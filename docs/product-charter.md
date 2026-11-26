@@ -12,6 +12,12 @@ exports that users can trust.
 kei copies photo and video libraries into storage the user controls, with safe
 file writes, resumable sync, and enough state to explain what happened.
 
+For every sync configuration, back up the selected media and remember where
+to resume. A quiet restart should not list the library again. One new photo
+should require only the work to identify it and save its requested copies.
+If settings change or the provider leaves a gap, rescan only the part of the
+selection that needs fresh evidence.
+
 The default product promise is local backup, not photo management. kei should
 make a local archive safer and easier to operate before it grows into
 destructive cleanup, provider-to-provider sync, or downstream upload workflows.
@@ -34,14 +40,6 @@ destructive cleanup, provider-to-provider sync, or downstream upload workflows.
 - Local file changes are opt-in. Capturing metadata in the state database is
   safe by default. Rewriting, deleting, or pruning local files needs an explicit
   user action.
-- A backup should save every currently selected item it can verify. A failed
-  item stays retryable; it does not disqualify healthy items or libraries.
-- The database and sync tokens avoid repeat work. Keep media progress and
-  checkpoint progress separate. If the provider cannot supply a trustworthy
-  cursor, keep the last good one and still save the media kei can verify.
-- A complete, validated inventory can establish a new baseline for its
-  selection. Older plans remain evidence, not work that must be replayed or
-  reconciled. Absence from a scan is not proof of deletion.
 - Sync should be explainable. A user should be able to tell what kei scanned,
   what it downloaded, what failed, and whether the next run can continue safely.
 - Headless operation is first-class. Watch mode, Docker, service managers,

@@ -1461,21 +1461,6 @@ impl state::MembershipStore for FailingMetadataSetDb {
             .selected_album_containers_have_complete_snapshots(library, container_ids)
             .await
     }
-
-    async fn get_live_selected_album_memberships_for_asset(
-        &self,
-        library: &str,
-        asset_record_name: &str,
-        selected_container_ids: &[&str],
-    ) -> Result<Vec<state::db::AlbumMembershipRecord>, state::error::StateError> {
-        self.inner
-            .get_live_selected_album_memberships_for_asset(
-                library,
-                asset_record_name,
-                selected_container_ids,
-            )
-            .await
-    }
 }
 
 #[async_trait::async_trait]

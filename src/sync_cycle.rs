@@ -1291,7 +1291,10 @@ async fn run_cycle_inner(
             Some(db) => db.get_metadata(&replay_key).await?,
             None => None,
         };
-        let indexing_replay_pending = replay_at_start.is_some();
+        let indexing_replay_pending = replay_at_start.is_some()
+            && retained_cursor_at_start
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty());
         let materialization_key = indexing_materialization_key(&lib_state.zone_name);
         let materialization_at_start = match state_db {
             Some(db) => db.get_metadata(&materialization_key).await?,

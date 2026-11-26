@@ -6,8 +6,6 @@ use anyhow::{Context, Result};
 use futures_util::{StreamExt, stream};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::icloud::photos::PhotoAsset;
-
 use super::config::DownloadConfig;
 use super::models::DownloadControls;
 
@@ -44,50 +42,24 @@ pub(super) fn build_pass_configs_with_download_concurrency(
 #[derive(Debug)]
 pub(super) struct IncrementalPassRouting {
     pub(super) selected_album_passes: FxHashMap<String, Vec<usize>>,
-    pub(super) selected_container_ids: Vec<String>,
-    pub(super) unfiled_passes: Vec<usize>,
 }
 
 impl IncrementalPassRouting {
     pub(super) fn from_passes(passes: &[crate::commands::AlbumPass]) -> Self {
         let mut selected_album_passes: FxHashMap<String, Vec<usize>> = FxHashMap::default();
-        let mut unfiled_passes = Vec::new();
-
         for (index, pass) in passes.iter().enumerate() {
-            match pass.kind {
-                crate::commands::PassKind::Album => {
-                    if let Some(container_id) = pass.album.container_id() {
-                        selected_album_passes
-                            .entry(container_id.to_string())
-                            .or_default()
-                            .push(index);
-                    }
-                }
-                crate::commands::PassKind::Unfiled => unfiled_passes.push(index),
-                crate::commands::PassKind::SmartFolder => {}
+            if pass.kind == crate::commands::PassKind::Album
+                && let Some(container_id) = pass.album.container_id()
+            {
+                selected_album_passes
+                    .entry(container_id.to_string())
+                    .or_default()
+                    .push(index);
             }
         }
-
-        let mut selected_container_ids: Vec<String> =
-            selected_album_passes.keys().cloned().collect();
-        selected_container_ids.sort_unstable();
-
         Self {
             selected_album_passes,
-            selected_container_ids,
-            unfiled_passes,
         }
-    }
-
-    pub(super) fn has_selected_albums(&self) -> bool {
-        !self.selected_album_passes.is_empty()
-    }
-
-    pub(super) fn selected_container_refs(&self) -> Vec<&str> {
-        self.selected_container_ids
-            .iter()
-            .map(String::as_str)
-            .collect()
     }
 
     pub(super) fn album_passes_for_container(&self, container_id: &str) -> Option<&[usize]> {
@@ -95,49 +67,6 @@ impl IncrementalPassRouting {
             .get(container_id)
             .map(Vec::as_slice)
     }
-}
-
-pub(super) async fn route_incremental_asset_to_passes(
-    asset: &PhotoAsset,
-    routing: &IncrementalPassRouting,
-    selected_container_ids: &[&str],
-    config: &DownloadConfig,
-) -> Result<Vec<usize>> {
-    if !routing.has_selected_albums() {
-        return Ok(routing.unfiled_passes.clone());
-    }
-
-    let db = config
-        .state_db
-        .as_ref()
-        .context("Album-aware incremental routing requires a state database")?;
-    let memberships = db
-        .get_live_selected_album_memberships_for_asset(
-            &config.library,
-            asset.asset_record_name(),
-            selected_container_ids,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "Could not look up album memberships for asset {}",
-                asset.asset_record_name()
-            )
-        })?;
-
-    let mut pass_indices = FxHashSet::default();
-    for membership in &memberships {
-        if let Some(indices) = routing.album_passes_for_container(&membership.container_id) {
-            pass_indices.extend(indices.iter().copied());
-        }
-    }
-    if memberships.is_empty() {
-        pass_indices.extend(routing.unfiled_passes.iter().copied());
-    }
-
-    let mut pass_indices: Vec<usize> = pass_indices.into_iter().collect();
-    pass_indices.sort_unstable();
-    Ok(pass_indices)
 }
 
 async fn collect_pass_asset_ids(pass: &crate::commands::AlbumPass) -> Result<FxHashSet<String>> {

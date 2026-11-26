@@ -48,17 +48,16 @@ pub(crate) use sparse_identity::{
 mod rows;
 mod temp_files;
 
-pub use contracts::{
-    AlbumMembershipRecord, CaptureRepairReceipt, DownloadStateStore, ImportStateStore,
-    ImportedRecord, MembershipStore, MetadataRewriteCompletion, MetadataRewriteQueue,
-    MetadataRewriteStore, PendingMetadataRewrite, ReportStateStore, SourceMetadataRecovery,
-    SyncTokenStore,
-};
 pub(crate) use contracts::{
     AssetGroupingRows, CheckpointTransition, DownloadContextStateStore, DownloadedFileRecord,
     ManifestAssetRow, OwnedTempFile, PendingPublicationRecord, ReconciliationCatalogPath,
     ReconciliationContent, ReconciliationPathKey, ReconciliationReservation,
     ReconciliationStateStore, ScopedDbSyncToken, SelectionMetadataReceipt, TempFileOwnershipStore,
+};
+pub use contracts::{
+    CaptureRepairReceipt, DownloadStateStore, ImportStateStore, ImportedRecord, MembershipStore,
+    MetadataRewriteCompletion, MetadataRewriteQueue, MetadataRewriteStore, PendingMetadataRewrite,
+    ReportStateStore, SourceMetadataRecovery, SyncTokenStore,
 };
 
 #[cfg(test)]

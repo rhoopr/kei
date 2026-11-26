@@ -36,9 +36,11 @@ Replay scheduling looks for due work, then validates the decisions in the select
 
 A standalone full inventory that establishes a zone's baseline checks work from the current selection, not older plans for that selection. Its generation and zone cursor commit together. Retained path ownership and prepared publication still protect local files. Incremental refreshes and inventories that require a retained-cursor bridge keep their existing coverage checks.
 
+After a complete unfiled inventory, ordinary sync can download paired photos directly from a completed library change feed. It links the original change pages to the selected destinations and confirms each photo before publication. A delta covers only those photos. Earlier files keep their receipts, and only a full query can establish a new inventory. If the feed leaves selection or placement unresolved, kei queries the selection again.
+
 If a continuation is refused, Kei can still save newly verified media from accepted pages in a standalone unfiled pass or in eligible named albums within a mixed selection. Each named album needs fresh proof of its own link. Neither publication nor membership proof advances the held cursor.
 
-After indexing finishes, a quiet zone change feed can establish coverage across disagreeing album query tokens. Qualification retains the trusted cursor for replay. See [checkpoint decisions and enumeration](architecture/checkpoints.md).
+After indexing finishes, a quiet zone change feed can establish coverage across disagreeing album query tokens. Qualification retains the trusted cursor for replay. If there was no cursor, the next complete inventory can establish the first one. See [checkpoint decisions and enumeration](architecture/checkpoints.md).
 
 **Local delivery.** The planner selects a destination. The pipeline writes and verifies a `.part`, publishes the file, syncs the parent directory, and finalizes durable state. An expired download URL leaves only that transfer for cleanup; other transfers continue. Import uses the shared path rules and verifies an existing file before adoption. Unresolved work needs durable retry evidence. See [publication, reconciliation, and import](architecture/publication.md).
 
@@ -48,25 +50,11 @@ Ordinary sync commits eligible provider checkpoints before draining the local me
 
 ## Data-safety invariants
 
-Keep publication, current work and checkpoint decisions separate. A hold on the checkpoint does not stop independently verified downloads. An item failure keeps that item retryable; it does not stop unrelated work unless the failure makes that work unsafe too.
+**The current selection decides which copies are owed.** If a photo belongs in two selected albums, a verified copy in one does not satisfy the other. A complete, validated inventory supersedes older plans only for the selection it covers. A change page covers only the items it establishes. An unknown current identity stays pending. Absence from a scan never authorizes deletion.
 
-Keep the previous checkpoint on incomplete token proof, interruption, stale planning, or non-durable recovery. A validated full inventory can replace older planning for the selection it covers. Historical uncertainty alone does not require repair before current progress. Unknown **current** provider identity keeps work pending. A missing observation or verified local copy does not prove that the provider deleted its source.
+**A checkpoint must not skip work.** Advance a zone only with complete evidence for its provider position and a durable way to retry any unfinished current work after restart. Otherwise keep the last good checkpoint and report the incomplete cycle, even if every transfer succeeded. Keep saving independently verified media. One failed copy or held zone need not stop the others.
 
-A verified copy in a prior album can establish catalog identity. Current selection evidence and an independent destination receipt still govern each new copy. Missing required provider position evidence makes the cycle a partial failure even if every transfer succeeded.
-
-Unknown indexing readiness before enumeration defers the affected library after two short retries. An unknown closing probe holds its checkpoint immediately. Independent libraries can advance their own checkpoints. Watch mode retries incomplete discovery before publishing a library map. See [checkpoint decisions and enumeration](architecture/checkpoints.md).
-
-Selection evidence limits apply to individual writes and validation operations. Retained history does not consume the next library's or restarted baseline's write allowance.
-
-Once selection freezes a destination, a downloaded receipt at a different path cannot satisfy it. With stable source evidence, a missing selected copy stays due until kei publishes it at the promised path or records proof that resolves that destination.
-
-When selection hashes an existing file to check a catalog receipt, it retains the confined handle. Before committing reuse or local preservation, kei checks that the path still names the same file and the bytes have not changed. On Unix, a settled inode change time can establish that the original digest still applies; otherwise kei verifies the bytes again. If projection redirects the destination, kei checks the selected file instead. The digest does not authorize a later write or carry across a restart.
-
-Writable sync may retire raw enumeration responses only after verifying the selection seal and finding no unfinished identity, destination, metadata, or repair work. Compact rank proofs preserve the original seal and source links.
-
-A new selection filters previous metadata writers by scope, configuration and destination inputs before reading files. It hashes the installed media and any configured XMP packet before opening the SQLite write transaction. Reuse requires matching hashes, frozen grouping and effective capture offset. At commit, kei checks both retained file identities. On Unix it also checks the inode change times sampled before hashing. On Windows the retained handles exclude writes and replacement. If kei cannot verify either file, the destination and its aliases stay pending for the ordinary writer. Reuse does not confer publication ownership. Prepared writes, preserved local files, managed layouts and explicit refresh or repair keep their existing recovery paths.
-
-File publication must preserve existing media unless replacement has exact authorization. Metadata writers must verify their input before replacement. A failed write leaves enough evidence to retry without overwriting a concurrent edit.
+**Protect files and writes already in progress.** Replacing an obsolete plan does not cancel an interrupted write or authorize replacing a file. Verify each selected path before reusing its contents. Replace media or metadata only with authorization for that change and while the files still match the approved inputs. Preserve concurrent edits and the evidence needed to recover unfinished writes.
 
 Keep secrets and provider identifiers out of logs and reports. See [diagnostic evidence](architecture/support.md) for redaction, offline collection, and interpretation limits.
 

@@ -317,16 +317,6 @@ async fn hard_delete_state_transition_key<'a>(
     })
 }
 
-/// Routing work left to the execution strategy after shared delta bookkeeping.
-#[derive(Debug, PartialEq, Eq)]
-#[must_use]
-pub(super) enum IncrementalDeltaRouting {
-    Album,
-    Relation,
-    Created,
-    None,
-}
-
 /// Shared facts for one zone delta. Callers retain their buffering and ordering:
 /// streaming persists identity and applies source changes as events arrive;
 /// collecting observes the whole delta before writes and applies relations before
@@ -420,39 +410,24 @@ impl<'a> IncrementalDeltaState<'a> {
         }
     }
 
-    fn routing_input(event: &ChangeEvent) -> IncrementalDeltaRouting {
-        if event.album.is_some() {
-            IncrementalDeltaRouting::Album
-        } else if event.relation.is_some() {
-            IncrementalDeltaRouting::Relation
-        } else if event.token_unsafe_reason.is_some() || event.reason != ChangeReason::Created {
-            IncrementalDeltaRouting::None
-        } else {
-            IncrementalDeltaRouting::Created
-        }
-    }
-
     pub(super) fn created_asset(event: &ChangeEvent) -> Option<&PhotoAsset> {
-        if Self::routing_input(event) != IncrementalDeltaRouting::Created {
-            return None;
-        }
-        event.asset.as_ref()
+        (event.album.is_none()
+            && event.relation.is_none()
+            && event.token_unsafe_reason.is_none()
+            && event.reason == ChangeReason::Created)
+            .then_some(event.asset.as_ref())
+            .flatten()
     }
 
-    pub(super) async fn apply_event(
-        &mut self,
-        event: &ChangeEvent,
-        config: &DownloadConfig,
-    ) -> IncrementalDeltaRouting {
-        let routing = Self::routing_input(event);
-        match routing {
-            IncrementalDeltaRouting::Created => self.summary.created_count += 1,
-            IncrementalDeltaRouting::None if event.token_unsafe_reason.is_none() => {
+    pub(super) async fn apply_event(&mut self, event: &ChangeEvent, config: &DownloadConfig) {
+        if event.album.is_none() && event.relation.is_none() && event.token_unsafe_reason.is_none()
+        {
+            if event.reason == ChangeReason::Created {
+                self.summary.created_count += 1;
+            } else {
                 self.summary.apply_source_state_event(event, config).await;
             }
-            _ => {}
         }
-        routing
     }
 
     pub(super) async fn apply_album_event(&mut self, event: &ChangeEvent, config: &DownloadConfig) {
@@ -505,6 +480,8 @@ impl MembershipDelta {
 
 #[derive(Debug, Default)]
 pub(super) struct IncrementalDeltaSummary {
+    pub(super) paired_pages: Vec<crate::state::db::provider_inbox::CapturedPageId>,
+    pub(super) paired_assets: Vec<PhotoAsset>,
     pub(super) membership: Box<MembershipDelta>,
     pub(super) sparse_target_stats: crate::download::SyncStats,
     pub(super) sparse_identity_proofs: Vec<SparseIdentityProof>,

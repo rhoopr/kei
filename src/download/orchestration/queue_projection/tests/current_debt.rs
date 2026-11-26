@@ -461,7 +461,7 @@ fn historical_evidence(f: &Fixture, generation: &str) -> Vec<Vec<u8>> {
 }
 
 #[derive(Clone)]
-struct PagedSelection(super::CurrentSession);
+struct PagedSelection(super::CurrentSession, Option<Vec<Value>>);
 
 #[async_trait::async_trait]
 impl PhotosSession for PagedSelection {
@@ -471,6 +471,15 @@ impl PhotosSession for PagedSelection {
         body: String,
         headers: &[(&str, &str)],
     ) -> anyhow::Result<Value> {
+        if url.contains("/changes/zone?")
+            && let Some(delta) = &self.1
+        {
+            let request: Value = serde_json::from_str(&body)?;
+            assert_eq!(request["zones"][0]["syncToken"], "paged-selection-proof");
+            return Ok(
+                json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"records":delta,"syncToken":"after-new-photo","moreComing":false}]}),
+            );
+        }
         if url.contains("/internal/records/query/batch?") {
             let count = self.0.records.lock().unwrap().len() / 2;
             return Ok(json!({"batch":[{"records":[{"fields":{"itemCount":{"value":count}}}]}]}));
@@ -508,8 +517,125 @@ fn use_paged_selection(f: &mut Fixture) {
     f.pass.album = make_captured_cycle_album(
         "PrimarySync",
         f.capture.clone(),
-        Box::new(PagedSelection(f.session.clone())),
+        Box::new(PagedSelection(f.session.clone(), None)),
     );
+}
+
+#[tokio::test]
+async fn new_photo_after_baseline_uses_only_the_change_feed() {
+    let server = crate::start_wiremock_or_skip!();
+    Mock::given(method("GET"))
+        .and(path("/media"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    f.db.acquire_lock("no cursor")
+        .unwrap()
+        .execute("DELETE FROM metadata WHERE key=?1", [PRIMARY_KEY])
+        .unwrap();
+    let config = make_run_cycle_config();
+    let (_dir, session) = make_shared_session_for_run_cycle().await;
+    use_paged_selection(&mut f);
+    select(&f, "a", &server);
+    let first = baseline_cycle(&f, &config, &session, vec![f.pass.clone()]).await;
+    assert_eq!(
+        (first.failed_count, first.stats.downloaded),
+        (0, 1),
+        "{first:?}"
+    );
+    let original =
+        f.db.get_downloaded_page(0, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+            .local_path
+            .unwrap();
+    let modified = std::fs::metadata(&original).unwrap().modified().unwrap();
+    f = reopen_destination_fixture(f).await;
+    use_paged_selection(&mut f);
+    let mut new = selected_records("b", &server);
+    new[0]["fields"]["filenameEnc"]["value"] = json!("photo-b.jpg");
+    new[0]["fields"]["resOriginalRes"]["value"]["downloadURL"] =
+        json!(format!("{}/new-photo", server.uri()));
+    f.session.records.lock().unwrap().extend(new.clone());
+    f.pass.album = make_captured_cycle_album(
+        "PrimarySync",
+        f.capture.clone(),
+        Box::new(PagedSelection(f.session.clone(), Some(new.clone()))),
+    );
+    let before = f.session.rank_calls.load(Ordering::SeqCst);
+    let failed = baseline_cycle(&f, &config, &session, vec![f.pass.clone()]).await;
+    assert!(failed.failed_count > 0, "{failed:?}");
+    assert_eq!(before, f.session.rank_calls.load(Ordering::SeqCst));
+    assert_eq!(
+        f.db.get_metadata(PRIMARY_KEY).await.unwrap().as_deref(),
+        Some("paged-selection-proof")
+    );
+    f = reopen_destination_fixture(f).await;
+    use_paged_selection(&mut f);
+    f.pass.album = make_captured_cycle_album(
+        "PrimarySync",
+        f.capture.clone(),
+        Box::new(PagedSelection(f.session.clone(), Some(new))),
+    );
+    Mock::given(method("GET"))
+        .and(path("/new-photo"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .expect(1)
+        .mount(&server)
+        .await;
+    for (downloads, cursor) in [(1, "after-new-photo"), (0, "quiet-zone-cursor")] {
+        let before = f.session.rank_calls.load(Ordering::SeqCst);
+        let result = baseline_cycle(&f, &config, &session, vec![f.pass.clone()]).await;
+        assert_eq!(result.failed_count, 0, "{result:?}");
+        assert_eq!(result.stats.downloaded, downloads);
+        assert_eq!(
+            f.db.get_metadata(PRIMARY_KEY).await.unwrap().as_deref(),
+            Some(cursor)
+        );
+        assert_eq!(
+            before,
+            f.session.rank_calls.load(Ordering::SeqCst),
+            "{result:?}"
+        );
+        let rows = f.db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert_eq!(std::fs::read(row.local_path.unwrap()).unwrap(), MEDIA);
+        }
+        assert_eq!(
+            std::fs::metadata(&original).unwrap().modified().unwrap(),
+            modified
+        );
+        f = reopen_destination_fixture(f).await;
+        use_paged_selection(&mut f);
+    }
+    assert!(
+        f.db.inspect_integrity_destination(original.clone())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    server.verify().await;
+    server.reset().await;
+    std::fs::remove_file(&original).unwrap();
+    Mock::given(method("GET"))
+        .and(path("/media"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let restored = baseline_cycle(&f, &config, &session, vec![f.pass.clone()]).await;
+    assert_eq!(
+        (restored.failed_count, restored.stats.downloaded),
+        (0, 1),
+        "{restored:?}"
+    );
+    assert_eq!(std::fs::read(original).unwrap(), MEDIA);
+    server.verify().await;
 }
 
 #[tokio::test]
@@ -583,6 +709,11 @@ async fn full_sync_410_keeps_healthy_transfers_running_before_cleanup() {
     );
     server.verify().await;
     server.reset().await;
+    // The bytes and destination still match. A new provider caption cannot
+    // make a failed, never-published media transfer depend on its old plan.
+    f.session.records.lock().unwrap()[1]["fields"]["captionEnc"]["value"] = json!("New caption");
+    let updated = f.session.records.lock().unwrap().clone();
+    f.capture(updated, "updated-caption").await;
     Mock::given(method("GET"))
         .and(path("/expired"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
@@ -603,6 +734,61 @@ async fn full_sync_410_keeps_healthy_transfers_running_before_cleanup() {
         assert_eq!(rows.len(), 3);
         for row in rows {
             assert_eq!(std::fs::read(row.local_path.unwrap()).unwrap(), MEDIA);
+        }
+    }
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn first_checkpoint_after_indexing_needs_no_replay_without_a_prior_cursor() {
+    let server = crate::start_wiremock_or_skip!();
+    Mock::given(method("GET"))
+        .and(path("/media"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    use_paged_selection(&mut f);
+    f.db.acquire_lock("no cursor before indexing")
+        .unwrap()
+        .execute("DELETE FROM metadata WHERE key=?1", [PRIMARY_KEY])
+        .unwrap();
+    select(&f, "old", &server);
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"]["downloadURL"] =
+        json!(format!("{}/expired", server.uri()));
+    let config = make_run_cycle_config();
+    let (_dir, session) = make_shared_session_for_run_cycle().await;
+    let first = baseline_cycle(&f, &config, &session, vec![f.pass.clone()]).await;
+    assert!(first.stats.selected_work_remaining);
+    assert!(f.db.get_metadata(PRIMARY_KEY).await.unwrap().is_none());
+    let replay = crate::sync_cycle::indexing_replay_key("PrimarySync");
+    f.db.set_metadata(&replay, "1").await.unwrap();
+    let mut peer = selected_records("peer", &server);
+    peer[0]["fields"]["filenameEnc"]["value"] = json!("peer.jpg");
+    *f.session.records.lock().unwrap() = peer.clone();
+    f.capture(peer, "peer-observation").await;
+    for (downloaded, cursor) in [
+        (1, "paged-selection-proof"),
+        (0, "quiet-zone-cursor"),
+        (0, "quiet-zone-cursor"),
+    ] {
+        f = reopen_destination_fixture(f).await;
+        use_paged_selection(&mut f);
+        let before = f.session.rank_calls.load(Ordering::SeqCst);
+        let result = baseline_cycle(&f, &config, &session, vec![f.pass.clone()]).await;
+        assert_eq!(
+            (result.failed_count, result.stats.downloaded),
+            (0, downloaded),
+            "{result:?}"
+        );
+        assert_eq!(
+            f.db.get_metadata(PRIMARY_KEY).await.unwrap().as_deref(),
+            Some(cursor)
+        );
+        assert_eq!(f.db.get_metadata(&replay).await.unwrap(), None);
+        if downloaded == 0 {
+            assert_eq!(before, f.session.rank_calls.load(Ordering::SeqCst));
         }
     }
     server.verify().await;

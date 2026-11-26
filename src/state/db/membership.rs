@@ -6,8 +6,10 @@ use async_trait::async_trait;
 use chrono::Utc;
 use rusqlite::{OptionalExtension, Transaction};
 
+#[cfg(test)]
+use super::contracts::AlbumMembershipRecord;
 use super::rows::{collect_rows_with_warn, sqlite_placeholders, unique_sorted_strings};
-use super::{AlbumMembershipRecord, AssetGroupingRows, MembershipStore, SqliteStateDb};
+use super::{AssetGroupingRows, MembershipStore, SqliteStateDb};
 use crate::state::error::StateError;
 
 /// Project provider relations into the compatibility grouping table. Only
@@ -167,6 +169,7 @@ fn album_container_known_tx(
     .map_err(|e| StateError::query(operation, e))
 }
 
+#[cfg(test)]
 fn album_membership_record_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<AlbumMembershipRecord> {
@@ -716,8 +719,11 @@ impl MembershipStore for SqliteStateDb {
         )
         .await
     }
+}
 
-    async fn get_live_selected_album_memberships_for_asset(
+#[cfg(test)]
+impl SqliteStateDb {
+    pub(crate) async fn get_live_selected_album_memberships_for_asset(
         &self,
         library: &str,
         asset_record_name: &str,

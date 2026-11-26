@@ -373,6 +373,7 @@ pub(crate) trait TempFileOwnershipStore: Send + Sync {
 /// name returned by `PhotoAsset::id()`. Keep both identifiers when available
 /// so later routing can bridge relation deltas to existing download state.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub struct AlbumMembershipRecord {
     pub library: String,
     pub asset_record_name: String,
@@ -988,16 +989,6 @@ pub trait MembershipStore: Send + Sync {
     ) -> Result<bool, StateError> {
         Err(unsupported_album_membership_api(
             "selected_album_containers_have_complete_snapshots",
-        ))
-    }
-    async fn get_live_selected_album_memberships_for_asset(
-        &self,
-        _library: &str,
-        _asset_record_name: &str,
-        _selected_container_ids: &[&str],
-    ) -> Result<Vec<AlbumMembershipRecord>, StateError> {
-        Err(unsupported_album_membership_api(
-            "get_live_selected_album_memberships_for_asset",
         ))
     }
 }

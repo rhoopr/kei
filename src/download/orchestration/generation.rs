@@ -37,8 +37,9 @@ use crate::icloud::photos::{
 use crate::state::ReconciliationStateStore;
 use crate::state::db::provider_generations::{
     ActiveDecision, ActiveGeneration, AdmissionChecks, GenerationSpec, INDEPENDENT_ALBUM_COPIES,
-    MAX_GENERATION_BYTES, ReplayPageCapture, SelectionAttempt, SelectionCheckpointHold,
-    SelectionDebt, SelectionInventory, accepted_replay_coverage, accepted_replay_pass,
+    LIBRARY_DELTA, MAX_GENERATION_BYTES, ReplayPageCapture, SelectionAttempt,
+    SelectionCheckpointHold, SelectionDebt, SelectionInventory, accepted_replay_coverage,
+    accepted_replay_pass,
 };
 use crate::state::db::provider_inbox::CapturedPageId;
 use crate::state::db::provider_selection::{
@@ -418,6 +419,22 @@ pub(crate) struct SelectionRun {
 }
 
 impl SelectionContext {
+    pub(super) async fn library_delta_base(
+        &self,
+        config: &DownloadConfig,
+    ) -> Result<Option<ActiveGeneration>> {
+        if crate::state::db::provider_generations::library_delta_selection(&self.profile)
+            && !config.primary_layout_active
+            && !config.refresh_metadata
+            && !config.sparse_membership_due
+            && config.indexing_inventory_cursor.is_none()
+            && config.inventory_checkpoint != InventoryCheckpointPolicy::RetainedBridge
+        {
+            self.current().await
+        } else {
+            Ok(None)
+        }
+    }
     async fn has_work(&self, config: &DownloadConfig) -> Result<bool> {
         Ok(self.debt(config, None).await?.is_some())
     }
@@ -608,6 +625,7 @@ impl SelectionContext {
         };
         let root = if let Some(current) = self.current().await?
             && !current.sealed
+            && current.spec.profile == spec.profile
         {
             current
         } else {
@@ -1985,12 +2003,13 @@ async fn discover_missing_files(
         let Some(last) = files.last() else {
             return Ok(());
         };
-        after = Some((
+        after = Some([
+            last.generation.clone(),
             last.pass_key.clone(),
             last.child.clone(),
             last.version.clone(),
             last.path.key()?,
-        ));
+        ]);
         for file in files {
             if cancel.is_some_and(CancellationToken::is_cancelled) {
                 return Ok(());
@@ -2006,11 +2025,7 @@ async fn discover_missing_files(
                     context
                         .capture
                         .db
-                        .reopen_missing_selection_file(
-                            context.capture.owner.clone(),
-                            generation.to_owned(),
-                            file,
-                        )
+                        .reopen_missing_selection_file(context.capture.owner.clone(), file)
                         .await?;
                 }
                 Err(error) => {
@@ -2257,30 +2272,8 @@ pub(super) async fn inventory(
             run.held.store(true, Ordering::Relaxed);
         }
     }
-    let metadata = if result.stats.storage_failed || config.post_sync_metadata {
-        MetadataTailOutcome::default()
-    } else {
-        metadata_tail(config, &cancel, context, &run.root.id).await?
-    };
-    result.stats.exif_failures += metadata.failed;
-    if metadata.storage_failed {
-        // The checkpoint projection below owns the reported flag, so record
-        // the metadata drain's storage evidence before it runs.
-        result.checkpoint.storage_failed = true;
-        result.stats.storage_failed = true;
-    }
-    if metadata.failed > 0 {
-        result.outcome = merge_download_outcomes(
-            &result.outcome,
-            &DownloadOutcome::PartialFailure {
-                failed_count: metadata.failed,
-            },
-        );
-    }
     context
-        .capture
-        .db
-        .complete_selection_metadata(context.capture.owner.clone(), run.root.id.clone())
+        .finish_writers(config, &cancel, &run.root.id, &mut result)
         .await?;
     if run.held.load(Ordering::Relaxed) {
         result.checkpoint.identity_incomplete = true;
@@ -2338,6 +2331,36 @@ pub(super) async fn inventory(
 }
 
 const METADATA_WRITER_BUDGET: usize = 500;
+
+impl SelectionContext {
+    async fn finish_writers(
+        &self,
+        config: &DownloadConfig,
+        cancel: &CancellationToken,
+        generation: &str,
+        result: &mut SyncResult,
+    ) -> Result<()> {
+        if !result.stats.storage_failed && !config.post_sync_metadata {
+            let metadata = metadata_tail(config, cancel, self, generation).await?;
+            result.stats.exif_failures += metadata.failed;
+            result.checkpoint.storage_failed |= metadata.storage_failed;
+            result.stats.storage_failed |= metadata.storage_failed;
+            if metadata.failed > 0 {
+                result.outcome = merge_download_outcomes(
+                    &result.outcome,
+                    &DownloadOutcome::PartialFailure {
+                        failed_count: metadata.failed,
+                    },
+                );
+            }
+        }
+        self.capture
+            .db
+            .complete_selection_metadata(self.capture.owner.clone(), generation.to_owned())
+            .await?;
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 tokio::task_local! {
@@ -2860,9 +2883,7 @@ async fn recover_retained(
                 }
             }
             if let Some(asset) = asset {
-                assets.push(Ok(
-                    asset.with_state_record_name(Arc::from(decision.state_id.clone()))
-                ));
+                assets.push(asset.with_state_record_name(Arc::from(decision.state_id.clone())));
             } else {
                 run.defer_confirmation(&key, decision.decision.child.clone(), None)
                     .await?;
@@ -2871,19 +2892,9 @@ async fn recover_retained(
         if assets.is_empty() {
             continue;
         }
-        let mut effective = config.with_pass(pass);
-        effective.selection_run = Some(run.clone());
-        effective.selection_pass = Some(key);
-        let result = crate::download::pipeline::stream_and_download_from_stream(
-            client,
-            futures_util::stream::iter(assets),
-            &Arc::new(effective),
-            controls,
-            0,
-            cancel.clone(),
-            crate::download::pipeline::StreamRuntime::new(None, None).deferring_metadata_drain(),
-        )
-        .await?;
+        let result = run
+            .publish_assets(client, pass, config, controls, &cancel, assets)
+            .await?;
         run.remember_retry_sources(&result.failed, passes, config)
             .await?;
         super::models::merge_streaming_result(&mut combined, result);
@@ -2955,7 +2966,9 @@ async fn replay(
         .db
         .complete_selection_metadata(context.capture.owner.clone(), root.id.clone())
         .await?;
-    if !root.checkpoint_ready || run.held.load(Ordering::Relaxed) {
+    if !(root.checkpoint_ready || (root.sealed && root.spec.is_library_delta()))
+        || run.held.load(Ordering::Relaxed)
+    {
         result.block_incremental_token(match root.checkpoint_veto.as_deref() {
             Some(super::models::DATE_BOUNDED_FULL_ENUMERATION_REASON) => {
                 super::models::DATE_BOUNDED_FULL_ENUMERATION_REASON
@@ -3010,31 +3023,22 @@ async fn replay_destinations(
                 if let (Some(body), Some(master)) =
                     (&decision.decision.confirmation, &decision.decision.master)
                 {
-                    assets.push(Ok(current_asset(
-                        body,
-                        &decision.decision.child,
-                        master,
-                        decision.media_zone(root),
-                    )?
-                    .with_state_record_name(Arc::from(decision.state_id))));
+                    assets.push(
+                        current_asset(
+                            body,
+                            &decision.decision.child,
+                            master,
+                            decision.media_zone(root),
+                        )?
+                        .with_state_record_name(Arc::from(decision.state_id)),
+                    );
                 } else {
                     run.held.store(true, Ordering::Relaxed);
                 }
             }
-            let mut effective = config.with_pass(pass);
-            effective.selection_run = Some(run.clone());
-            effective.selection_pass = Some(key.clone());
-            let result = crate::download::pipeline::stream_and_download_from_stream(
-                client,
-                futures_util::stream::iter(assets),
-                &Arc::new(effective),
-                controls,
-                0,
-                cancel.clone(),
-                crate::download::pipeline::StreamRuntime::new(None, None)
-                    .deferring_metadata_drain(),
-            )
-            .await?;
+            let result = run
+                .publish_assets(client, pass, config, controls, cancel, assets)
+                .await?;
             run.remember_retry_sources(&result.failed, passes, config)
                 .await?;
             super::models::merge_streaming_result(combined, result);
@@ -3090,6 +3094,79 @@ impl AcceptedReplayCandidate {
             Self::Child { child, .. } => child,
             Self::Foreign(child) => child,
         }
+    }
+}
+
+impl SelectionRun {
+    async fn publish_assets(
+        self: &Arc<Self>,
+        client: &Client,
+        pass: &AlbumPass,
+        config: &DownloadConfig,
+        controls: DownloadControls,
+        cancel: &CancellationToken,
+        assets: Vec<PhotoAsset>,
+    ) -> Result<StreamingResult> {
+        let effective = Arc::new(DownloadConfig {
+            selection_run: Some(self.clone()),
+            selection_pass: Some(config.pass_key(pass)),
+            ..config.with_pass(pass)
+        });
+        crate::download::pipeline::stream_and_download_from_stream(
+            client,
+            futures_util::stream::iter(assets.into_iter().map(Ok)),
+            &effective,
+            controls,
+            0,
+            cancel.clone(),
+            StreamRuntime::new(None, None).deferring_metadata_drain(),
+        )
+        .await
+    }
+
+    async fn link_delta_pages(
+        &self,
+        pass: &AlbumPass,
+        key: &str,
+        pages: &[CapturedPageId],
+        cancel: &CancellationToken,
+    ) -> Result<FxHashSet<String>> {
+        let mut children = FxHashSet::default();
+        for &page in pages {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let capture = |body| {
+                self.capture.db.capture_selection_replay_page(
+                    self.capture.owner.clone(),
+                    self.root.id.clone(),
+                    key.to_owned(),
+                    page,
+                    body,
+                )
+            };
+            let evidence = match capture(None).await? {
+                ReplayPageCapture::Released(cursor) => {
+                    let reply = tokio::select! {
+                        biased;
+                        ()=cancel.cancelled()=>break,
+                        reply=pass.album.reread_replay_page(&cursor)=>reply,
+                    };
+                    match reply {
+                        Ok(body) => capture(Some(body)).await?,
+                        Err(error) if crate::icloud::photos::session::is_session_error(&error) => {
+                            return Err(error);
+                        }
+                        Err(_) => continue,
+                    }
+                }
+                evidence => evidence,
+            };
+            if let ReplayPageCapture::Captured(ids) = evidence {
+                children.extend(ids);
+            }
+        }
+        Ok(children)
     }
 }
 
@@ -3165,7 +3242,7 @@ pub(super) async fn publish_accepted_replay(
         ..StreamingResult::default()
     };
     let mut attempted = false;
-    'passes: for pass in passes {
+    for pass in passes {
         if cancel.is_cancelled()
             || combined.storage_failed
             || combined.state_write_failures > 0
@@ -3263,41 +3340,7 @@ pub(super) async fn publish_accepted_replay(
         if candidates.is_empty() {
             continue;
         }
-        let mut children = FxHashSet::default();
-        for &page in pages {
-            if cancel.is_cancelled() {
-                break 'passes;
-            }
-            let capture = |body| {
-                run.capture.db.capture_selection_replay_page(
-                    run.capture.owner.clone(),
-                    run.root.id.clone(),
-                    key.clone(),
-                    page,
-                    body,
-                )
-            };
-            let evidence = match capture(None).await? {
-                ReplayPageCapture::Released(cursor) => {
-                    let reply = tokio::select! {
-                        biased;
-                        ()=cancel.cancelled()=>break 'passes,
-                        reply=pass.album.reread_replay_page(&cursor)=>reply,
-                    };
-                    match reply {
-                        Ok(body) => capture(Some(body)).await?,
-                        Err(error) if crate::icloud::photos::session::is_session_error(&error) => {
-                            return Err(error);
-                        }
-                        Err(_) => continue,
-                    }
-                }
-                evidence => evidence,
-            };
-            if let ReplayPageCapture::Captured(ids) = evidence {
-                children.extend(ids);
-            }
-        }
+        let children = run.link_delta_pages(pass, &key, pages, &cancel).await?;
         candidates.retain(|asset| children.contains(asset.child()));
         if candidates.is_empty() {
             continue;
@@ -3370,6 +3413,93 @@ pub(super) async fn publish_accepted_replay(
     ))
 }
 
+/// Publish a completed change feed through the same source, destination and
+/// writer transactions as inventory. Its seal never certifies a full listing.
+async fn publish_library_delta(
+    client: &Client,
+    pass: &AlbumPass,
+    config: &Arc<DownloadConfig>,
+    controls: DownloadControls,
+    cancel: &CancellationToken,
+    delta: &mut IncrementalDeltaSummary,
+    context: &SelectionContext,
+) -> Result<Option<SyncResult>> {
+    let passes = std::slice::from_ref(pass);
+    let mut context = context.clone();
+    let profile = context
+        .profile
+        .as_object_mut()
+        .context("Missing selection profile")?;
+    profile.insert("coverage".into(), json!(LIBRARY_DELTA));
+    profile.insert(
+        "input".into(),
+        json!(digest(&serde_json::to_vec(
+            &delta.paired_pages.iter().map(|id| id.0).collect::<Vec<_>>()
+        )?)),
+    );
+    let run = context.start(passes, config).await?;
+    let key = config.pass_key(pass);
+    let children = run
+        .link_delta_pages(pass, &key, &delta.paired_pages, cancel)
+        .await?;
+    if children.len() != delta.paired_assets.len()
+        || !delta
+            .paired_assets
+            .iter()
+            .all(|asset| children.contains(asset.asset_record_name()))
+    {
+        return Ok(None);
+    }
+    let started = Instant::now();
+    let work = run
+        .publish_assets(
+            client,
+            pass,
+            config,
+            controls,
+            cancel,
+            std::mem::take(&mut delta.paired_assets),
+        )
+        .await?;
+    run.remember_retry_sources(&work.failed, passes, config)
+        .await?;
+    let mut result = build_download_result(
+        client,
+        passes,
+        config,
+        controls,
+        work,
+        started,
+        cancel.clone(),
+    )
+    .await?;
+    if cancel.is_cancelled()
+        || run.held.load(Ordering::Relaxed)
+        || result.checkpoint.enumeration_incomplete
+        || result.checkpoint.enumeration_errors != 0
+        || result.checkpoint.state_write_failures != 0
+        || result.checkpoint.storage_failed
+        || !matches!(result.outcome, DownloadOutcome::Success)
+    {
+        result.block_incremental_token(DEFERRED_REASON);
+    } else {
+        context
+            .capture
+            .db
+            .seal_selection_generation(
+                context.capture.owner.clone(),
+                run.root.id.clone(),
+                false,
+                None,
+            )
+            .await?;
+        context
+            .finish_writers(config, cancel, &run.root.id, &mut result)
+            .await?;
+    }
+    Ok(Some(result))
+}
+
 /// Reuse the existing completed-delta/full-selection veto composition. The
 /// only offered successor is the actual completed source stream's successor.
 pub(super) async fn after_delta(
@@ -3379,6 +3509,7 @@ pub(super) async fn after_delta(
     controls: DownloadControls,
     cancel: CancellationToken,
     mut delta: IncrementalDeltaSummary,
+    prior: Option<ActiveGeneration>,
 ) -> Result<SyncResult> {
     let context = config
         .selection_context
@@ -3396,7 +3527,11 @@ pub(super) async fn after_delta(
     }
     let completed_delta_replay = delta.raw_records_observed.zip(delta.sync_token.clone());
     let mut delta_result = SyncResult::from_incremental_execution(
-        if delta.state_transition_failures > 0 {
+        if delta.auth_errors > 0 {
+            DownloadOutcome::SessionExpired {
+                auth_error_count: delta.auth_errors,
+            }
+        } else if delta.state_transition_failures > 0 {
             DownloadOutcome::PartialFailure {
                 failed_count: delta.state_transition_failures,
             }
@@ -3408,6 +3543,9 @@ pub(super) async fn after_delta(
         std::mem::take(&mut delta.sparse_identity_proofs),
         completed_delta_replay,
     );
+    if delta.auth_errors > 0 {
+        return Ok(delta_result);
+    }
     context
         .include_durable_membership_deletions(&mut delta.membership)
         .await?;
@@ -3423,7 +3561,7 @@ pub(super) async fn after_delta(
         && !delta_result.checkpoint.interrupted
         && delta_result.checkpoint.state_write_failures == 0;
     let root = context.current().await?;
-    if let Some(root) = &root {
+    if let Some(root) = root.as_ref().or(prior.as_ref()) {
         discover_missing_files(context, &root.id, &config.directory, Some(&cancel)).await?;
     }
     // Smart membership and foreign media facts are not covered by the owner's
@@ -3466,10 +3604,42 @@ pub(super) async fn after_delta(
                 )
             )
         });
-    let mut selected = match root {
-        Some(root)
+    let publication = if let [pass] = passes
+        && let Some(prior) = prior.as_ref()
+        && (prior.checkpoint_ready || prior.spec.is_library_delta())
+        && !refresh_selection
+        && !retry_pass_tokens
+        && delta_safe
+        && delta_result.checkpoint.completed_delta_replay
+        && !delta.paired_pages.is_empty()
+        && !delta.paired_assets.is_empty()
+        && ((!prior.sealed && root.as_ref().is_some_and(|r| r.id == prior.id))
+            || !context
+                .capture
+                .db
+                .unfinished_selection_debt(
+                    context.capture.owner.clone(),
+                    context.scope.clone(),
+                    context.config_hash.clone(),
+                )
+                .await?)
+    {
+        Box::pin(publish_library_delta(
+            client, pass, config, controls, &cancel, &mut delta, context,
+        ))
+        .await?
+    } else {
+        None
+    };
+    let mut selected = match (publication, root) {
+        (Some(published), _) => published,
+        (None, Some(root))
             if !refresh_selection
                 && !retry_pass_tokens
+                && (!root.spec.is_library_delta()
+                    || (delta.raw_records_observed == Some(false) && root.sealed))
+                && (!root.spec.is_library_delta()
+                    || !matches!(context.debt(config, None).await?, Some(SelectionDebt::Blocking(hold)) if hold.retained_generation))
                 && (root.sealed
                     || context
                         .capture

@@ -489,7 +489,7 @@ impl PhotoAlbum {
     ) -> (
         ChangeStream,
         tokio::sync::oneshot::Receiver<String>,
-        tokio::sync::oneshot::Receiver<bool>,
+        tokio::sync::oneshot::Receiver<super::ChangesCompletion>,
     ) {
         let (tx, rx) = mpsc::channel::<anyhow::Result<ChangeEvent>>(200);
         let (token_tx, token_rx) = tokio::sync::oneshot::channel();
@@ -509,7 +509,7 @@ impl PhotoAlbum {
         tokio::spawn(async move {
             let mut buffer = DeltaRecordBuffer::new();
             let mut current_token = initial_token;
-            let mut raw_records_observed = false;
+            let mut records = 0usize;
             let mut accepted = Vec::new();
             let mut visited = FxHashSet::from_iter([current_token.clone()]);
             let shadow_error = |error| {
@@ -586,7 +586,7 @@ impl PhotoAlbum {
 
                 // Unknown record types can disappear during pairing. Observe
                 // the validated raw page, not the resulting ChangeEvents.
-                raw_records_observed |= !zone_result.records.is_empty();
+                records = records.saturating_add(zone_result.records.len());
                 if let Some((capture, database)) = &shadow_capture {
                     let scope = match capture.scope(database, &zone_result.zone_scope) {
                         Ok(scope) => scope,
@@ -598,10 +598,7 @@ impl PhotoAlbum {
                     }
                     let page = zone_result.observed_page(raw_body, scope, &current_token);
                     match capture.capture(page).await {
-                        Ok(Some(id)) if zone_result.more_coming => {
-                            accepted.push(id);
-                        }
-                        Ok(_) => {}
+                        Ok(id) => accepted.extend(id),
                         Err(error) => break Some(shadow_error(error)),
                     }
                 }
@@ -649,7 +646,10 @@ impl PhotoAlbum {
             if let Some(e) = stream_error {
                 let _ = tx.send(Err(AcceptedReplay::attach(e, accepted))).await;
             } else if !tx.is_closed() {
-                let _ = completion_tx.send(raw_records_observed);
+                let _ = completion_tx.send(super::ChangesCompletion {
+                    records,
+                    pages: accepted,
+                });
             }
 
             let _ = token_tx.send(current_token);
@@ -686,7 +686,7 @@ mod tests {
             );
             let (stream, token, completion) = album.changes_stream_with_completion("prior");
             assert!(stream.collect::<Vec<_>>().await.is_empty());
-            assert_eq!(completion.await.unwrap(), expected_raw);
+            assert_eq!(completion.await.unwrap().records != 0, expected_raw);
             assert_eq!(token.await.unwrap(), "terminal");
         }
         let album = make_album_with_session(100, Box::new(MockPhotosSession::new()));
@@ -1529,7 +1529,10 @@ mod tests {
             }
             assert!(stream.next().await.is_none());
             assert_eq!(token.await.unwrap(), "saved");
-            assert_eq!(completion.await.ok(), (!more_coming).then_some(false));
+            assert_eq!(
+                completion.await.ok().map(|c| c.records),
+                (!more_coming).then_some(0)
+            );
         }
     }
 

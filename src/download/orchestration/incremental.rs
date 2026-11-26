@@ -22,18 +22,14 @@ use super::context::{
     legacy_owner_claim_mode_for_configs, preload_download_context,
 };
 use super::delta::{
-    IncrementalAssetHydrationContext, IncrementalDeltaRouting, IncrementalDeltaState,
-    IncrementalDeltaSummary, hydrate_missing_selected_relation_assets,
-    hydrate_unpaired_created_asset_deltas,
+    IncrementalAssetHydrationContext, IncrementalDeltaState, IncrementalDeltaSummary,
+    hydrate_missing_selected_relation_assets, hydrate_unpaired_created_asset_deltas,
 };
 use super::models::{
-    ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON, DownloadControls, DownloadOutcome,
-    PROVIDER_METADATA_STATE_WRITE_FAILED_REASON, SyncResult, SyncStats,
-    block_sync_token_for_incremental_delta, merge_download_outcomes, replay_refusal_reason,
+    DownloadControls, DownloadOutcome, PROVIDER_METADATA_STATE_WRITE_FAILED_REASON, SyncResult,
+    merge_download_outcomes, replay_refusal_reason,
 };
-use super::selection::{
-    IncrementalPassRouting, build_pass_configs, route_incremental_asset_to_passes,
-};
+use super::selection::{IncrementalPassRouting, build_pass_configs};
 async fn apply_changed_provider_metadata(
     config: &DownloadConfig,
     asset: &PhotoAsset,
@@ -108,7 +104,13 @@ pub(super) async fn download_photos_incremental(
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
     let started = Instant::now();
-    let delta_summary = match read_zone_delta(
+    // The baseline must match before the new pages change its source basis.
+    let prior = if let Some(context) = &config.selection_context {
+        context.library_delta_base(config).await?
+    } else {
+        None
+    };
+    let mut delta_summary = match read_zone_delta(
         download_client,
         passes,
         config,
@@ -121,31 +123,9 @@ pub(super) async fn download_photos_incremental(
         std::ops::ControlFlow::Break(refused) => return Ok(*refused),
         std::ops::ControlFlow::Continue(delta) => delta,
     };
-    let completed_delta_replay = delta_summary
-        .raw_records_observed
-        .zip(delta_summary.sync_token.clone());
     delta_summary.log_debug();
-
     if delta_summary.auth_errors > 0 {
-        let mut stats = SyncStats {
-            state_write_failures: delta_summary.state_transition_failures,
-            elapsed_secs: started.elapsed().as_secs_f64(),
-            ..SyncStats::default()
-        };
-        stats.accumulate(&delta_summary.sparse_target_stats);
-        stats.identity_incomplete = delta_summary.identity_incomplete;
-        if let Some(reason) = delta_summary.token_unsafe_reason {
-            block_sync_token_for_incremental_delta(&mut stats, reason);
-        }
-        return Ok(SyncResult::from_incremental_execution(
-            DownloadOutcome::SessionExpired {
-                auth_error_count: delta_summary.auth_errors,
-            },
-            None,
-            stats,
-            delta_summary.sparse_identity_proofs,
-            completed_delta_replay,
-        ));
+        delta_summary.sparse_target_stats.elapsed_secs += started.elapsed().as_secs_f64();
     }
 
     Box::pin(super::generation::after_delta(
@@ -155,6 +135,7 @@ pub(super) async fn download_photos_incremental(
         controls,
         shutdown_token,
         delta_summary,
+        prior,
     ))
     .await
 }
@@ -180,7 +161,6 @@ pub(super) async fn read_zone_delta(
     let mut change_events: Vec<ChangeEvent> = Vec::new();
     let mut delta = IncrementalDeltaState::new(passes);
     let routing = IncrementalPassRouting::from_passes(passes);
-    let selected_container_ids = routing.selected_container_refs();
 
     let delta_pass = passes.first();
 
@@ -246,7 +226,23 @@ pub(super) async fn read_zone_delta(
             () = shutdown_token.cancelled() => None,
             token = token_rx => token.ok(),
         };
-        delta.summary.raw_records_observed = completion_rx.await.ok();
+        if let Ok(completion) = completion_rx.await {
+            delta.summary.raw_records_observed = Some(completion.records != 0);
+            // Pairing can omit unknown records or leave orphans. Only direct
+            // pairs which account for the entire raw stream replace a listing.
+            let mut masters = FxHashSet::default();
+            if completion.records == change_events.len().saturating_mul(2)
+                && change_events.iter().all(|event| {
+                    IncrementalDeltaState::created_asset(event).is_some_and(|asset| {
+                        !asset.metadata().is_hidden
+                            && !asset.metadata().is_deleted
+                            && masters.insert(asset.id())
+                    })
+                })
+            {
+                delta.summary.paired_pages = completion.pages;
+            }
+        }
         delta.record_completion(token.filter(|_| delta.summary.raw_records_observed.is_some()));
         tracing::debug!(
             phase_elapsed = %format_duration(phase_started.elapsed()),
@@ -377,27 +373,7 @@ pub(super) async fn read_zone_delta(
     }
 
     for event in &change_events {
-        if delta.apply_event(event, config).await != IncrementalDeltaRouting::Created {
-            continue;
-        }
-        let Some(asset) = &event.asset else {
-            continue;
-        };
-        if let Err(e) =
-            route_incremental_asset_to_passes(asset, &routing, &selected_container_ids, config)
-                .await
-        {
-            tracing::warn!(
-                asset_record_name = %asset.asset_record_name(),
-                asset_id = %asset.id(),
-                error = %e,
-                "Failed to route incremental asset through album membership state"
-            );
-            delta
-                .summary
-                .token_unsafe_reason
-                .get_or_insert(ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON);
-        }
+        delta.apply_event(event, config).await;
     }
     tracing::debug!(
         phase_elapsed = %format_duration(phase_started.elapsed()),
@@ -405,6 +381,9 @@ pub(super) async fn read_zone_delta(
         "Incremental routing phase complete"
     );
 
+    if !delta.summary.paired_pages.is_empty() {
+        delta.summary.paired_assets = complete_delta_assets;
+    }
     let delta_summary = delta.summary;
     Ok(std::ops::ControlFlow::Continue(delta_summary))
 }

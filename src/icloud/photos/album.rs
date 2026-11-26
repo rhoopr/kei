@@ -10,6 +10,10 @@
 
 mod changes;
 pub(crate) use changes::catalog_observed_page;
+pub(crate) struct ChangesCompletion {
+    pub(crate) records: usize,
+    pub(crate) pages: Vec<crate::state::db::provider_inbox::CapturedPageId>,
+}
 mod completion;
 mod counts;
 mod enumeration;
@@ -609,7 +613,7 @@ impl PhotoAlbum {
     ) -> (
         ChangeStream,
         tokio::sync::oneshot::Receiver<String>,
-        tokio::sync::oneshot::Receiver<bool>,
+        tokio::sync::oneshot::Receiver<ChangesCompletion>,
     ) {
         self.stream_changes(sync_token)
     }

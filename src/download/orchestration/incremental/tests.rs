@@ -1548,6 +1548,7 @@ async fn explicit_live_photo_refresh_repairs_legacy_dates_and_sidecars_then_stay
     struct RefreshSession {
         enumeration: super::super::test_support::CountingChangesZoneSession,
         current: super::super::test_support::SelectedMediaSession,
+        cursors: Arc<std::sync::Mutex<Vec<String>>>,
     }
     #[async_trait::async_trait]
     impl PhotosSession for RefreshSession {
@@ -1560,9 +1561,14 @@ async fn explicit_live_photo_refresh_repairs_legacy_dates_and_sidecars_then_stay
             if url.contains("/records/lookup?") {
                 self.current.post(url, body, headers).await
             } else {
-                let unchanged = url.contains("/changes/zone?")
-                    && serde_json::from_str::<serde_json::Value>(&body)?["zones"][0]["syncToken"]
-                        == "zone-token-next";
+                let unchanged = if url.contains("/changes/zone?") {
+                    let request = serde_json::from_str::<serde_json::Value>(&body)?;
+                    let cursor = request["zones"][0]["syncToken"].as_str().unwrap();
+                    self.cursors.lock().unwrap().push(cursor.to_owned());
+                    cursor == "zone-token-next"
+                } else {
+                    false
+                };
                 let mut response = self.enumeration.post(url, body, headers).await?;
                 if unchanged {
                     response["zones"][0]["records"] = json!([]);
@@ -1574,12 +1580,14 @@ async fn explicit_live_photo_refresh_repairs_legacy_dates_and_sidecars_then_stay
             Box::new(self.clone())
         }
     }
+    let cursors = Arc::new(std::sync::Mutex::new(Vec::new()));
     let pass = super::super::test_support::selected_pass_with_session(
         &db,
         "",
         Box::new(RefreshSession {
             enumeration: session.clone(),
             current: current_lookup,
+            cursors: Arc::clone(&cursors),
         }),
     );
     let mut config = test_config();
@@ -1696,9 +1704,9 @@ async fn explicit_live_photo_refresh_repairs_legacy_dates_and_sidecars_then_stay
     assert_eq!(tokio::fs::read(still_path).await.unwrap(), still);
     let mut sidecars = HashMap::new();
     let mut full_query_count = 0;
-    // Turning explicit refresh off changes the selection configuration once;
-    // the following unchanged cycle must stay incremental and preserve bytes.
-    for (cycle, refresh) in [true, false, false].into_iter().enumerate() {
+    // Turning refresh off keeps the same selection. The paired change and
+    // the following quiet poll must both preserve the imported files.
+    for refresh in [true, false, false] {
         let (capture, _guard) = crate::test_helpers::TracingCapture::install();
         config.refresh_metadata = refresh;
         let result = download_photos_with_sync(
@@ -1716,7 +1724,7 @@ async fn explicit_live_photo_refresh_repairs_legacy_dates_and_sidecars_then_stay
             result.stats,
             capture.events()
         );
-        assert_eq!(result.full_enumeration_ran, cycle < 2);
+        assert_eq!(result.full_enumeration_ran, refresh);
         assert_eq!(result.stats.downloaded, 0);
         assert_eq!(result.stats.state_write_failures, 0);
         assert_eq!(result.stats.exif_failures, 0);
@@ -1821,17 +1829,18 @@ async fn explicit_live_photo_refresh_repairs_legacy_dates_and_sidecars_then_stay
                 .unwrap()
                 .is_empty()
         );
-        if cycle == 1 {
-            assert!(session.records_query_count() > full_query_count);
-            full_query_count = session.records_query_count();
-        } else {
-            assert_eq!(session.records_query_count(), full_query_count);
-        }
+        assert_eq!(session.records_query_count(), full_query_count);
         config.sync_mode = SyncMode::Incremental {
             zone_sync_token: result.sync_token.unwrap(),
         };
     }
-    assert_eq!(session.changes_zone_calls.load(Ordering::SeqCst), 2);
+    // The imported pair already has publication receipts, so the inbox
+    // released the original body. Re-read that exact page for its source
+    // proof. The following quiet poll starts at the delta successor.
+    assert_eq!(
+        *cursors.lock().unwrap(),
+        ["full-token", "full-token", "zone-token-next"]
+    );
     let (scope, historical_config, obsolete_path): (String, String, String) = db.acquire_lock("retained obsolete destination").unwrap()
         .query_row("SELECT g.scope,g.config_hash,w.compat_path FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.verified_media=0", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
     assert!(

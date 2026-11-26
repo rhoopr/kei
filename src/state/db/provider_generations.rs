@@ -35,6 +35,7 @@ pub(crate) use writer_output::WriterKey;
 // Limit one generation evidence write; retained history never spends this allowance.
 pub(crate) const MAX_GENERATION_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const INDEPENDENT_ALBUM_COPIES: &str = "independent_album_copies";
+pub(crate) const LIBRARY_DELTA: &str = "library_delta";
 const ACCEPTED_REPLAY_COVERAGE: &str = "accepted_unfiled_replay";
 const ACCEPTED_ALBUM_REPLAY_COVERAGE: &str = "accepted_named_album_replay";
 const ACCEPTED_FAVORITES_REPLAY_COVERAGE: &str = "accepted_favorites_replay";
@@ -530,6 +531,14 @@ pub(crate) struct GenerationSpec {
 }
 
 impl GenerationSpec {
+    pub(crate) fn is_library_delta(&self) -> bool {
+        self.profile.get("coverage").and_then(Value::as_str) == Some(LIBRARY_DELTA)
+    }
+
+    fn uses_delta_pages(&self) -> bool {
+        self.is_library_delta() || self.is_accepted_replay()
+    }
+
     pub(crate) fn is_accepted_replay(&self) -> bool {
         matches!(
             self.profile.get("coverage").and_then(Value::as_str),
@@ -603,6 +612,13 @@ pub(crate) fn accepted_replay_coverage(profile: &Value) -> Option<&'static str> 
     passes
         .iter()
         .find_map(|pass| replay_pass_coverage(pass, passes))
+}
+
+pub(crate) fn library_delta_selection(profile: &Value) -> bool {
+    has_no_replay_excludes(profile)
+        && profile.get("passes").and_then(Value::as_array).is_some_and(
+            |passes| matches!(passes.as_slice(), [pass] if is_replay_unfiled_pass(pass)),
+        )
 }
 
 pub(crate) fn accepted_replay_pass(profile: &Value, key: &str) -> bool {
@@ -1133,7 +1149,7 @@ fn validate_spec(spec: &GenerationSpec) -> Result<(), StateError> {
         || [&spec.config_hash, &spec.basis]
             .iter()
             .any(|v| v.len() != 64 || !v.bytes().all(|b| b.is_ascii_hexdigit()))
-        || !(spec.is_accepted_replay()
+        || !(spec.uses_delta_pages()
             || spec.profile.get("coverage").and_then(Value::as_str)
                 == Some("observed_selection_window"))
         || spec
@@ -1163,6 +1179,9 @@ fn validate_spec(spec: &GenerationSpec) -> Result<(), StateError> {
         .filter_map(|p| p.get("key").and_then(Value::as_str))
         .collect();
     if keys.len() != passes.len() {
+        return invalid();
+    }
+    if spec.is_library_delta() && !library_delta_selection(&spec.profile) {
         return invalid();
     }
     if spec.is_accepted_replay()
@@ -1265,7 +1284,7 @@ fn load_generation(conn: &Connection, id: &str) -> Result<ActiveGeneration, Stat
     let spec: GenerationSpec =
         serde_json::from_slice(&bytes).map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
     validate_spec(&spec)?;
-    if spec.is_accepted_replay() && sealed {
+    if (spec.is_accepted_replay() && sealed) || (spec.is_library_delta() && ready) {
         return invalid();
     }
     validate_deleted_selection(conn, &spec)?;
@@ -1605,7 +1624,7 @@ fn load_rank(
     let mut rows = statement.query([page])?;
     let foreign = root.spec.accepted_foreign_replay(&key).is_some();
     let membership_container =
-        if (foreign || !root.spec.is_accepted_replay()) && request.get("zones").is_some() {
+        if (foreign || !root.spec.uses_delta_pages()) && request.get("zones").is_some() {
             Some(
                 pass(root, &key)?
                     .pointer("/scope/container_id")
@@ -1654,7 +1673,7 @@ fn load_rank(
                 )
                 .map_err(|_invalid| StateError::ProviderSelectionInvalid)?
             }
-        } else if root.spec.is_accepted_replay()
+        } else if root.spec.uses_delta_pages()
             && (kind != Some("CPLAsset")
                 || record.get("deleted").and_then(Value::as_bool) == Some(true))
         {
@@ -1813,7 +1832,7 @@ fn validate_rank_request(
     key: &str,
     request: &Value,
 ) -> Result<(), StateError> {
-    if root.spec.is_accepted_replay() {
+    if root.spec.uses_delta_pages() {
         if !accepted_replay_pass(&root.spec.profile, key) {
             return invalid();
         }
@@ -2059,7 +2078,7 @@ fn validate_decision_with_pages(
         {
             return invalid();
         }
-        if !verify_body && !root.spec.is_accepted_replay() {
+        if !verify_body && !root.spec.uses_delta_pages() {
             let valid:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_selection_rank_records r JOIN provider_selection_rank_pages p ON p.id=r.page_id WHERE p.generation=?1 AND p.pass_key=?2 AND r.page_id=?3 AND r.ordinal=?4 AND r.record_name=?5 AND r.record_type IS NOT 'CPLContainerRelation')",params![root.id,decision.pass_key,source.page_id,source.ordinal,decision.child],|r|r.get(0))?;
             if valid {
                 continue;
@@ -2262,7 +2281,7 @@ impl SqliteStateDb {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             account::validate_authenticated(&tx, &owner)?;
             let root = load_generation(&tx, &generation)?;
-            if root.spec.is_accepted_replay() {
+            if root.spec.uses_delta_pages() {
                 return invalid();
             }
             capture_selection_source(&tx, &root, &key, &request, &body, capacity)?;
@@ -2285,15 +2304,15 @@ impl SqliteStateDb {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             account::validate_authenticated(&tx, &owner)?;
             let root = load_generation(&tx, &generation)?;
-            if !root.spec.is_accepted_replay() {
+            if !root.spec.uses_delta_pages() {
                 return invalid();
             }
             let page = if super::provider_inbox::released(&tx, id.0)? {
                 let cursor: String = tx.query_row(
                     "SELECT p.request_cursor FROM provider_shadow_pages p
                      JOIN account_owner a USING(account_key,provider_key)
-                     WHERE a.singleton=1 AND p.id=?1 AND p.scope=?2 AND p.more_coming=1",
-                    params![id.0, root.spec.scope],
+                     WHERE a.singleton=1 AND p.id=?1 AND p.scope=?2 AND (p.more_coming=1 OR ?3)",
+                    params![id.0, root.spec.scope, root.spec.is_library_delta()],
                     |row| row.get(0),
                 )?;
                 // A sibling pass or a previous replay can already have kept
@@ -2329,8 +2348,8 @@ impl SqliteStateDb {
                 load_page(&tx, id, MAX_CHUNK_BYTES)?.page
             };
             if page.scope != root.spec.scope
-                || !page.more_coming
-                || page.request_cursor == page.successor
+                || (!root.spec.is_library_delta() && !page.more_coming)
+                || (page.more_coming && page.request_cursor == page.successor)
                 || crate::icloud::photos::catalog_observed_page(
                     page.body.clone(),
                     &page.scope,
@@ -4819,18 +4838,18 @@ const UNFINISHED: &str = "w.admitted=1
           AND (newer.metadata_enabled=0 OR current.verified_metadata=1)
     ))";
 
+// A planned transfer has no local writer input. Published media (including
+// preserved files) and fingerprint-confirmed repairs still own their metadata.
+const OWNS_METADATA_INPUT: &str = "(w.verified_media=1 OR w.preserved_local IS NOT NULL OR w.prepared_hash IS NOT NULL OR w.confirmed_repair IS NOT NULL)";
+
 pub(super) fn guard_generation(conn: &Connection, record: &AssetRecord) -> Result<(), StateError> {
     validate_identity_decisions(conn, &record.library, &record.id)?;
-    let pending:bool=conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.library=?1 AND w.asset_id=?2 AND w.version_size=?3 AND {UNFINISHED})"),params![record.library,record.id,record.version_size.as_str()],|row|row.get(0))?;
-    if !pending {
-        return Ok(());
-    }
     let hash = record
         .metadata
         .metadata_hash
         .clone()
         .unwrap_or_else(|| record.metadata.compute_hash());
-    let conflict:bool=conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.library=?1 AND w.asset_id=?2 AND w.version_size=?3 AND {UNFINISHED} AND (w.checksum<>?4 OR w.size_bytes IS NOT ?5 OR w.created_at IS NOT ?6 OR w.added_at IS NOT ?7 OR w.metadata_hash<>?8))"),params![record.library,record.id,record.version_size.as_str(),record.checksum,i64::try_from(record.size_bytes).ok(),encode_asset_date(record.created_at),record.added_at.map(encode_asset_date),hash],|r|r.get(0))?;
+    let conflict:bool=conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.library=?1 AND w.asset_id=?2 AND w.version_size=?3 AND {UNFINISHED} AND (w.checksum<>?4 OR w.size_bytes IS NOT ?5 OR w.created_at IS NOT ?6 OR w.added_at IS NOT ?7 OR (w.metadata_hash<>?8 AND {OWNS_METADATA_INPUT})))"),params![record.library,record.id,record.version_size.as_str(),record.checksum,i64::try_from(record.size_bytes).ok(),encode_asset_date(record.created_at),record.added_at.map(encode_asset_date),hash],|r|r.get(0))?;
     if conflict {
         Err(StateError::ProviderWorkConflict("unfinished_asset_changed"))
     } else {
@@ -4869,7 +4888,7 @@ pub(super) fn guard_metadata(
         .metadata_hash
         .clone()
         .unwrap_or_else(|| metadata.compute_hash());
-    let conflict:bool=conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.library=?1 AND w.asset_id=?2 AND w.version_size=?3 AND {UNFINISHED} AND (w.metadata_hash<>?4 OR w.created_at IS NOT ?5 OR w.added_at IS NOT ?6))"),params![library,asset,version,hash,created,added],|r|r.get(0))?;
+    let conflict:bool=conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.library=?1 AND w.asset_id=?2 AND w.version_size=?3 AND {UNFINISHED} AND ((w.metadata_hash<>?4 AND {OWNS_METADATA_INPUT}) OR w.created_at IS NOT ?5 OR w.added_at IS NOT ?6))"),params![library,asset,version,hash,created,added],|r|r.get(0))?;
     if conflict {
         Err(StateError::ProviderWorkConflict(
             "unfinished_metadata_changed",
@@ -5825,6 +5844,7 @@ impl SqliteStateDb {
 
 #[derive(Debug)]
 pub(crate) struct CompletedSelectionFile {
+    pub(crate) generation: String,
     pub(crate) pass_key: String,
     pub(crate) child: String,
     pub(crate) version: String,
@@ -5838,18 +5858,27 @@ impl SqliteStateDb {
         &self,
         owner: account::AccountOwner,
         generation: String,
-        after: Option<(String, String, String, String)>,
+        after: Option<[String; 5]>,
     ) -> Result<Vec<CompletedSelectionFile>, StateError> {
         self.with_conn("reading completed selection files", move |conn| {
             account::validate_authenticated(conn, &owner)?;
-            load_generation(conn, &generation)?;
-            let mut statement = conn.prepare("SELECT pass_key,child,version_size,path FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND (verified_media=1 OR preserved_local IS NOT NULL) AND (?2 IS NULL OR (pass_key,child,version_size,path)>(?2,?3,?4,?5)) ORDER BY pass_key,child,version_size,path LIMIT ?6")?;
-            let rows = statement.query_map(params![generation, after.as_ref().map(|v| &v.0), after.as_ref().map(|v| &v.1), after.as_ref().map(|v| &v.2), after.as_ref().map(|v| &v.3), COMPLETED_SELECTION_PAGE_SIZE], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
-            })?;
+            let root = load_generation(conn, &generation)?;
+            // A delta adds to the last inventory. Missing-file checks still
+            // belong to each file's original publication, including older deltas.
+            let mut statement = conn.prepare(&format!("SELECT w.generation,w.pass_key,w.child,w.version_size,w.path
+                FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation
+                WHERE (g.id=?1 OR (?2 AND g.scope=?3 AND g.config_hash=?4 AND
+                    g.created_at<(SELECT created_at FROM provider_active_generations WHERE id=?1)
+                    AND NOT EXISTS(SELECT 1 FROM provider_active_generations newer WHERE {NEWER_PATH_SELECTION})
+                    AND (w.current_publication=1 OR w.preserved_local IS NOT NULL)))
+                AND w.admitted=1 AND (w.verified_media=1 OR w.preserved_local IS NOT NULL)
+                AND (?5 IS NULL OR (w.generation,w.pass_key,w.child,w.version_size,w.path)>(?5,?6,?7,?8,?9))
+                ORDER BY w.generation,w.pass_key,w.child,w.version_size,w.path LIMIT ?10"))?;
+            let [g,k,c,v,p] = after.as_ref().map_or([None;5], |a| a.each_ref().map(Some));
+            let rows = statement.query_map(params![generation,root.spec.is_library_delta(),root.spec.scope,root.spec.config_hash,g,k,c,v,p,COMPLETED_SELECTION_PAGE_SIZE], |row| row.try_into())?;
             rows.map(|row| {
-                let (pass_key, child, version, path) = row?;
-                Ok(CompletedSelectionFile { pass_key, child, version,
+                let (generation, pass_key, child, version, path): (_, _, _, _, String) = row?;
+                Ok(CompletedSelectionFile { generation, pass_key, child, version,
                     path: serde_json::from_str(&path).map_err(|_invalid| StateError::ProviderSelectionInvalid)?,
                 })
             }).collect()
@@ -5859,13 +5888,13 @@ impl SqliteStateDb {
     pub(crate) async fn reopen_missing_selection_file(
         &self,
         owner: account::AccountOwner,
-        generation: String,
         file: CompletedSelectionFile,
     ) -> Result<(), StateError> {
         self.with_conn_mut("reopening missing selection file", move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             account::validate_authenticated(&tx, &owner)?;
-            let root = load_generation(&tx, &generation)?;
+            let generation = &file.generation;
+            let root = load_generation(&tx, generation)?;
             let manifest = load_decision(&tx, &root, &file.pass_key, &file.child)?;
             if !manifest.decision.destinations.iter().any(|destination| destination.path == file.path && destination.version_size == file.version) {
                 return invalid();
@@ -6150,7 +6179,7 @@ impl SqliteStateDb {
                     AND a.version_size=w.version_size AND a.checksum=w.checksum AND a.is_deleted=0
                     AND a.metadata_hash=w.metadata_hash AND a.created_at IS w.created_at AND a.added_at IS w.added_at)
                 AND EXISTS(SELECT 1 FROM provider_active_destinations n JOIN provider_active_generations newest ON newest.id=n.generation
-                    WHERE n.generation=({LATEST_LOCAL_GENERATION}) AND newest.sealed=1 AND newest.checkpoint_ready=1
+                    WHERE n.generation=({LATEST_LOCAL_GENERATION}) AND newest.sealed=1 AND (newest.checkpoint_ready=1 OR json_extract(newest.specification,'$.profile.coverage')='{LIBRARY_DELTA}')
                     AND n.pass_key=w.pass_key AND n.child=w.child AND n.version_size=w.version_size AND n.path=w.path
                     AND n.library=w.library AND n.asset_id=w.asset_id AND n.master=w.master AND n.checksum=w.checksum
                     AND n.size_bytes=w.size_bytes AND n.metadata_hash=w.metadata_hash AND n.added_at IS w.added_at AND n.created_at IS w.created_at
@@ -6315,6 +6344,13 @@ type IntegrityInspectionRow = (
     Option<Vec<u8>>,
 );
 
+// An inventory replaces the path selection. A delta for the same configuration
+// covers only its observed children and their paths, including a renamed copy.
+const NEWER_PATH_SELECTION: &str = "newer.scope=g.scope AND newer.created_at>g.created_at
+    AND (newer.config_hash<>g.config_hash OR json_extract(newer.specification,'$.profile.coverage') IS NOT 'library_delta'
+    OR EXISTS(SELECT 1 FROM provider_active_decisions observed WHERE observed.generation=newer.id AND observed.child=w.child AND observed.pass_key=w.pass_key)
+    OR EXISTS(SELECT 1 FROM provider_active_destinations changed WHERE changed.generation=newer.id AND changed.path=w.path))";
+
 type StoredConfirmation = (Vec<u8>, String, u64);
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -6398,7 +6434,7 @@ impl SqliteStateDb {
         self.with_conn("inspecting explicit integrity destination", move |conn| {
             let path = super::provider_selection::SelectionPath::from_path(&path).key()?;
             let row: Option<IntegrityInspectionRow> = conn.query_row(
-                "SELECT w.generation,w.pass_key,w.child,w.version_size,w.local_checksum,w.preserved_local IS NOT NULL,w.verified_media,w.confirmed_repair FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.path=?1 AND w.admitted=1 AND (w.verified_media=1 OR w.preserved_local IS NOT NULL OR w.confirmed_repair IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM provider_active_generations newer WHERE newer.scope=g.scope AND newer.created_at>g.created_at) ORDER BY g.created_at DESC,w.current_publication DESC,w.generation,w.pass_key LIMIT 1",
+                &format!("SELECT w.generation,w.pass_key,w.child,w.version_size,w.local_checksum,w.preserved_local IS NOT NULL,w.verified_media,w.confirmed_repair FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.path=?1 AND w.admitted=1 AND (w.verified_media=1 OR w.preserved_local IS NOT NULL OR w.confirmed_repair IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM provider_active_generations newer WHERE {NEWER_PATH_SELECTION}) ORDER BY g.created_at DESC,w.current_publication DESC,w.generation,w.pass_key LIMIT 1"),
                 [&path], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)),
             ).optional()?;
             let Some((generation, pass_key, child, version, local_checksum, preserved, verified_media, previous_confirmation)) = row else { return Ok(None) };
@@ -6455,6 +6491,7 @@ impl SqliteStateDb {
     ) -> Result<(), StateError> {
         self.with_conn_mut("confirming explicit integrity damage", move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            validate_generation_headers(&tx)?;
             let root = load_generation(&tx, &inspected.generation)?;
             let manifest = load_decision(&tx, &root, &inspected.pass_key, &inspected.child)?;
             let destination = manifest.decision.destinations.iter()
@@ -6481,7 +6518,7 @@ impl SqliteStateDb {
                 return invalid();
             }
             let changed = tx.execute(
-                "UPDATE provider_active_destinations SET confirmed_repair=?6,current_publication=0,preserved_local=NULL,verified_media=0,verified_metadata=0,local_checksum=NULL,source_checksum=NULL,progress_hash=NULL,prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND verified_media=?9 AND (preserved_local IS NOT NULL)=?8 AND local_checksum IS ?7 AND confirmed_repair IS ?10 AND prepared_hash IS NULL AND NOT EXISTS(SELECT 1 FROM provider_active_generations g JOIN provider_active_generations newer ON newer.scope=g.scope AND newer.created_at>g.created_at WHERE g.id=?1)",
+                &format!("UPDATE provider_active_destinations AS w SET confirmed_repair=?6,current_publication=0,preserved_local=NULL,verified_media=0,verified_metadata=0,local_checksum=NULL,source_checksum=NULL,progress_hash=NULL,prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND verified_media=?9 AND (preserved_local IS NOT NULL)=?8 AND local_checksum IS ?7 AND confirmed_repair IS ?10 AND prepared_hash IS NULL AND NOT EXISTS(SELECT 1 FROM provider_active_generations g JOIN provider_active_generations newer ON {NEWER_PATH_SELECTION} WHERE g.id=?1)"),
                 params![root.id, inspected.pass_key, inspected.child, destination.version_size, destination.path.key()?, encode(&repair)?, inspected.local_checksum, inspected.preserved, inspected.verified_media, inspected.previous_confirmation],
             )?;
             if changed != 1 { return invalid() }

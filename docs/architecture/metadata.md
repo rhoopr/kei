@@ -303,6 +303,14 @@ It does not scan for, infer ownership of, or authorize writes to older copies
 that were never recorded. Additional paths enter the registry through verified
 download finalization or explicit import adoption.
 
+To reuse a previous writer's result, selection checks its scope, configuration,
+destination inputs, grouping and capture offset. It hashes the installed media
+and any configured XMP packet before the write transaction. At commit it checks
+both file identities. On Unix it also checks the inode change times sampled
+before hashing; on Windows the open handles exclude writes and replacement.
+If either check fails, the destination and its aliases stay pending. Reuse
+does not grant permission to replace either file.
+
 XMP sidecars record the exact properties that kei writes in the kei namespace.
 A later rewrite deletes a cleared property only when that marker proves kei
 owned the prior value. Unmarked standard properties and unrelated third-party
