@@ -107,10 +107,120 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn get_failed_sample(
+    pub(crate) async fn get_manifest_assets(&self) -> Result<Vec<ManifestAssetRow>, StateError> {
+        self.with_conn("get_manifest_assets", move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    r"
+                    SELECT
+                        a.library,
+                        a.id,
+                        a.version_size,
+                        a.filename,
+                        a.local_path,
+                        a.checksum,
+                        a.local_checksum,
+                        a.download_checksum,
+                        a.size_bytes,
+                        a.created_at,
+                        a.added_at,
+                        a.downloaded_at,
+                        a.last_seen_at,
+                        a.media_type,
+                        a.status,
+                        aa.album_name,
+                        a.is_deleted,
+                        a.deleted_at
+                    FROM assets a
+                    LEFT JOIN asset_albums aa
+                        ON aa.library = a.library
+                       AND aa.asset_id = a.id
+                    ORDER BY a.library, a.id, a.version_size, aa.album_name
+                    ",
+                )
+                .map_err(|e| StateError::query("get_manifest_assets::prepare", e))?;
+
+            let rows = stmt
+                .query_map([], manifest_joined_row_from_row)
+                .map_err(|e| StateError::query("get_manifest_assets::query", e))?;
+
+            let mut assets: BTreeMap<(String, String, String), ManifestAssetRow> = BTreeMap::new();
+            for row in rows {
+                let joined = row.map_err(|e| StateError::query("get_manifest_assets::row", e))?;
+                let key = (
+                    joined.asset.library.clone(),
+                    joined.asset.asset_id.clone(),
+                    joined.asset.version.clone(),
+                );
+                let asset = assets.entry(key).or_insert(joined.asset);
+                if let Some(album) = joined.album_name {
+                    asset.albums.push(album);
+                }
+            }
+
+            // A superseded path is historical evidence, never a claim that the
+            // rendition still owns the reused primary. Export its independent
+            // preservation receipt with the provider and local hashes instead.
+            let mut statement = conn.prepare("SELECT o.library,o.header,p.evidence,o.operation,o.family,o.prior_generation,o.phase FROM primary_layout_preserved p JOIN primary_layout_operations o ON o.operation=p.operation ORDER BY o.operation,p.member")?;
+            let receipts = statement.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,Vec<u8>>(1)?,row.get::<_,Vec<u8>>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,i64>(5)?,row.get::<_,String>(6)?)))?;
+            for receipt in receipts {
+                let (library,header,evidence,operation,family,previous_generation,phase) = receipt?;
+                let header: super::primary_layout::LayoutOperation = super::primary_layout::decode(&header)?;
+                let child = header.child;
+                let file: super::primary_layout::LayoutFile = super::primary_layout::decode(&evidence)?;
+                if let Some(asset) = assets.get_mut(&(library,child,file.version.clone())) {
+                    asset.preserved_files.push(super::primary_layout::PreservedManifestFile {
+                        operation,family,previous_generation,phase,native_path:file.path,
+                        provider_checksum:file.provider_checksum,
+                        local_checksum:data_encoding::HEXLOWER.encode(&file.fingerprint.sha256),
+                        source_checksum:file.source_checksum,
+                        sidecar_checksum:file.sidecar.map(|sidecar|data_encoding::HEXLOWER.encode(&sidecar.sha256)),
+                        size_bytes:file.fingerprint.size,
+                    });
+                }
+            }
+            for asset in assets.values_mut() {
+                if let Some(path) = &asset.local_path {
+                    let superseded: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM primary_layout_superseded_paths s WHERE s.library=?1 AND s.child=?2 AND s.version=?3 AND s.provider_checksum=?4 AND s.compat_path=?5) AND NOT EXISTS(SELECT 1 FROM primary_layout_claims c WHERE c.library=?1 AND c.child=?2 AND c.version=?3 AND c.provider_checksum=?4 AND c.path_key=?6 AND c.operation IS NULL)",rusqlite::params![asset.library,asset.asset_id,asset.version,asset.checksum,path.to_str(),super::primary_layout::path_key(path)?],|row|row.get(0))?;
+                    if superseded { asset.local_path = None; }
+                }
+            }
+            Ok(assets.into_values().collect())
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sync_run_snapshot_for_test(
         &self,
-        limit: u32,
-    ) -> Result<(Vec<AssetRecord>, u64), StateError> {
+        run_id: i64,
+    ) -> Result<(String, i64, i64, i64, i32), StateError> {
+        let conn = self.acquire_lock("sync_run_snapshot_for_test")?;
+        conn.query_row(
+            "SELECT status, assets_seen, assets_failed, enumeration_errors, interrupted \
+             FROM sync_runs WHERE id = ?1",
+            [run_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i32>(4)?,
+                ))
+            },
+        )
+        .map_err(|e| StateError::query("sync_run_snapshot_for_test", e))
+    }
+}
+
+#[async_trait]
+impl ReportStateStore for SqliteStateDb {
+    async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
+        <SqliteStateDb as ReportStateStore>::get_failed_page(self, 0, u32::MAX).await
+    }
+
+    async fn get_failed_sample(&self, limit: u32) -> Result<(Vec<AssetRecord>, u64), StateError> {
         self.with_conn("get_failed_sample", move |conn| {
             let total: i64 = conn
                 .query_row(
@@ -144,7 +254,7 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn get_failed_page(
+    async fn get_failed_page(
         &self,
         offset: u64,
         limit: u32,
@@ -177,7 +287,7 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn get_pending_page(
+    async fn get_pending_page(
         &self,
         offset: u64,
         limit: u32,
@@ -210,7 +320,7 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn get_summary(&self) -> Result<SyncSummary, StateError> {
+    async fn get_summary(&self) -> Result<SyncSummary, StateError> {
         self.with_conn("get_summary", move |conn| {
             let (
                 total_assets,
@@ -534,7 +644,7 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn get_downloaded_page(
+    async fn get_downloaded_page(
         &self,
         offset: u64,
         limit: u32,
@@ -562,97 +672,7 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn get_manifest_assets(&self) -> Result<Vec<ManifestAssetRow>, StateError> {
-        self.with_conn("get_manifest_assets", move |conn| {
-            let mut stmt = conn
-                .prepare(
-                    r"
-                    SELECT
-                        a.library,
-                        a.id,
-                        a.version_size,
-                        a.filename,
-                        a.local_path,
-                        a.checksum,
-                        a.local_checksum,
-                        a.download_checksum,
-                        a.size_bytes,
-                        a.created_at,
-                        a.added_at,
-                        a.downloaded_at,
-                        a.last_seen_at,
-                        a.media_type,
-                        a.status,
-                        aa.album_name,
-                        a.is_deleted,
-                        a.deleted_at
-                    FROM assets a
-                    LEFT JOIN asset_albums aa
-                        ON aa.library = a.library
-                       AND aa.asset_id = a.id
-                    ORDER BY a.library, a.id, a.version_size, aa.album_name
-                    ",
-                )
-                .map_err(|e| StateError::query("get_manifest_assets::prepare", e))?;
-
-            let rows = stmt
-                .query_map([], manifest_joined_row_from_row)
-                .map_err(|e| StateError::query("get_manifest_assets::query", e))?;
-
-            let mut assets: BTreeMap<(String, String, String), ManifestAssetRow> = BTreeMap::new();
-            for row in rows {
-                let joined = row.map_err(|e| StateError::query("get_manifest_assets::row", e))?;
-                let key = (
-                    joined.asset.library.clone(),
-                    joined.asset.asset_id.clone(),
-                    joined.asset.version.clone(),
-                );
-                let asset = assets.entry(key).or_insert(joined.asset);
-                if let Some(album) = joined.album_name {
-                    asset.albums.push(album);
-                }
-            }
-
-            // A superseded path is historical evidence, never a claim that the
-            // rendition still owns the reused primary. Export its independent
-            // preservation receipt with the provider and local hashes instead.
-            let mut statement = conn.prepare("SELECT o.library,o.header,p.evidence,o.operation,o.family,o.prior_generation,o.phase FROM primary_layout_preserved p JOIN primary_layout_operations o ON o.operation=p.operation ORDER BY o.operation,p.member")?;
-            let receipts = statement.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,Vec<u8>>(1)?,row.get::<_,Vec<u8>>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,i64>(5)?,row.get::<_,String>(6)?)))?;
-            for receipt in receipts {
-                let (library,header,evidence,operation,family,previous_generation,phase) = receipt?;
-                let header: super::primary_layout::LayoutOperation = super::primary_layout::decode(&header)?;
-                let child = header.child;
-                let file: super::primary_layout::LayoutFile = super::primary_layout::decode(&evidence)?;
-                if let Some(asset) = assets.get_mut(&(library,child,file.version.clone())) {
-                    asset.preserved_files.push(super::primary_layout::PreservedManifestFile {
-                        operation,family,previous_generation,phase,native_path:file.path,
-                        provider_checksum:file.provider_checksum,
-                        local_checksum:data_encoding::HEXLOWER.encode(&file.fingerprint.sha256),
-                        source_checksum:file.source_checksum,
-                        sidecar_checksum:file.sidecar.map(|sidecar|data_encoding::HEXLOWER.encode(&sidecar.sha256)),
-                        size_bytes:file.fingerprint.size,
-                    });
-                }
-            }
-            for asset in assets.values_mut() {
-                if let Some(path) = &asset.local_path {
-                    let superseded: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM primary_layout_superseded_paths s WHERE s.library=?1 AND s.child=?2 AND s.version=?3 AND s.provider_checksum=?4 AND s.compat_path=?5) AND NOT EXISTS(SELECT 1 FROM primary_layout_claims c WHERE c.library=?1 AND c.child=?2 AND c.version=?3 AND c.provider_checksum=?4 AND c.path_key=?6 AND c.operation IS NULL)",rusqlite::params![asset.library,asset.asset_id,asset.version,asset.checksum,path.to_str(),super::primary_layout::path_key(path)?],|row|row.get(0))?;
-                    if superseded { asset.local_path = None; }
-                }
-            }
-            Ok(assets.into_values().collect())
-        })
-        .await
-    }
-
-    pub(crate) async fn start_sync_run(&self) -> Result<i64, StateError> {
-        self.start_sync_run_at(Utc::now()).await
-    }
-
-    pub(crate) async fn start_sync_run_at(
-        &self,
-        started_at: DateTime<Utc>,
-    ) -> Result<i64, StateError> {
+    async fn start_sync_run_at(&self, started_at: DateTime<Utc>) -> Result<i64, StateError> {
         let started_at = started_at.timestamp();
         self.with_conn("start_sync_run", move |conn| {
             conn.execute(
@@ -666,11 +686,11 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn complete_sync_run(
-        &self,
-        run_id: i64,
-        stats: &SyncRunStats,
-    ) -> Result<(), StateError> {
+    async fn start_sync_run(&self) -> Result<i64, StateError> {
+        self.start_sync_run_at(Utc::now()).await
+    }
+
+    async fn complete_sync_run(&self, run_id: i64, stats: &SyncRunStats) -> Result<(), StateError> {
         let completed_at = Utc::now().timestamp();
         let assets_seen = i64::try_from(stats.assets_seen).unwrap_or(i64::MAX);
         let assets_downloaded = i64::try_from(stats.assets_downloaded).unwrap_or(i64::MAX);
@@ -735,30 +755,7 @@ impl SqliteStateDb {
         .await
     }
 
-    #[cfg(test)]
-    pub(crate) fn sync_run_snapshot_for_test(
-        &self,
-        run_id: i64,
-    ) -> Result<(String, i64, i64, i64, i32), StateError> {
-        let conn = self.acquire_lock("sync_run_snapshot_for_test")?;
-        conn.query_row(
-            "SELECT status, assets_seen, assets_failed, enumeration_errors, interrupted \
-             FROM sync_runs WHERE id = ?1",
-            [run_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i32>(4)?,
-                ))
-            },
-        )
-        .map_err(|e| StateError::query("sync_run_snapshot_for_test", e))
-    }
-
-    pub(crate) async fn promote_orphaned_sync_runs(&self) -> Result<u64, StateError> {
+    async fn promote_orphaned_sync_runs(&self) -> Result<u64, StateError> {
         self.with_conn("promote_orphaned_sync_runs", move |conn| {
             let rows = conn
                 .execute(
@@ -770,61 +767,6 @@ impl SqliteStateDb {
             Ok(rows as u64)
         })
         .await
-    }
-}
-
-#[async_trait]
-impl ReportStateStore for SqliteStateDb {
-    async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
-        <SqliteStateDb as ReportStateStore>::get_failed_page(self, 0, u32::MAX).await
-    }
-
-    async fn get_failed_sample(&self, limit: u32) -> Result<(Vec<AssetRecord>, u64), StateError> {
-        SqliteStateDb::get_failed_sample(self, limit).await
-    }
-
-    async fn get_failed_page(
-        &self,
-        offset: u64,
-        limit: u32,
-    ) -> Result<Vec<AssetRecord>, StateError> {
-        SqliteStateDb::get_failed_page(self, offset, limit).await
-    }
-
-    async fn get_pending_page(
-        &self,
-        offset: u64,
-        limit: u32,
-    ) -> Result<Vec<AssetRecord>, StateError> {
-        SqliteStateDb::get_pending_page(self, offset, limit).await
-    }
-
-    async fn get_summary(&self) -> Result<SyncSummary, StateError> {
-        SqliteStateDb::get_summary(self).await
-    }
-
-    async fn get_downloaded_page(
-        &self,
-        offset: u64,
-        limit: u32,
-    ) -> Result<Vec<AssetRecord>, StateError> {
-        SqliteStateDb::get_downloaded_page(self, offset, limit).await
-    }
-
-    async fn start_sync_run_at(&self, started_at: DateTime<Utc>) -> Result<i64, StateError> {
-        SqliteStateDb::start_sync_run_at(self, started_at).await
-    }
-
-    async fn start_sync_run(&self) -> Result<i64, StateError> {
-        SqliteStateDb::start_sync_run(self).await
-    }
-
-    async fn complete_sync_run(&self, run_id: i64, stats: &SyncRunStats) -> Result<(), StateError> {
-        SqliteStateDb::complete_sync_run(self, run_id, stats).await
-    }
-
-    async fn promote_orphaned_sync_runs(&self) -> Result<u64, StateError> {
-        SqliteStateDb::promote_orphaned_sync_runs(self).await
     }
 }
 

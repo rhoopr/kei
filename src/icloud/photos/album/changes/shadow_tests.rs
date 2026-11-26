@@ -2,6 +2,7 @@ use crate::icloud::photos::album::test_support::make_album_with_session;
 use crate::icloud::photos::inbox::ShadowCapture;
 use crate::icloud::photos::session::PhotosSession;
 use crate::state::SqliteStateDb;
+use crate::state::SyncTokenStore;
 use crate::state::db::account::AccountOwner;
 use crate::test_helpers::{
     assert_no_retired_inbox_archive, assert_no_temporary_backup_bundles, snapshot_database,

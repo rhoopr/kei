@@ -3,6 +3,9 @@ use crate::download::pipeline::{
     consumer::{StreamConsumerSettings, consume_stream_download_tasks},
 };
 use crate::download::planner::{self, TaskPlanner};
+#[cfg(feature = "xmp")]
+use crate::state::{DownloadStateStore, MetadataRewriteStore};
+use crate::state::{ReportStateStore, TempFileOwnershipStore};
 use crate::test_helpers::TestPhotoAsset;
 use futures_util::stream;
 use indicatif::ProgressBar;

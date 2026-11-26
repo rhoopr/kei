@@ -2,7 +2,9 @@
 #![cfg(target_os = "linux")]
 
 use crate::icloud::photos::{PhotoAsset, PhotosSession};
+use crate::state::SyncTokenStore;
 use crate::state::VersionSizeKey;
+use crate::state::{DownloadStateStore, MetadataRewriteStore, ReportStateStore};
 use crate::sync_cycle::run_cycle;
 use crate::sync_loop::test_support::{
     RunCycleDownloadConfigOptions, album_count_response, full_album_page_with_download,

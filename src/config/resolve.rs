@@ -23,53 +23,11 @@ use crate::types::{
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-/// Programmatic durable sync overrides.
-///
-/// Public CLI/env no longer expose these fields in v0.20. Tests and internal
-/// call sites that need to exercise the resolver can still pass explicit
-/// overrides without re-growing [`crate::cli::SyncArgs`].
-#[derive(Debug, Clone, Default)]
-pub(crate) struct SyncConfigOverrides {
-    pub download_dir: Option<String>,
-    pub albums: Vec<String>,
-    pub smart_folders: Vec<String>,
-    pub unfiled: Option<bool>,
-    pub libraries: Vec<String>,
-    pub threads: Option<u16>,
-    pub bandwidth_limit: Option<u64>,
-    pub skip_videos: Option<bool>,
-    pub skip_photos: Option<bool>,
-    pub folder_structure: Option<String>,
-    pub folder_structure_albums: Option<String>,
-    pub folder_structure_smart_folders: Option<String>,
-    pub set_exif_datetime: Option<bool>,
-    pub set_exif_rating: Option<bool>,
-    pub set_exif_gps: Option<bool>,
-    pub set_exif_description: Option<bool>,
-    #[cfg(feature = "xmp")]
-    pub embed_xmp: Option<bool>,
-    #[cfg(feature = "xmp")]
-    pub xmp_sidecar: Option<bool>,
-    pub watch_with_interval: Option<u64>,
-    pub keep_unicode_in_filenames: Option<bool>,
-    pub live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
-    pub file_match_policy: Option<FileMatchPolicy>,
-    pub max_retries: Option<u32>,
-    pub temp_suffix: Option<String>,
-    pub notify_systemd: Option<bool>,
-    pub pid_file: Option<PathBuf>,
-    pub reconcile_every_n_cycles: Option<u64>,
-    pub notification_script: Option<String>,
-    pub report_json: Option<PathBuf>,
-    pub http_port: Option<u16>,
-    pub http_bind: Option<std::net::IpAddr>,
-}
-
 // ── Application Config ──────────────────────────────────────────────
 
-/// Resolve library selection from the programmatic override, TOML, or the
-/// default (`primary`). The override and TOML `[filters].libraries` array share
-/// the selector grammar
+/// Resolve library selection from a command's library arguments, TOML, or the
+/// default (`primary`). The arguments and TOML `[filters].libraries` array
+/// share the selector grammar
 /// (`primary` / `shared` / `all` / `none` / `!name` / raw zone names);
 ///
 /// Returns the parsed [`crate::selection::LibrarySelector`]; the matching
@@ -86,10 +44,8 @@ pub(crate) fn resolve_library_selector(
 
 pub(crate) fn resolve_media_selection(
     toml_filters: Option<&TomlFilters>,
-    skip_videos_override: Option<bool>,
-    skip_photos_override: Option<bool>,
 ) -> anyhow::Result<MediaSelection> {
-    let mut selection = if let Some(kinds) = toml_filters.and_then(|f| f.exclude.as_ref()) {
+    let selection = if let Some(kinds) = toml_filters.and_then(|f| f.exclude.as_ref()) {
         let mut seen = BTreeSet::new();
         let mut selection = MediaSelection::all();
         for kind in kinds {
@@ -110,13 +66,6 @@ pub(crate) fn resolve_media_selection(
         MediaSelection::all()
     };
 
-    if let Some(skip_videos) = skip_videos_override {
-        selection.videos = !skip_videos;
-    }
-    if let Some(skip_photos) = skip_photos_override {
-        selection.photos = !skip_photos;
-    }
-
     anyhow::ensure!(
         selection.photos || selection.videos || selection.live_photos,
         "[filters].exclude must leave at least one media component selected."
@@ -125,11 +74,10 @@ pub(crate) fn resolve_media_selection(
     Ok(selection)
 }
 
-/// Default for `Selection.unfiled` when the user did not pass `--unfiled`
-/// explicitly: always `true` in v0.13. The unfiled pass is independent of
-/// `--album`: `kei sync --album Vacation` runs the Vacation pass *and* the
-/// unfiled pass unless the user explicitly disables it with
-/// `--unfiled false`. `--unfiled` always wins when supplied.
+/// Default for `Selection.unfiled` when `[filters].unfiled` is absent: always
+/// `true` in v0.13. The unfiled pass is independent of album selection:
+/// `albums = ["Vacation"]` runs the Vacation pass *and* the unfiled pass unless
+/// the user explicitly sets `[filters].unfiled = false`.
 pub(crate) const fn unfiled_default() -> bool {
     true
 }
@@ -147,13 +95,6 @@ fn resolve_ref<T: Clone>(cli: Option<&T>, toml: Option<&T>, default: T) -> T {
     cli.or(toml).cloned().unwrap_or(default)
 }
 
-/// For boolean flags: CLI explicit value wins, then TOML, then false.
-/// `Option<bool>` allows the CLI to explicitly pass `--flag false` to
-/// override a TOML `true`.
-fn resolve_flag(cli_flag: Option<bool>, toml_val: Option<bool>) -> bool {
-    cli_flag.or(toml_val).unwrap_or(false)
-}
-
 /// For repeatable Vec flags where empty CLI input means "no override":
 /// CLI value wins iff non-empty, else TOML, else empty. Mirrors how
 /// `clap` represents an absent repeatable flag (`Vec::new()`).
@@ -162,33 +103,6 @@ fn resolve_vec(cli: Vec<String>, toml: Option<Vec<String>>) -> Vec<String> {
         toml.unwrap_or_default()
     } else {
         cli
-    }
-}
-
-/// CLI inputs for [`resolve_path_derivation_fields`].
-///
-/// Each field is `Option<T>`; `Some` means the CLI (or env var) supplied
-/// the value, `None` means fall through to TOML and then to the default.
-#[derive(Debug, Default)]
-pub(crate) struct PathDerivationCliArgs {
-    pub folder_structure: Option<String>,
-    pub folder_structure_albums: Option<String>,
-    pub folder_structure_smart_folders: Option<String>,
-    pub live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
-    pub file_match_policy: Option<FileMatchPolicy>,
-    pub keep_unicode_in_filenames: Option<bool>,
-}
-
-impl PathDerivationCliArgs {
-    fn from_overrides(overrides: &SyncConfigOverrides) -> Self {
-        Self {
-            folder_structure: overrides.folder_structure.clone(),
-            folder_structure_albums: overrides.folder_structure_albums.clone(),
-            folder_structure_smart_folders: overrides.folder_structure_smart_folders.clone(),
-            live_photo_mov_filename_policy: overrides.live_photo_mov_filename_policy,
-            file_match_policy: overrides.file_match_policy,
-            keep_unicode_in_filenames: overrides.keep_unicode_in_filenames,
-        }
     }
 }
 
@@ -213,30 +127,23 @@ pub(crate) struct PathDerivationFields {
     pub keep_unicode_in_filenames: bool,
 }
 
-/// Resolve the CLI > TOML > default chain for every field that affects
-/// path derivation, shared by sync and import.
+/// Resolve every TOML-configurable field that affects path derivation,
+/// shared by sync and import.
 pub(crate) fn resolve_path_derivation_fields(
-    cli: PathDerivationCliArgs,
     toml: Option<&TomlConfig>,
 ) -> anyhow::Result<PathDerivationFields> {
     let toml_dl = toml.and_then(|t| t.download.as_ref());
     let toml_photos = toml.and_then(|t| t.photos.as_ref());
 
-    let folder_structure = resolve_ref(
-        cli.folder_structure.as_ref(),
-        toml_dl.and_then(|d| d.folder_structure.as_ref()),
-        "%Y/%m/%d".to_string(),
-    );
-    let folder_structure_albums = resolve_ref(
-        cli.folder_structure_albums.as_ref(),
-        toml_dl.and_then(|d| d.folder_structure_albums.as_ref()),
-        DEFAULT_FOLDER_STRUCTURE_ALBUMS.to_string(),
-    );
-    let folder_structure_smart_folders = resolve_ref(
-        cli.folder_structure_smart_folders.as_ref(),
-        toml_dl.and_then(|d| d.folder_structure_smart_folders.as_ref()),
-        DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS.to_string(),
-    );
+    let folder_structure = toml_dl
+        .and_then(|d| d.folder_structure.clone())
+        .unwrap_or_else(|| "%Y/%m/%d".to_string());
+    let folder_structure_albums = toml_dl
+        .and_then(|d| d.folder_structure_albums.clone())
+        .unwrap_or_else(|| DEFAULT_FOLDER_STRUCTURE_ALBUMS.to_string());
+    let folder_structure_smart_folders = toml_dl
+        .and_then(|d| d.folder_structure_smart_folders.clone())
+        .unwrap_or_else(|| DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS.to_string());
     let resolution = PhotoResolution::Original;
     let live_resolution = LivePhotoResolution::Original;
     let exclusions = toml
@@ -244,11 +151,9 @@ pub(crate) fn resolve_path_derivation_fields(
         .and_then(|f| f.exclude.as_deref())
         .unwrap_or_default();
     let live_photo_mode = MediaExclusion::live_mode(exclusions);
-    let live_photo_mov_filename_policy = resolve(
-        cli.live_photo_mov_filename_policy,
-        toml_photos.and_then(|p| p.live_photo_mov_filename_policy),
-        LivePhotoMovFilenamePolicy::Suffix,
-    );
+    let live_photo_mov_filename_policy = toml_photos
+        .and_then(|p| p.live_photo_mov_filename_policy)
+        .unwrap_or(LivePhotoMovFilenamePolicy::Suffix);
     let edited = true;
     let edited_naming = if toml_photos
         .and_then(|p| p.edited_as_primary)
@@ -260,16 +165,13 @@ pub(crate) fn resolve_path_derivation_fields(
     };
     let alternative = true;
     let raw_policy = RawPolicy::AsIs;
-    let file_match_policy = resolve(
-        cli.file_match_policy,
-        toml_photos.and_then(|p| p.file_match_policy),
-        FileMatchPolicy::NameSizeDedupWithSuffix,
-    );
+    let file_match_policy = toml_photos
+        .and_then(|p| p.file_match_policy)
+        .unwrap_or(FileMatchPolicy::NameSizeDedupWithSuffix);
     let force_resolution = true;
-    let keep_unicode_in_filenames = resolve_flag(
-        cli.keep_unicode_in_filenames,
-        toml_photos.and_then(|p| p.keep_unicode_in_filenames),
-    );
+    let keep_unicode_in_filenames = toml_photos
+        .and_then(|p| p.keep_unicode_in_filenames)
+        .unwrap_or(false);
 
     Ok(PathDerivationFields {
         folder_structure,
@@ -289,23 +191,19 @@ pub(crate) fn resolve_path_derivation_fields(
     })
 }
 
-/// Resolve `--notify-systemd` given the explicit CLI / TOML values and
-/// whether `NOTIFY_SOCKET` is present in the environment.
+/// Resolve `[watch].notify_systemd` and whether `NOTIFY_SOCKET` is present in
+/// the environment.
 ///
-/// Explicit settings (CLI or TOML) take precedence in that order. When
-/// nothing is set, auto-detect: `NOTIFY_SOCKET` is the env var systemd's
-/// `Type=notify` units publish, so its presence is a reliable signal that
-/// the sd_notify messages will have a listener. No other launcher sets it,
-/// so false positives are effectively zero.
+/// An explicit TOML setting wins. When nothing is set, auto-detect:
+/// `NOTIFY_SOCKET` is the env var systemd's `Type=notify` units publish, so its
+/// presence is a reliable signal that the sd_notify messages will have a
+/// listener. No other launcher sets it, so false positives are effectively
+/// zero.
 ///
 /// Pure policy function so the truth table is testable without touching
 /// process environment state.
-pub(crate) fn resolve_notify_systemd(
-    cli: Option<bool>,
-    toml: Option<bool>,
-    notify_socket_present: bool,
-) -> bool {
-    cli.or(toml).unwrap_or(notify_socket_present)
+pub(crate) fn resolve_notify_systemd(toml: Option<bool>, notify_socket_present: bool) -> bool {
+    toml.unwrap_or(notify_socket_present)
 }
 
 /// Smart initial retry delay (seconds) derived from retry `per_transfer`.
@@ -358,16 +256,6 @@ pub(crate) fn resolve_auth(
     Ok((username, password, domain, cookie_directory))
 }
 
-#[cfg(test)]
-fn take_sync_config_overrides(sync: &mut crate::cli::SyncArgs) -> SyncConfigOverrides {
-    std::mem::take(&mut sync.config_overrides)
-}
-
-#[cfg(not(test))]
-fn take_sync_config_overrides(_sync: &mut crate::cli::SyncArgs) -> SyncConfigOverrides {
-    SyncConfigOverrides::default()
-}
-
 impl Config {
     /// Build a Config by merging CLI args with optional TOML config.
     /// Runtime CLI flags override TOML where they remain public. Durable sync
@@ -378,14 +266,11 @@ impl Config {
         sync: crate::cli::SyncArgs,
         toml: Option<&TomlConfig>,
     ) -> anyhow::Result<Self> {
-        let mut sync = sync;
-        let overrides = take_sync_config_overrides(&mut sync);
         let friendly_request = toml.and_then(|t| t.ui.as_ref()).and_then(|u| u.friendly);
         Self::build_inner_impl(
             globals,
             pw,
             sync,
-            overrides,
             toml,
             crate::personality::Mode::Off,
             friendly_request,
@@ -400,22 +285,13 @@ impl Config {
         personality_mode: crate::personality::Mode,
         friendly_request: Option<bool>,
     ) -> anyhow::Result<Self> {
-        Self::build_inner_impl(
-            globals,
-            pw,
-            sync,
-            SyncConfigOverrides::default(),
-            toml,
-            personality_mode,
-            friendly_request,
-        )
+        Self::build_inner_impl(globals, pw, sync, toml, personality_mode, friendly_request)
     }
 
     fn build_inner_impl(
         globals: &GlobalArgs,
         pw: &crate::cli::PasswordArgs,
         sync: crate::cli::SyncArgs,
-        overrides: SyncConfigOverrides,
         toml: Option<&TomlConfig>,
         personality_mode: crate::personality::Mode,
         friendly_request: Option<bool>,
@@ -514,53 +390,44 @@ impl Config {
         let toml_ui = toml.and_then(|t| t.ui.as_ref());
         let toml_watch = toml.and_then(|t| t.watch.as_ref());
         let toml_server = toml.and_then(|t| t.server.as_ref());
-        let path_derivation_args = PathDerivationCliArgs::from_overrides(&overrides);
 
         // Download
-        let directory = overrides
-            .download_dir
-            .or_else(|| toml_dl.and_then(|d| d.directory.clone()))
+        let directory = toml_dl
+            .and_then(|d| d.directory.clone())
             .map(|d| expand_tilde(&d))
             .unwrap_or_default();
         if !directory.as_os_str().is_empty() {
             validate_download_dir(&directory)?;
         }
-        // Resolve bandwidth limit (CLI bytes/sec > TOML human-readable string > None).
-        let bandwidth_limit: Option<u64> = if let Some(n) = overrides.bandwidth_limit {
-            Some(n)
-        } else if let Some(s) = toml_dl.and_then(|d| d.bandwidth_limit.as_ref()) {
-            Some(crate::cli::parse_bandwidth_limit(s).map_err(|e| {
-                anyhow::anyhow!("Invalid [download].bandwidth_limit in config: {e}")
-            })?)
-        } else {
-            None
-        };
+        // Resolve bandwidth limit (TOML human-readable string > None).
+        let bandwidth_limit: Option<u64> =
+            if let Some(s) = toml_dl.and_then(|d| d.bandwidth_limit.as_ref()) {
+                Some(crate::cli::parse_bandwidth_limit(s).map_err(|e| {
+                    anyhow::anyhow!("Invalid [download].bandwidth_limit in config: {e}")
+                })?)
+            } else {
+                None
+            };
 
         let toml_threads = toml_dl.and_then(|d| d.threads);
 
-        // When a bandwidth limit is set without an explicit thread-count flag,
+        // When a bandwidth limit is set without an explicit thread count,
         // default concurrency to 1: many connections starving for a capped
         // total budget just fragments downloads and adds connection overhead.
-        let threads_explicitly_set = overrides.threads.is_some() || toml_threads.is_some();
-        let threads_default = if bandwidth_limit.is_some() && !threads_explicitly_set {
+        let threads_default = if bandwidth_limit.is_some() && toml_threads.is_none() {
             1
         } else {
             10
         };
 
-        let threads_num = overrides
-            .threads
-            .or(toml_threads)
-            .unwrap_or(threads_default);
+        let threads_num = toml_threads.unwrap_or(threads_default);
         anyhow::ensure!(
             (1..=64).contains(&threads_num),
             "[download].threads must be between 1 and 64, got {threads_num}."
         );
-        let temp_suffix = resolve(
-            overrides.temp_suffix,
-            toml_dl.and_then(|d| d.temp_suffix.clone()),
-            ".kei-tmp".to_string(),
-        );
+        let temp_suffix = toml_dl
+            .and_then(|d| d.temp_suffix.clone())
+            .unwrap_or_else(|| ".kei-tmp".to_string());
         let PathDerivationFields {
             folder_structure,
             folder_structure_albums,
@@ -576,39 +443,26 @@ impl Config {
             file_match_policy,
             force_resolution,
             keep_unicode_in_filenames,
-        } = resolve_path_derivation_fields(path_derivation_args, toml)?;
-        let set_exif_datetime = resolve_flag(
-            overrides.set_exif_datetime,
-            toml_metadata.and_then(|m| m.set_exif_datetime),
-        );
-        let set_exif_rating = resolve_flag(
-            overrides.set_exif_rating,
-            toml_metadata.and_then(|m| m.set_exif_rating),
-        );
-        let set_exif_gps = resolve_flag(
-            overrides.set_exif_gps,
-            toml_metadata.and_then(|m| m.set_exif_gps),
-        );
-        let set_exif_description = resolve_flag(
-            overrides.set_exif_description,
-            toml_metadata.and_then(|m| m.set_exif_description),
-        );
+        } = resolve_path_derivation_fields(toml)?;
+        let set_exif_datetime = toml_metadata
+            .and_then(|m| m.set_exif_datetime)
+            .unwrap_or(false);
+        let set_exif_rating = toml_metadata
+            .and_then(|m| m.set_exif_rating)
+            .unwrap_or(false);
+        let set_exif_gps = toml_metadata.and_then(|m| m.set_exif_gps).unwrap_or(false);
+        let set_exif_description = toml_metadata
+            .and_then(|m| m.set_exif_description)
+            .unwrap_or(false);
         #[cfg(feature = "xmp")]
-        let embed_xmp = resolve_flag(overrides.embed_xmp, toml_metadata.and_then(|m| m.embed_xmp));
+        let embed_xmp = toml_metadata.and_then(|m| m.embed_xmp).unwrap_or(false);
         #[cfg(feature = "xmp")]
-        let xmp_sidecar = resolve_flag(
-            overrides.xmp_sidecar,
-            toml_metadata.and_then(|m| m.xmp_sidecar),
-        );
+        let xmp_sidecar = toml_metadata.and_then(|m| m.xmp_sidecar).unwrap_or(false);
         let no_progress_bar =
             sync.no_progress_bar || !toml_ui.and_then(|u| u.progress_bar).unwrap_or(true);
 
         // Re-validate; clap range attrs run on CLI only.
-        let max_retries = resolve(
-            overrides.max_retries,
-            toml_retry.and_then(|r| r.per_transfer),
-            3,
-        );
+        let max_retries = toml_retry.and_then(|r| r.per_transfer).unwrap_or(3);
         anyhow::ensure!(
             max_retries <= 100,
             "[download.retry].per_transfer must be 100 or less, got {max_retries}."
@@ -616,9 +470,10 @@ impl Config {
         let retry_delay_secs = smart_retry_delay(max_retries);
 
         // Filters
-        let library_selector = resolve_library_selector(overrides.libraries, toml_filters)?;
-        let toml_albums = toml_filters.and_then(|f| f.albums.clone());
-        let raw_albums = resolve_vec(overrides.albums, toml_albums);
+        let library_selector = resolve_library_selector(Vec::new(), toml_filters)?;
+        let raw_albums = toml_filters
+            .and_then(|f| f.albums.clone())
+            .unwrap_or_default();
 
         // The base template is for unfiled/library-only paths. Album-specific
         // paths must use `folder_structure_albums`.
@@ -626,18 +481,14 @@ impl Config {
         validate_template_tokens(&folder_structure_albums, TemplateKind::Albums)?;
         validate_template_tokens(&folder_structure_smart_folders, TemplateKind::SmartFolders)?;
 
-        let media =
-            resolve_media_selection(toml_filters, overrides.skip_videos, overrides.skip_photos)?;
+        let media = resolve_media_selection(toml_filters)?;
         let skip_videos = media.skip_videos();
         let skip_photos = media.skip_photos();
-        let raw_smart_folders = resolve_vec(
-            overrides.smart_folders,
-            toml_filters.and_then(|f| f.smart_folders.clone()),
-        );
+        let raw_smart_folders = toml_filters
+            .and_then(|f| f.smart_folders.clone())
+            .unwrap_or_default();
 
-        let unfiled_override = overrides
-            .unfiled
-            .or_else(|| toml_filters.and_then(|f| f.unfiled));
+        let unfiled_override = toml_filters.and_then(|f| f.unfiled);
 
         let selection = crate::selection::Selection {
             albums: crate::selection::parse_album_selector(&raw_albums, true)?,
@@ -680,71 +531,57 @@ impl Config {
             );
         }
 
-        let watch_with_interval = overrides
-            .watch_with_interval
-            .or_else(|| toml_watch.and_then(|w| w.interval));
+        let watch_with_interval = toml_watch.and_then(|w| w.interval);
         if let Some(n) = watch_with_interval {
             anyhow::ensure!(
                 (60..=86400).contains(&n),
                 "watch interval must be in 60..=86400 seconds, got {n}"
             );
         }
-        // Auto-detect systemd via `NOTIFY_SOCKET` when neither CLI nor TOML
-        // sets the flag explicitly. See `resolve_notify_systemd`.
+        // Auto-detect systemd via `NOTIFY_SOCKET` when TOML does not set the
+        // flag explicitly. See `resolve_notify_systemd`.
         let notify_systemd = resolve_notify_systemd(
-            overrides.notify_systemd,
             toml_watch.and_then(|w| w.notify_systemd),
             std::env::var_os("NOTIFY_SOCKET").is_some(),
         );
-        let pid_file = overrides.pid_file.or_else(|| {
-            toml_watch
-                .and_then(|w| w.pid_file.as_ref())
-                .map(PathBuf::from)
-        });
+        let pid_file = toml_watch
+            .and_then(|w| w.pid_file.as_ref())
+            .map(PathBuf::from);
         // `.filter` collapses TOML's `reconcile_every_n_cycles = 0` to None,
-        // matching the documented "0 = off" semantic. The CLI parser already
-        // rejects 0, so the filter only fires for the TOML path.
-        let reconcile_every_n_cycles = overrides
-            .reconcile_every_n_cycles
-            .or_else(|| toml_watch.and_then(|w| w.reconcile_every_n_cycles))
+        // matching the documented "0 = off" semantic.
+        let reconcile_every_n_cycles = toml_watch
+            .and_then(|w| w.reconcile_every_n_cycles)
             .filter(|n| *n > 0);
 
         // Notifications
         let toml_notif = toml.and_then(|t| t.notifications.as_ref());
-        let notification_script = overrides
-            .notification_script
-            .or_else(|| toml_notif.and_then(|n| n.script.clone()))
+        let notification_script = toml_notif
+            .and_then(|n| n.script.clone())
             .map(|s| expand_tilde(&s));
 
-        // JSON report: CLI > [report] json TOML > none.
+        // JSON report: [report] json TOML > none.
         let toml_report = toml.and_then(|t| t.report.as_ref());
-        let report_json = overrides.report_json.or_else(|| {
-            toml_report
-                .and_then(|r| r.json.as_deref())
-                .map(expand_tilde)
-        });
+        let report_json = toml_report
+            .and_then(|r| r.json.as_deref())
+            .map(expand_tilde);
 
-        // HTTP server port - CLI > [server] TOML > default 9090.
+        // HTTP server port - [server] TOML > default 9090.
         const DEFAULT_HTTP_PORT: u16 = 9090;
-        let http_port = overrides
-            .http_port
-            .or_else(|| toml_server.and_then(|s| s.port))
+        let http_port = toml_server
+            .and_then(|s| s.port)
             .unwrap_or(DEFAULT_HTTP_PORT);
 
-        // HTTP server bind address — CLI > [server] bind TOML > default 0.0.0.0.
+        // HTTP server bind address — [server] bind TOML > default 0.0.0.0.
         // 0.0.0.0 preserves the historical behavior and keeps Docker's `-p 9090:9090`
         // working out of the box; desktop users can set 127.0.0.1 to restrict
         // /healthz and /metrics to loopback.
         const DEFAULT_HTTP_BIND: std::net::IpAddr =
             std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0));
-        let http_bind = match overrides.http_bind {
-            Some(addr) => addr,
-            None => match toml_server.and_then(|s| s.bind.as_deref()) {
-                Some(raw) => raw.parse::<std::net::IpAddr>().map_err(|e| {
-                    anyhow::anyhow!("[server].bind must be an IP address, but got {raw:?}: {e}")
-                })?,
-                None => DEFAULT_HTTP_BIND,
-            },
+        let http_bind = match toml_server.and_then(|s| s.bind.as_deref()) {
+            Some(raw) => raw.parse::<std::net::IpAddr>().map_err(|e| {
+                anyhow::anyhow!("[server].bind must be an IP address, but got {raw:?}: {e}")
+            })?,
+            None => DEFAULT_HTTP_BIND,
         };
 
         Ok(Self {
@@ -859,7 +696,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::{
-        PathDerivationCliArgs, resolve_auth, resolve_library_selector, resolve_notify_systemd,
+        resolve_auth, resolve_library_selector, resolve_notify_systemd,
         resolve_path_derivation_fields, smart_retry_delay,
     };
     use crate::config::input::{TomlConfig, TomlFilters, TomlUi};
@@ -921,9 +758,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(cfg.photos.edited_naming, expected, "input: {input}");
-            let fields =
-                resolve_path_derivation_fields(PathDerivationCliArgs::default(), Some(&toml))
-                    .unwrap();
+            let fields = resolve_path_derivation_fields(Some(&toml)).unwrap();
             assert_eq!(fields.edited_naming, expected, "input: {input}");
         }
         let cfg = Config::build(
@@ -1011,22 +846,23 @@ mod tests {
         );
     }
     #[test]
-    fn test_build_cli_overrides_toml() {
+    fn test_build_toml_threads_and_libraries() {
         let toml_str = r#"
             [download]
-            threads = 4
+            threads = 8
 
             [filters]
-            libraries = ["SharedSync-ABC"]
+            libraries = ["PrimarySync"]
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
 
-        let mut sync = default_sync();
-        sync.config_overrides.threads = Some(8);
-        sync.config_overrides.libraries = vec!["PrimarySync".to_string()];
-
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         assert_eq!(cfg.download.threads_num, 8);
         assert_eq!(
             cfg.filters.selection.libraries.to_raw(),
@@ -1034,24 +870,23 @@ mod tests {
         );
     }
     #[test]
-    fn test_library_all_value() {
-        let mut sync = default_sync();
-        sync.config_overrides.libraries = vec!["all".to_string()];
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert_eq!(
-            cfg.filters.selection.libraries.to_raw(),
-            vec!["all".to_string()]
-        );
-    }
-    #[test]
-    fn test_library_all_case_insensitive() {
-        let mut sync = default_sync();
-        sync.config_overrides.libraries = vec!["ALL".to_string()];
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert_eq!(
-            cfg.filters.selection.libraries.to_raw(),
-            vec!["all".to_string()]
-        );
+    fn test_library_all_case_insensitive_from_toml() {
+        for raw in ["all", "ALL", "All"] {
+            let toml_str = format!("[filters]\nlibraries = [\"{raw}\"]\n");
+            let toml: TomlConfig = toml::from_str(&toml_str).unwrap();
+            let cfg = Config::build(
+                &default_globals(),
+                &default_password(),
+                default_sync(),
+                Some(&toml),
+            )
+            .unwrap();
+            assert_eq!(
+                cfg.filters.selection.libraries.to_raw(),
+                vec!["all".to_string()],
+                "libraries = [\"{raw}\"] must resolve to all"
+            );
+        }
     }
     #[test]
     fn test_library_all_from_toml() {
@@ -1073,27 +908,33 @@ mod tests {
         );
     }
     #[test]
-    fn config_build_unfiled_bare_flag_resolves_to_true() {
-        let mut sync = default_sync();
-        sync.config_overrides.unfiled = Some(true);
-        let mut globals = default_globals();
-        globals.username = Some("u@example.com".to_string());
-        let cfg = Config::build(&globals, &default_password(), sync, None).unwrap();
+    fn config_build_unfiled_true_from_toml() {
+        let toml: TomlConfig = toml::from_str("[filters]\nunfiled = true\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         assert!(
             cfg.filters.selection.unfiled,
-            "bare --unfiled must resolve Selection.unfiled = true"
+            "[filters].unfiled = true must resolve Selection.unfiled = true"
         );
     }
     #[test]
-    fn config_build_unfiled_explicit_false_resolves_to_false() {
-        let mut sync = default_sync();
-        sync.config_overrides.unfiled = Some(false);
-        let mut globals = default_globals();
-        globals.username = Some("u@example.com".to_string());
-        let cfg = Config::build(&globals, &default_password(), sync, None).unwrap();
+    fn config_build_unfiled_false_from_toml() {
+        let toml: TomlConfig = toml::from_str("[filters]\nunfiled = false\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         assert!(
             !cfg.filters.selection.unfiled,
-            "explicit `--unfiled false` must resolve Selection.unfiled = false"
+            "[filters].unfiled = false must resolve Selection.unfiled = false"
         );
     }
     //
@@ -1107,9 +948,15 @@ mod tests {
 
     #[test]
     fn config_build_smart_folder_resolves_to_named_selector() {
-        let mut sync = default_sync();
-        sync.config_overrides.smart_folders = vec!["Favorites".to_string()];
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let toml: TomlConfig =
+            toml::from_str("[filters]\nsmart_folders = [\"Favorites\"]\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         assert_eq!(
             cfg.filters.selection.smart_folders.to_raw(),
             vec!["Favorites".to_string()]
@@ -1117,10 +964,16 @@ mod tests {
     }
     #[test]
     fn config_build_smart_folder_all_with_sensitive_resolves() {
-        let mut sync = default_sync();
-        sync.config_overrides.smart_folders =
-            vec!["all-with-sensitive".to_string(), "!Hidden".to_string()];
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let toml: TomlConfig =
+            toml::from_str("[filters]\nsmart_folders = [\"all-with-sensitive\", \"!Hidden\"]\n")
+                .unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         match cfg.filters.selection.smart_folders {
             crate::selection::SmartFolderSelector::All {
                 include_sensitive,
@@ -1140,9 +993,15 @@ mod tests {
     }
     #[test]
     fn config_build_library_repeatable_primary_plus_shared() {
-        let mut sync = default_sync();
-        sync.config_overrides.libraries = vec!["primary".to_string(), "shared".to_string()];
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let toml: TomlConfig =
+            toml::from_str("[filters]\nlibraries = [\"primary\", \"shared\"]\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         assert!(
             cfg.filters.selection.libraries.primary,
             "--library primary must set primary = true"
@@ -1160,10 +1019,16 @@ mod tests {
     }
     #[test]
     fn config_build_library_repeatable_named_zone_with_primary() {
-        let mut sync = default_sync();
-        sync.config_overrides.libraries =
-            vec!["primary".to_string(), "SharedSync-A1B2C3D4".to_string()];
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let toml: TomlConfig =
+            toml::from_str("[filters]\nlibraries = [\"primary\", \"SharedSync-A1B2C3D4\"]\n")
+                .unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         let lib = &cfg.filters.selection.libraries;
         assert!(lib.primary, "primary must remain set");
         assert!(!lib.shared_all, "no `shared` sentinel was passed");
@@ -1174,10 +1039,16 @@ mod tests {
         );
     }
     #[test]
-    fn config_build_folder_structure_albums_resolves_through_cli() {
-        let mut sync = default_sync();
-        sync.config_overrides.folder_structure_albums = Some("{album}/%Y/%m/%d".to_string());
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+    fn config_build_folder_structure_albums_resolves_through_toml() {
+        let toml: TomlConfig =
+            toml::from_str("[download]\nfolder_structure_albums = \"{album}/%Y/%m/%d\"\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         assert_eq!(cfg.download.folder_structure_albums, "{album}/%Y/%m/%d");
         // Default unfiled / smart-folder templates are untouched.
         assert_eq!(
@@ -1186,11 +1057,17 @@ mod tests {
         );
     }
     #[test]
-    fn config_build_folder_structure_smart_folders_resolves_through_cli() {
-        let mut sync = default_sync();
-        sync.config_overrides.folder_structure_smart_folders =
-            Some("{smart-folder}/%Y".to_string());
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+    fn config_build_folder_structure_smart_folders_resolves_through_toml() {
+        let toml: TomlConfig =
+            toml::from_str("[download]\nfolder_structure_smart_folders = \"{smart-folder}/%Y\"\n")
+                .unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         assert_eq!(
             cfg.download.folder_structure_smart_folders,
             "{smart-folder}/%Y"
@@ -1295,8 +1172,7 @@ mod tests {
         );
     }
     #[test]
-    fn config_build_cli_overrides_toml_folder_structure_keys() {
-        // CLI > TOML precedence on the new per-category template keys.
+    fn config_build_toml_folder_structure_keys_custom() {
         let toml_str = r#"
             [download]
             folder_structure_albums = "{album}/from-toml"
@@ -1304,16 +1180,17 @@ mod tests {
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
 
-        let mut sync = default_sync();
-        sync.config_overrides.folder_structure_albums = Some("{album}/from-cli".to_string());
-        sync.config_overrides.folder_structure_smart_folders =
-            Some("{smart-folder}/from-cli".to_string());
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        assert_eq!(cfg.download.folder_structure_albums, "{album}/from-cli");
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.download.folder_structure_albums, "{album}/from-toml");
         assert_eq!(
             cfg.download.folder_structure_smart_folders,
-            "{smart-folder}/from-cli"
+            "{smart-folder}/from-toml"
         );
     }
     #[test]
@@ -1332,64 +1209,43 @@ mod tests {
     fn test_build_bandwidth_limit_resolution() {
         struct Case {
             name: &'static str,
-            cli: Option<u64>,
-            toml_cli_threads: Option<u16>,
-            toml: Option<&'static str>,
+            bandwidth_limit: Option<&'static str>,
             toml_threads: Option<u16>,
             want_limit: Option<u64>,
             want_threads: u16,
         }
         let cases = [
             Case {
-                name: "cli sets limit, threads defaults to 1",
-                cli: Some(5_000_000),
-                toml_cli_threads: None,
-                toml: None,
+                name: "limit alone defaults threads to 1",
+                bandwidth_limit: Some("5000000"),
                 toml_threads: None,
                 want_limit: Some(5_000_000),
                 want_threads: 1,
             },
             Case {
-                name: "toml string parses into u64",
-                cli: None,
-                toml_cli_threads: None,
-                toml: Some("2M"),
+                name: "human-readable limit parses into u64",
+                bandwidth_limit: Some("2M"),
                 toml_threads: None,
                 want_limit: Some(2_000_000),
                 want_threads: 1,
             },
             Case {
-                name: "cli overrides toml",
-                cli: Some(10_000_000),
-                toml_cli_threads: None,
-                toml: Some("1M"),
-                toml_threads: None,
-                want_limit: Some(10_000_000),
-                want_threads: 1,
-            },
-            Case {
-                name: "explicit cli threads overrides auto-1",
-                cli: Some(500_000),
-                toml_cli_threads: Some(4),
-                toml: None,
-                toml_threads: None,
+                name: "explicit threads override auto-1",
+                bandwidth_limit: Some("500000"),
+                toml_threads: Some(4),
                 want_limit: Some(500_000),
                 want_threads: 4,
             },
             Case {
-                name: "toml threads overrides auto-1",
-                cli: None,
-                toml_cli_threads: None,
-                toml: Some("1M"),
+                name: "toml threads override auto-1",
+                bandwidth_limit: Some("1M"),
                 toml_threads: Some(3),
                 want_limit: Some(1_000_000),
                 want_threads: 3,
             },
             Case {
                 name: "no limit keeps default 10 threads",
-                cli: None,
-                toml_cli_threads: None,
-                toml: None,
+                bandwidth_limit: None,
                 toml_threads: None,
                 want_limit: None,
                 want_threads: 10,
@@ -1397,7 +1253,7 @@ mod tests {
         ];
 
         for case in cases {
-            let toml = match (case.toml, case.toml_threads) {
+            let toml = match (case.bandwidth_limit, case.toml_threads) {
                 (None, None) => None,
                 (limit, threads) => {
                     let mut body = "[download]\n".to_string();
@@ -1410,11 +1266,13 @@ mod tests {
                     Some(toml::from_str::<TomlConfig>(&body).unwrap())
                 }
             };
-            let mut sync = default_sync();
-            sync.config_overrides.bandwidth_limit = case.cli;
-            sync.config_overrides.threads = case.toml_cli_threads;
-            let cfg = Config::build(&default_globals(), &default_password(), sync, toml.as_ref())
-                .unwrap_or_else(|e| panic!("{}: build failed: {e}", case.name));
+            let cfg = Config::build(
+                &default_globals(),
+                &default_password(),
+                default_sync(),
+                toml.as_ref(),
+            )
+            .unwrap_or_else(|e| panic!("{}: build failed: {e}", case.name));
             assert_eq!(
                 cfg.download.bandwidth_limit, case.want_limit,
                 "{}",
@@ -1425,10 +1283,16 @@ mod tests {
     }
     #[test]
     fn build_bails_when_album_token_appears_in_smart_folders_template() {
-        let mut sync = default_sync();
-        sync.config_overrides.folder_structure_smart_folders = Some("{album}/%Y".to_string());
-        let err = Config::build(&default_globals(), &default_password(), sync, None)
-            .expect_err("`{album}` in --folder-structure-smart-folders must bail");
+        let toml: TomlConfig =
+            toml::from_str("[download]\nfolder_structure_smart_folders = \"{album}/%Y\"\n")
+                .unwrap();
+        let err = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .expect_err("`{album}` in [download].folder_structure_smart_folders must bail");
         let msg = err.to_string();
         assert!(
             msg.contains("--folder-structure-smart-folders")
@@ -1438,10 +1302,16 @@ mod tests {
     }
     #[test]
     fn build_bails_when_library_token_misplaced() {
-        let mut sync = default_sync();
-        sync.config_overrides.folder_structure_albums = Some("{album}/{library}".to_string());
-        let err = Config::build(&default_globals(), &default_password(), sync, None)
-            .expect_err("`{library}` not as first segment must bail");
+        let toml: TomlConfig =
+            toml::from_str("[download]\nfolder_structure_albums = \"{album}/{library}\"\n")
+                .unwrap();
+        let err = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .expect_err("`{library}` not as first segment must bail");
         assert!(
             err.to_string().contains("`{library}` must be the first"),
             "{err}"
@@ -1449,10 +1319,16 @@ mod tests {
     }
     #[test]
     fn build_accepts_library_album_pair_in_albums_template() {
-        let mut sync = default_sync();
-        sync.config_overrides.folder_structure_albums = Some("{library}/{album}/%Y".to_string());
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None)
-            .expect("`{library}/{album}/...` is a valid albums template");
+        let toml: TomlConfig =
+            toml::from_str("[download]\nfolder_structure_albums = \"{library}/{album}/%Y\"\n")
+                .unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .expect("`{library}/{album}/...` is a valid albums template");
         assert_eq!(cfg.download.folder_structure_albums, "{library}/{album}/%Y");
     }
     #[test]
@@ -1515,19 +1391,22 @@ mod tests {
     }
     #[cfg(feature = "xmp")]
     #[test]
-    fn test_cli_embed_xmp_overrides_toml() {
+    fn test_embed_xmp_explicit_false_from_toml() {
         let toml_str = r#"
             [metadata]
-            embed_xmp = true
+            embed_xmp = false
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.config_overrides.embed_xmp = Some(false);
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         assert!(
             !cfg.metadata.embed_xmp,
-            "--embed-xmp=false must override TOML embed_xmp = true"
+            "[metadata].embed_xmp = false must stay disabled"
         );
     }
     #[cfg(feature = "xmp")]
@@ -1544,33 +1423,19 @@ mod tests {
         assert!(!cfg.metadata.xmp_sidecar);
     }
     #[test]
-    fn test_build_cli_flag_overrides_toml_false() {
-        let toml_str = r#"
-            [filters]
-            exclude = []
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.config_overrides.skip_videos = Some(true);
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        assert!(cfg.filters.skip_videos);
-    }
-    #[test]
-    fn test_build_cli_false_overrides_toml_true() {
-        let toml_str = r#"
-            [filters]
-            exclude = ["videos"]
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.config_overrides.skip_videos = Some(false);
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        assert!(
-            !cfg.filters.skip_videos,
-            "CLI --skip-videos false should override TOML true"
-        );
+    fn test_build_skip_videos_from_toml_exclusions() {
+        for (exclude, expected) in [("", false), ("\"videos\"", true)] {
+            let toml: TomlConfig =
+                toml::from_str(&format!("[filters]\nexclude = [{exclude}]\n")).unwrap();
+            let cfg = Config::build(
+                &default_globals(),
+                &default_password(),
+                default_sync(),
+                Some(&toml),
+            )
+            .unwrap();
+            assert_eq!(cfg.filters.skip_videos, expected, "exclude = [{exclude}]");
+        }
     }
     #[test]
     fn test_build_watch_interval_above_upper_bound_from_toml_rejected() {
@@ -1637,16 +1502,19 @@ mod tests {
         assert_album_raw(&cfg, &["Favorites", "Vacation"]);
     }
     #[test]
-    fn test_build_cli_albums_override_toml() {
+    fn test_build_albums_from_toml_custom() {
         let toml_str = r#"
             [filters]
-            albums = ["Favorites"]
+            albums = ["Screenshots"]
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.config_overrides.albums = vec!["Screenshots".to_string()];
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         assert_album_raw(&cfg, &["Screenshots"]);
     }
     #[test]
@@ -1835,24 +1703,16 @@ mod tests {
         assert!(err.contains("not supported on Windows"), "{err}");
     }
     #[test]
-    fn test_build_download_dir_from_cli() {
-        let mut sync = default_sync();
-        sync.config_overrides.download_dir = Some("/photos/new".to_string());
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+    fn test_build_download_dir_from_toml() {
+        let toml: TomlConfig = toml::from_str("[download]\ndirectory = \"/photos/new\"\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         assert_eq!(cfg.download.directory, PathBuf::from("/photos/new"));
-    }
-    #[test]
-    fn test_build_download_dir_cli_beats_toml() {
-        let toml_str = r#"
-            [download]
-            directory = "/photos/toml"
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.config_overrides.download_dir = Some("/photos/cli".to_string());
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        assert_eq!(cfg.download.directory, PathBuf::from("/photos/cli"));
     }
     #[test]
     fn test_build_toml_directory_unchanged() {
@@ -1943,20 +1803,23 @@ mod tests {
         assert_eq!(config.server.port, 0);
     }
     #[test]
-    fn test_cli_http_port_overrides_toml() {
+    fn test_toml_server_port_custom() {
         let toml_str = r#"
             [auth]
             username = "user@example.com"
             [download]
             directory = "/photos"
             [server]
-            port = 9090
+            port = 8080
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.config_overrides.http_port = Some(8080);
-        let config =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
+        let config = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         assert_eq!(config.server.port, 8080);
     }
     #[test]
@@ -2001,22 +1864,6 @@ mod tests {
             Some(&toml),
         )
         .unwrap();
-        assert_eq!(
-            config.server.bind,
-            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        );
-    }
-    #[test]
-    fn test_http_bind_cli_overrides_toml() {
-        let toml_str = r#"
-            [server]
-            bind = "0.0.0.0"
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.config_overrides.http_bind = Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-        let config =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(
             config.server.bind,
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
@@ -2185,30 +2032,36 @@ mod tests {
         }
     }
     #[test]
-    fn test_build_folder_structure_cli_overrides_toml() {
+    fn test_build_folder_structure_from_toml_custom() {
         let toml_str = r#"
             [download]
-            folder_structure = "%Y-%m"
+            folder_structure = "%Y-%m-%d"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.config_overrides.folder_structure = Some("%Y/%m/%d".to_string());
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        assert_eq!(cfg.download.folder_structure, "%Y/%m/%d");
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.download.folder_structure, "%Y-%m-%d");
     }
     #[test]
-    fn test_build_temp_suffix_cli_overrides_toml() {
+    fn test_build_temp_suffix_from_toml_custom() {
         let toml_str = r#"
             [download]
-            temp_suffix = ".toml-tmp"
+            temp_suffix = ".custom-tmp"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.config_overrides.temp_suffix = Some(".cli-tmp".to_string());
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        assert_eq!(cfg.download.temp_suffix, ".cli-tmp");
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.download.temp_suffix, ".custom-tmp");
     }
     #[test]
     fn test_build_temp_suffix_from_toml() {
@@ -2227,16 +2080,19 @@ mod tests {
         assert_eq!(cfg.download.temp_suffix, ".downloading");
     }
     #[test]
-    fn test_build_max_retries_cli_overrides_toml() {
+    fn test_build_max_retries_from_toml_custom() {
         let toml_str = r#"
             [download.retry]
-            per_transfer = 5
+            per_transfer = 10
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.config_overrides.max_retries = Some(10);
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         assert_eq!(cfg.retry.max_retries, 10);
     }
     #[test]
@@ -2249,17 +2105,19 @@ mod tests {
         }
     }
     #[test]
-    fn test_build_mov_filename_policy_cli_overrides_toml() {
+    fn test_build_mov_filename_policy_suffix_from_toml() {
         let toml_str = r#"
             [photos]
-            live_photo_mov_filename_policy = "original"
+            live_photo_mov_filename_policy = "suffix"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.config_overrides.live_photo_mov_filename_policy =
-            Some(LivePhotoMovFilenamePolicy::Suffix);
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         assert!(matches!(
             cfg.photos.live_photo_mov_filename_policy,
             LivePhotoMovFilenamePolicy::Suffix
@@ -2285,16 +2143,19 @@ mod tests {
         ));
     }
     #[test]
-    fn test_build_file_match_policy_cli_overrides_toml() {
+    fn test_build_file_match_policy_default_name_from_toml() {
         let toml_str = r#"
             [photos]
-            file_match_policy = "name-id7"
+            file_match_policy = "name-size-dedup-with-suffix"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.config_overrides.file_match_policy = Some(FileMatchPolicy::NameSizeDedupWithSuffix);
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         assert!(matches!(
             cfg.photos.file_match_policy,
             FileMatchPolicy::NameSizeDedupWithSuffix
@@ -2324,7 +2185,7 @@ mod tests {
     /// both `sync` and `import-existing` follow when invoked bare.
     #[test]
     fn resolve_path_derivation_all_defaults() {
-        let pd = resolve_path_derivation_fields(PathDerivationCliArgs::default(), None).unwrap();
+        let pd = resolve_path_derivation_fields(None).unwrap();
         assert_eq!(pd.folder_structure, "%Y/%m/%d");
         assert_eq!(pd.resolution, PhotoResolution::Original);
         assert_eq!(pd.live_photo_mode, LivePhotoMode::Both);
@@ -2343,7 +2204,7 @@ mod tests {
     }
     #[test]
     fn resolve_path_derivation_includes_full_resolution_renditions() {
-        let pd = resolve_path_derivation_fields(PathDerivationCliArgs::default(), None).unwrap();
+        let pd = resolve_path_derivation_fields(None).unwrap();
         assert!(pd.edited && pd.alternative && pd.force_resolution);
         assert_eq!(pd.resolution, PhotoResolution::Original);
         assert_eq!(
@@ -2352,25 +2213,17 @@ mod tests {
             "edited extras must not rewrite live_resolution"
         );
     }
-    /// CLI > TOML > default. The resolver short-circuits on the first
-    /// `Some`; this confirms we don't double-resolve and accidentally
-    /// fall through to the TOML value when the CLI already chose.
     #[test]
-    fn resolve_path_derivation_cli_beats_toml() {
+    fn resolve_path_derivation_explicit_toml_values() {
         let toml: TomlConfig = toml::from_str(
             r#"
             [photos]
-            file_match_policy = "name-id7"
-            keep_unicode_in_filenames = true
+            file_match_policy = "name-size-dedup-with-suffix"
+            keep_unicode_in_filenames = false
             "#,
         )
         .unwrap();
-        let cli = PathDerivationCliArgs {
-            file_match_policy: Some(FileMatchPolicy::NameSizeDedupWithSuffix),
-            keep_unicode_in_filenames: Some(false),
-            ..Default::default()
-        };
-        let pd = resolve_path_derivation_fields(cli, Some(&toml)).unwrap();
+        let pd = resolve_path_derivation_fields(Some(&toml)).unwrap();
         assert_eq!(pd.resolution, PhotoResolution::Original);
         assert_eq!(
             pd.file_match_policy,
@@ -2394,14 +2247,16 @@ mod tests {
             "#,
         )
         .unwrap();
-        let mut sync = default_sync();
-        sync.config_overrides.folder_structure_albums = Some("{album}/cli".to_string());
-
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
 
         assert_eq!(cfg.download.folder_structure, "%Y/%m");
-        assert_eq!(cfg.download.folder_structure_albums, "{album}/cli");
+        assert_eq!(cfg.download.folder_structure_albums, "{album}/toml");
         assert_eq!(
             cfg.download.folder_structure_smart_folders,
             "{smart-folder}/toml"
@@ -2411,10 +2266,9 @@ mod tests {
         assert_eq!(cfg.photos.live_resolution, LivePhotoResolution::Original);
         assert_eq!(cfg.photos.raw_policy, RawPolicy::AsIs);
     }
-    /// TOML wins when the CLI is silent. Pin this so anyone refactoring
-    /// the resolver doesn't accidentally swallow TOML defaults.
+    /// Pin the TOML-derived path fields so a refactor does not swallow them.
     #[test]
-    fn resolve_path_derivation_toml_when_cli_absent() {
+    fn resolve_path_derivation_from_toml() {
         let toml: TomlConfig = toml::from_str(
             r#"
             [download]
@@ -2427,8 +2281,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let pd =
-            resolve_path_derivation_fields(PathDerivationCliArgs::default(), Some(&toml)).unwrap();
+        let pd = resolve_path_derivation_fields(Some(&toml)).unwrap();
         assert_eq!(pd.folder_structure, "%Y/%m");
         assert_eq!(pd.resolution, PhotoResolution::Original);
         assert_eq!(pd.live_photo_mode, LivePhotoMode::Skip);
@@ -2516,17 +2369,27 @@ mod tests {
         assert!(!config.metadata.set_exif_orientation);
     }
     #[test]
-    fn test_build_all_boolean_flags_cli_overrides() {
-        // Programmatic skip overrides still feed the same media owner type
-        // for tests and internal call sites.
+    fn test_build_all_boolean_flags_from_toml_with_run_flag() {
+        // The per-run --no-progress-bar flag combines with durable TOML
+        // metadata, filters, photo and watch settings.
+        let toml: TomlConfig = toml::from_str(
+            r#"
+            [metadata]
+            set_exif_datetime = true
+
+            [filters]
+            exclude = ["videos", "live-photo-stills", "live-photo-videos"]
+
+            [photos]
+            keep_unicode_in_filenames = true
+
+            [watch]
+            notify_systemd = true
+            "#,
+        )
+        .unwrap();
         let mut sync = default_sync();
-        sync.config_overrides.set_exif_datetime = Some(true);
         sync.no_progress_bar = true;
-        sync.config_overrides.skip_videos = Some(true);
-        sync.config_overrides.keep_unicode_in_filenames = Some(true);
-        sync.config_overrides.notify_systemd = Some(true);
-        let toml: TomlConfig =
-            toml::from_str("[filters]\nexclude=['live-photo-stills','live-photo-videos']").unwrap();
         let cfg =
             Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert!(cfg.metadata.set_exif_datetime);
@@ -2556,29 +2419,35 @@ mod tests {
         assert!(!cfg.filters.skip_photos);
     }
     #[test]
-    fn test_build_watch_interval_cli_overrides_toml() {
+    fn test_build_watch_interval_custom_from_toml() {
         let toml_str = r#"
             [watch]
-            interval = 1800
+            interval = 600
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.config_overrides.watch_with_interval = Some(600);
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         assert_eq!(cfg.watch.interval, Some(600));
     }
     #[test]
-    fn test_build_reconcile_cli_overrides_toml() {
+    fn test_build_reconcile_custom_from_toml() {
         let toml_str = r#"
             [watch]
-            reconcile_every_n_cycles = 24
+            reconcile_every_n_cycles = 6
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.config_overrides.reconcile_every_n_cycles = Some(6);
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         assert_eq!(cfg.watch.reconcile_every_n_cycles, Some(6));
     }
     #[test]
@@ -2627,16 +2496,19 @@ mod tests {
         assert!(cfg.watch.reconcile_every_n_cycles.is_none());
     }
     #[test]
-    fn test_build_notification_script_cli_overrides_toml() {
+    fn test_build_notification_script_custom_from_toml() {
         let toml_str = r#"
             [notifications]
-            script = "/toml/notify.sh"
+            script = "/cli/notify.sh"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.config_overrides.notification_script = Some("/cli/notify.sh".to_string());
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         assert_eq!(
             cfg.notifications.script,
             Some(PathBuf::from("/cli/notify.sh"))
@@ -2670,16 +2542,19 @@ mod tests {
         assert_eq!(cfg.report.json, Some(PathBuf::from("/toml/run.json")));
     }
     #[test]
-    fn test_build_report_json_cli_overrides_toml() {
+    fn test_build_report_json_custom_from_toml() {
         let toml_str = r#"
             [report]
-            json = "/toml/run.json"
+            json = "/cli/run.json"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.config_overrides.report_json = Some(PathBuf::from("/cli/run.json"));
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         assert_eq!(cfg.report.json, Some(PathBuf::from("/cli/run.json")));
     }
     #[test]
@@ -2969,17 +2844,28 @@ mod tests {
     }
     #[test]
     fn test_build_album_all_maps_to_all_variant() {
-        let mut sync = default_sync();
-        sync.config_overrides.albums = vec!["all".to_string()];
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let toml: TomlConfig = toml::from_str("[filters]\nalbums = [\"all\"]\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         assert_album_raw(&cfg, &["all"]);
     }
     #[test]
     fn test_build_album_all_is_case_insensitive() {
         for raw in ["all", "ALL", "All", "aLL"] {
-            let mut sync = default_sync();
-            sync.config_overrides.albums = vec![raw.to_string()];
-            let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+            let toml: TomlConfig =
+                toml::from_str(&format!("[filters]\nalbums = [\"{raw}\"]\n")).unwrap();
+            let cfg = Config::build(
+                &default_globals(),
+                &default_password(),
+                default_sync(),
+                Some(&toml),
+            )
+            .unwrap();
             assert_eq!(
                 cfg.filters.selection.albums.to_raw(),
                 strings(&["all"]),
@@ -2989,9 +2875,15 @@ mod tests {
     }
     #[test]
     fn test_build_album_all_mixed_with_names_errors() {
-        let mut sync = default_sync();
-        sync.config_overrides.albums = vec!["all".to_string(), "Vacation".to_string()];
-        let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
+        let toml: TomlConfig =
+            toml::from_str("[filters]\nalbums = [\"all\", \"Vacation\"]\n").unwrap();
+        let err = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("`--album all` cannot be combined with album names"),
@@ -3016,60 +2908,100 @@ mod tests {
     }
     #[test]
     fn test_build_default_is_all_with_album_template() {
-        let mut sync = default_sync();
-        sync.config_overrides.folder_structure_albums = Some("{album}/%Y/%m".to_string());
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let toml: TomlConfig =
+            toml::from_str("[download]\nfolder_structure_albums = \"{album}/%Y/%m\"\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         assert_album_raw(&cfg, &["all"]);
     }
     #[test]
     fn test_build_no_flag_default_is_all() {
-        // v0.13: no `-a`, default `--folder-structure` -> `All`. The legacy
-        // pre-v0.13 default was `LibraryOnly`; this test pins the new
-        // contract so a regression flips it back.
-        let mut sync = default_sync();
-        sync.config_overrides.folder_structure = Some("%Y/%m/%d".to_string());
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        // v0.13: no album selector, default `[download].folder_structure`
+        // -> `All`. The legacy pre-v0.13 default was `LibraryOnly`; this test
+        // pins the new contract so a regression flips it back.
+        let toml: TomlConfig =
+            toml::from_str("[download]\nfolder_structure = \"%Y/%m/%d\"\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         assert_album_raw(&cfg, &["all"]);
         assert!(cfg.filters.selection.unfiled);
     }
     #[test]
     fn test_build_album_named_preserved() {
-        let mut sync = default_sync();
-        sync.config_overrides.albums = vec!["Vacation".to_string(), "Trip".to_string()];
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let toml: TomlConfig =
+            toml::from_str("[filters]\nalbums = [\"Vacation\", \"Trip\"]\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         // Names are normalised through the v0.13 selector grammar, which uses
         // a BTreeSet for deterministic ordering — alphabetical, regardless of
-        // CLI input order.
+        // input order.
         assert_album_raw(&cfg, &["Trip", "Vacation"]);
     }
     #[test]
     fn test_build_album_inline_exclude_only_implies_all() {
-        // `--album '!Family'` with no positive value resolves to "all minus
-        // Family" via the new grammar; no `--album all` needed.
-        let mut sync = default_sync();
-        sync.config_overrides.albums = vec!["!Family".to_string()];
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        // `albums = ["!Family"]` with no positive value resolves to "all minus
+        // Family" via the new grammar; no explicit `all` needed.
+        let toml: TomlConfig = toml::from_str("[filters]\nalbums = [\"!Family\"]\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         assert_album_raw(&cfg, &["all", "!Family"]);
     }
     #[test]
     fn test_build_album_all_with_inline_exclude() {
-        let mut sync = default_sync();
-        sync.config_overrides.albums = vec!["all".to_string(), "!Family".to_string()];
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let toml: TomlConfig =
+            toml::from_str("[filters]\nalbums = [\"all\", \"!Family\"]\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         assert_album_raw(&cfg, &["all", "!Family"]);
     }
     #[test]
     fn test_build_album_named_with_inline_exclude() {
-        let mut sync = default_sync();
-        sync.config_overrides.albums = vec!["Vacation".to_string(), "!Family".to_string()];
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let toml: TomlConfig =
+            toml::from_str("[filters]\nalbums = [\"Vacation\", \"!Family\"]\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         assert_album_raw(&cfg, &["Vacation", "!Family"]);
     }
     #[test]
     fn test_build_album_none_sentinel_maps_to_library_only() {
-        let mut sync = default_sync();
-        sync.config_overrides.albums = vec!["none".to_string()];
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let toml: TomlConfig = toml::from_str("[filters]\nalbums = [\"none\"]\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         assert_eq!(
             cfg.filters.selection.albums,
             crate::selection::AlbumSelector::None
@@ -3077,9 +3009,15 @@ mod tests {
     }
     #[test]
     fn test_build_album_contradiction_bails() {
-        let mut sync = default_sync();
-        sync.config_overrides.albums = vec!["Vacation".to_string(), "!Vacation".to_string()];
-        let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
+        let toml: TomlConfig =
+            toml::from_str("[filters]\nalbums = [\"Vacation\", \"!Vacation\"]\n").unwrap();
+        let err = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("includes and excludes"),
             "unexpected error: {err}"
@@ -3087,9 +3025,15 @@ mod tests {
     }
     #[test]
     fn test_build_album_none_mixed_with_names_bails() {
-        let mut sync = default_sync();
-        sync.config_overrides.albums = vec!["none".to_string(), "Vacation".to_string()];
-        let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
+        let toml: TomlConfig =
+            toml::from_str("[filters]\nalbums = [\"none\", \"Vacation\"]\n").unwrap();
+        let err = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap_err();
         assert!(
             err.to_string()
                 .contains("`--album none` cannot be combined"),
@@ -3098,9 +3042,15 @@ mod tests {
     }
     #[test]
     fn test_build_album_token_rejected_mid_path() {
-        let mut sync = default_sync();
-        sync.config_overrides.folder_structure = Some("Photos/{album}/%Y".to_string());
-        let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
+        let toml: TomlConfig =
+            toml::from_str("[download]\nfolder_structure = \"Photos/{album}/%Y\"\n").unwrap();
+        let err = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap_err();
         assert!(
             err.to_string()
                 .contains("`{album}` cannot be used in --folder-structure"),
@@ -3109,9 +3059,15 @@ mod tests {
     }
     #[test]
     fn test_build_album_token_rejected_after_date() {
-        let mut sync = default_sync();
-        sync.config_overrides.folder_structure = Some("%Y/{album}/%m".to_string());
-        let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
+        let toml: TomlConfig =
+            toml::from_str("[download]\nfolder_structure = \"%Y/{album}/%m\"\n").unwrap();
+        let err = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap_err();
         assert!(
             err.to_string()
                 .contains("`{album}` cannot be used in --folder-structure"),
@@ -3120,9 +3076,15 @@ mod tests {
     }
     #[test]
     fn test_build_album_token_rejected_as_trailing() {
-        let mut sync = default_sync();
-        sync.config_overrides.folder_structure = Some("%Y/%m/{album}".to_string());
-        let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
+        let toml: TomlConfig =
+            toml::from_str("[download]\nfolder_structure = \"%Y/%m/{album}\"\n").unwrap();
+        let err = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap_err();
         assert!(
             err.to_string()
                 .contains("`{album}` cannot be used in --folder-structure"),
@@ -3131,9 +3093,15 @@ mod tests {
     }
     #[test]
     fn test_build_album_token_rejected_duplicate() {
-        let mut sync = default_sync();
-        sync.config_overrides.folder_structure = Some("{album}/%Y/{album}".to_string());
-        let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
+        let toml: TomlConfig =
+            toml::from_str("[download]\nfolder_structure = \"{album}/%Y/{album}\"\n").unwrap();
+        let err = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap_err();
         assert!(
             err.to_string()
                 .contains("`{album}` cannot be used in --folder-structure"),
@@ -3144,23 +3112,32 @@ mod tests {
     fn test_build_no_album_token_no_migration() {
         // Without `{album}` in the template there is nothing to migrate;
         // both fields keep their resolved values.
-        let mut sync = default_sync();
-        sync.config_overrides.folder_structure = Some("%Y/%m".to_string());
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let toml: TomlConfig =
+            toml::from_str("[download]\nfolder_structure = \"%Y/%m\"\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         assert_eq!(cfg.download.folder_structure, "%Y/%m");
         assert_eq!(cfg.download.folder_structure_albums, "{album}");
     }
     #[test]
-    fn test_build_directory_cli_overrides_toml() {
+    fn test_build_directory_from_toml_custom() {
         let toml_str = r#"
             [download]
-            directory = "/toml/photos"
+            directory = "/cli/photos"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.config_overrides.download_dir = Some("/cli/photos".to_string());
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         assert_eq!(cfg.download.directory, PathBuf::from("/cli/photos"));
     }
     #[test]
@@ -3170,40 +3147,41 @@ mod tests {
         let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert!(cfg.runtime.dry_run);
     }
+    fn build_folder_structure(folder_structure: &str) -> anyhow::Result<Config> {
+        let toml: TomlConfig = toml::from_str(&format!(
+            "[download]\nfolder_structure = {folder_structure:?}\n"
+        ))?;
+        Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+    }
     #[test]
     fn test_folder_structure_valid_tokens_accepted() {
-        let mut sync = default_sync();
-        sync.config_overrides.folder_structure = Some("%Y/%m/%d".to_string());
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let cfg = build_folder_structure("%Y/%m/%d").unwrap();
         assert_eq!(cfg.download.folder_structure, "%Y/%m/%d");
     }
     #[test]
     fn test_folder_structure_all_tokens_accepted() {
-        let mut sync = default_sync();
-        sync.config_overrides.folder_structure = Some("%Y/%m/%d/%H/%M/%S".to_string());
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let cfg = build_folder_structure("%Y/%m/%d/%H/%M/%S").unwrap();
         assert_eq!(cfg.download.folder_structure, "%Y/%m/%d/%H/%M/%S");
     }
     #[test]
     fn test_folder_structure_none_bypasses_validation() {
-        let mut sync = default_sync();
-        sync.config_overrides.folder_structure = Some("none".to_string());
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let cfg = build_folder_structure("none").unwrap();
         assert_eq!(cfg.download.folder_structure, "none");
     }
     #[test]
     fn test_folder_structure_strftime_tokens_accepted() {
         // Full strftime support: %B (month name), %X (locale time), etc. are valid
-        let mut sync = default_sync();
-        sync.config_overrides.folder_structure = Some("%Y/%B/%d".to_string());
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let cfg = build_folder_structure("%Y/%B/%d").unwrap();
         assert_eq!(cfg.download.folder_structure, "%Y/%B/%d");
     }
     #[test]
     fn test_folder_structure_wrapped_format_accepted() {
-        let mut sync = default_sync();
-        sync.config_overrides.folder_structure = Some("{:%Y/%m/%d}".to_string());
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let cfg = build_folder_structure("{:%Y/%m/%d}").unwrap();
         assert_eq!(cfg.download.folder_structure, "{:%Y/%m/%d}");
     }
     #[test]
@@ -3392,11 +3370,14 @@ mod tests {
             assert!(excluded.contains(*n), "missing exclude {n}");
         }
     }
-    fn build_with_smart_folders(cli: Vec<&str>, toml_str: Option<&str>) -> Config {
-        let mut sync = default_sync();
-        sync.config_overrides.smart_folders = cli.iter().map(|s| (*s).to_string()).collect();
-        let toml = toml_str.map(|s| toml::from_str::<TomlConfig>(s).unwrap());
-        Config::build(&default_globals(), &default_password(), sync, toml.as_ref()).unwrap()
+    fn build_with_smart_folders(toml_str: &str) -> anyhow::Result<Config> {
+        let toml: TomlConfig = toml::from_str(toml_str)?;
+        Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
     }
     #[test]
     fn test_smart_folders_default_is_none() {
@@ -3413,8 +3394,10 @@ mod tests {
         );
     }
     #[test]
-    fn test_smart_folders_from_cli() {
-        let cfg = build_with_smart_folders(vec!["Favorites", "!Hidden"], None);
+    fn test_smart_folders_from_toml_named() {
+        let cfg =
+            build_with_smart_folders("[filters]\nsmart_folders = [\"Favorites\", \"!Hidden\"]\n")
+                .unwrap();
         assert_sf_named(
             &cfg.filters.selection.smart_folders,
             &["Favorites"],
@@ -3423,15 +3406,15 @@ mod tests {
     }
     #[test]
     fn test_smart_folders_all_sentinel() {
-        let cfg = build_with_smart_folders(vec!["all"], None);
+        let cfg = build_with_smart_folders("[filters]\nsmart_folders = [\"all\"]\n").unwrap();
         assert_sf_all(&cfg.filters.selection.smart_folders, false, &[]);
     }
     #[test]
     fn test_smart_folders_from_toml() {
         let cfg = build_with_smart_folders(
-            vec![],
-            Some("[filters]\nsmart_folders = [\"all-with-sensitive\", \"!Recently Deleted\"]\n"),
-        );
+            "[filters]\nsmart_folders = [\"all-with-sensitive\", \"!Recently Deleted\"]\n",
+        )
+        .unwrap();
         assert_sf_all(
             &cfg.filters.selection.smart_folders,
             true,
@@ -3439,39 +3422,26 @@ mod tests {
         );
     }
     #[test]
-    fn test_smart_folders_cli_overrides_toml() {
-        let cfg = build_with_smart_folders(
-            vec!["Favorites"],
-            Some("[filters]\nsmart_folders = [\"Videos\"]\n"),
-        );
-        let crate::selection::SmartFolderSelector::Named { included, .. } =
-            &cfg.filters.selection.smart_folders
-        else {
-            panic!(
-                "expected Named, got {:?}",
-                cfg.filters.selection.smart_folders
-            );
-        };
-        assert!(included.contains("Favorites"));
-        assert!(!included.contains("Videos"));
-    }
-    #[test]
     fn test_smart_folders_invalid_combination_bails() {
-        let mut sync = default_sync();
-        sync.config_overrides.smart_folders =
-            vec!["all".to_string(), "all-with-sensitive".to_string()];
-        let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
+        let err = build_with_smart_folders(
+            "[filters]\nsmart_folders = [\"all\", \"all-with-sensitive\"]\n",
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("cannot be used together"));
     }
-    fn build_with_unfiled(cli: Option<bool>, toml_str: Option<&str>) -> Config {
-        let mut sync = default_sync();
-        sync.config_overrides.unfiled = cli;
+    fn build_with_unfiled(toml_str: Option<&str>) -> Config {
         let toml = toml_str.map(|s| toml::from_str::<TomlConfig>(s).unwrap());
-        Config::build(&default_globals(), &default_password(), sync, toml.as_ref()).unwrap()
+        Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            toml.as_ref(),
+        )
+        .unwrap()
     }
     #[test]
     fn test_unfiled_default_no_flags_is_true() {
-        let cfg = build_with_unfiled(None, None);
+        let cfg = build_with_unfiled(None);
         assert!(
             cfg.filters.selection.unfiled,
             "v0.13 default: unfiled = true"
@@ -3479,26 +3449,24 @@ mod tests {
     }
     #[test]
     fn test_unfiled_default_with_named_albums_is_true() {
-        // v0.13: --unfiled defaults to true regardless of --album. Named
-        // albums get their own passes AND the unfiled pass runs alongside.
-        // Pre-v0.13 behaviour was unfiled=false for named-album syncs; this
-        // test pins the new contract.
-        let mut sync = default_sync();
-        sync.config_overrides.albums = vec!["Vacation".to_string()];
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        // v0.13: unfiled defaults to true regardless of album selection.
+        // Named albums get their own passes AND the unfiled pass runs
+        // alongside. Pre-v0.13 behaviour was unfiled=false for named-album
+        // syncs; this test pins the new contract.
+        let cfg = build_with_unfiled(Some("[filters]\nalbums = [\"Vacation\"]\n"));
         assert!(
             cfg.filters.selection.unfiled,
-            "v0.13: --album Vacation alone should still default unfiled = true",
+            "v0.13: albums = [\"Vacation\"] alone should still default unfiled = true",
         );
     }
     #[test]
-    fn test_unfiled_cli_true_explicit() {
-        let cfg = build_with_unfiled(Some(true), None);
+    fn test_unfiled_true_explicit() {
+        let cfg = build_with_unfiled(Some("[filters]\nunfiled = true\n"));
         assert!(cfg.filters.selection.unfiled);
     }
     #[test]
-    fn test_unfiled_cli_false_explicit() {
-        let cfg = build_with_unfiled(Some(false), None);
+    fn test_unfiled_false_explicit() {
+        let cfg = build_with_unfiled(Some("[filters]\nunfiled = false\n"));
         assert!(!cfg.filters.selection.unfiled);
     }
     #[test]
@@ -3506,21 +3474,15 @@ mod tests {
         // The user explicitly opts out of the unfiled pass when running a
         // named-album sync. Without this opt-out, v0.13's default would
         // run the Vacation pass AND the unfiled pass.
-        let mut sync = default_sync();
-        sync.config_overrides.albums = vec!["Vacation".to_string()];
-        sync.config_overrides.unfiled = Some(false);
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let cfg = build_with_unfiled(Some(
+            "[filters]\nalbums = [\"Vacation\"]\nunfiled = false\n",
+        ));
         assert!(!cfg.filters.selection.unfiled);
     }
     #[test]
     fn test_unfiled_from_toml() {
-        let cfg = build_with_unfiled(None, Some("[filters]\nunfiled = false\n"));
+        let cfg = build_with_unfiled(Some("[filters]\nunfiled = false\n"));
         assert!(!cfg.filters.selection.unfiled);
-    }
-    #[test]
-    fn test_unfiled_cli_overrides_toml() {
-        let cfg = build_with_unfiled(Some(true), Some("[filters]\nunfiled = false\n"));
-        assert!(cfg.filters.selection.unfiled);
     }
     #[test]
     fn test_folder_structure_albums_default_is_album_token() {
@@ -3551,18 +3513,30 @@ mod tests {
         );
     }
     #[test]
-    fn test_folder_structure_albums_from_cli() {
-        let mut sync = default_sync();
-        sync.config_overrides.folder_structure_albums = Some("{album}/%Y/%m".to_string());
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+    fn test_folder_structure_albums_custom_from_toml() {
+        let toml: TomlConfig =
+            toml::from_str("[download]\nfolder_structure_albums = \"{album}/%Y/%m\"\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         assert_eq!(cfg.download.folder_structure_albums, "{album}/%Y/%m");
     }
     #[test]
-    fn test_folder_structure_smart_folders_from_cli() {
-        let mut sync = default_sync();
-        sync.config_overrides.folder_structure_smart_folders =
-            Some("{smart-folder}/%Y".to_string());
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+    fn test_folder_structure_smart_folders_custom_from_toml() {
+        let toml: TomlConfig =
+            toml::from_str("[download]\nfolder_structure_smart_folders = \"{smart-folder}/%Y\"\n")
+                .unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         assert_eq!(
             cfg.download.folder_structure_smart_folders,
             "{smart-folder}/%Y"
@@ -3597,16 +3571,7 @@ mod tests {
             "{smart-folder}/%Y"
         );
     }
-    #[test]
-    fn test_folder_structure_albums_cli_overrides_toml() {
-        let mut sync = default_sync();
-        sync.config_overrides.folder_structure_albums = Some("{album}/cli".to_string());
-        let toml_str = "[download]\nfolder_structure_albums = \"{album}/toml\"\n";
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        assert_eq!(cfg.download.folder_structure_albums, "{album}/cli");
-    }
+
     #[test]
     fn test_contradictory_date_filter_succeeds() {
         // A contradictory window is a warning, not an error.
@@ -3702,29 +3667,23 @@ mod tests {
     // under parallel test execution).
 
     #[test]
-    fn resolve_notify_systemd_cli_true_wins() {
-        // CLI true: enabled regardless of socket presence.
-        assert!(resolve_notify_systemd(Some(true), None, false));
-        assert!(resolve_notify_systemd(Some(true), None, true));
-        assert!(resolve_notify_systemd(Some(true), Some(false), true));
+    fn resolve_notify_systemd_toml_true_wins() {
+        // Explicit true enables it regardless of socket presence.
+        assert!(resolve_notify_systemd(Some(true), false));
+        assert!(resolve_notify_systemd(Some(true), true));
     }
     #[test]
-    fn resolve_notify_systemd_cli_false_wins_even_under_systemd() {
-        // Explicit CLI false is the escape hatch: user is under systemd
+    fn resolve_notify_systemd_toml_false_wins_even_under_systemd() {
+        // Explicit false is the escape hatch: user is under systemd
         // (NOTIFY_SOCKET set) but wants kei to stay silent.
-        assert!(!resolve_notify_systemd(Some(false), None, true));
-        assert!(!resolve_notify_systemd(Some(false), Some(true), true));
-    }
-    #[test]
-    fn resolve_notify_systemd_toml_used_when_cli_absent() {
-        assert!(resolve_notify_systemd(None, Some(true), false));
-        assert!(!resolve_notify_systemd(None, Some(false), true));
+        assert!(!resolve_notify_systemd(Some(false), true));
+        assert!(!resolve_notify_systemd(Some(false), false));
     }
     #[test]
     fn resolve_notify_systemd_auto_detect_when_nothing_set() {
         // No explicit setting: follow the NOTIFY_SOCKET signal.
-        assert!(resolve_notify_systemd(None, None, true));
-        assert!(!resolve_notify_systemd(None, None, false));
+        assert!(resolve_notify_systemd(None, true));
+        assert!(!resolve_notify_systemd(None, false));
     }
     #[test]
     fn test_smart_retry_delay_table() {
@@ -3739,34 +3698,46 @@ mod tests {
         assert_eq!(smart_retry_delay(25), 30);
         assert_eq!(smart_retry_delay(100), 30);
     }
+    fn build_with_retry(per_transfer: u32) -> Config {
+        let toml: TomlConfig = toml::from_str(&format!(
+            "[download.retry]\nper_transfer = {per_transfer}\n"
+        ))
+        .unwrap();
+        Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap()
+    }
     #[test]
     fn test_build_retry_delay_smart_default_from_max_retries() {
         // No explicit retry-delay anywhere; per_transfer=5 should pull the
         // 4..=6 bucket from the smart table (10s).
-        let mut sync = default_sync();
-        sync.config_overrides.max_retries = Some(5);
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let cfg = build_with_retry(5);
         assert_eq!(cfg.retry.retry_delay_secs, 10);
     }
     #[test]
     fn test_build_retry_delay_smart_default_patient_bucket() {
-        let mut sync = default_sync();
-        sync.config_overrides.max_retries = Some(10);
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let cfg = build_with_retry(10);
         assert_eq!(cfg.retry.retry_delay_secs, 30);
     }
     #[test]
     fn test_build_retry_delay_smart_default_fail_fast_bucket() {
-        let mut sync = default_sync();
-        sync.config_overrides.max_retries = Some(1);
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let cfg = build_with_retry(1);
         assert_eq!(cfg.retry.retry_delay_secs, 2);
     }
     #[test]
-    fn test_build_threads_cli_canonical() {
-        let mut sync = default_sync();
-        sync.config_overrides.threads = Some(7);
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+    fn test_build_threads_from_toml_custom() {
+        let toml: TomlConfig = toml::from_str("[download]\nthreads = 7\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         assert_eq!(cfg.download.threads_num, 7);
     }
     #[test]
@@ -3941,78 +3912,6 @@ mod tests {
             let err = toml::from_str::<TomlConfig>(&toml_str).unwrap_err();
             assert!(err.to_string().contains(&format!("unknown field `{key}`")));
         }
-    }
-    #[test]
-    fn test_build_skip_videos_and_photos_with_live_skip_rejected() {
-        let mut sync = default_sync();
-        sync.config_overrides.skip_videos = Some(true);
-        sync.config_overrides.skip_photos = Some(true);
-        let toml: TomlConfig =
-            toml::from_str("[filters]\nexclude=['live-photo-stills','live-photo-videos']").unwrap();
-        let err = Config::build(&default_globals(), &default_password(), sync, Some(&toml))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("at least one media component"),
-            "error should explain the outcome; got: {err}"
-        );
-        assert!(
-            err.contains("exclude"),
-            "error should name the conflicting field; got: {err}"
-        );
-    }
-    #[test]
-    fn test_build_skip_videos_and_photos_with_image_only_allowed() {
-        let mut sync = default_sync();
-        sync.config_overrides.skip_videos = Some(true);
-        sync.config_overrides.skip_photos = Some(true);
-        let toml: TomlConfig = toml::from_str("[filters]\nexclude=['live-photo-videos']").unwrap();
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        assert_eq!(cfg.filters.media.to_kinds(), vec![MediaKind::LivePhotos]);
-        assert_eq!(cfg.photos.live_photo_mode, LivePhotoMode::ImageOnly);
-    }
-    #[test]
-    fn test_build_skip_videos_and_photos_with_video_only_allowed() {
-        // Obscure but legitimate: user wants only Live Photo MOV
-        // companions. video-only mode keeps the MOV while both skip flags
-        // drop everything else. Must not error.
-        let mut sync = default_sync();
-        sync.config_overrides.skip_videos = Some(true);
-        sync.config_overrides.skip_photos = Some(true);
-        let toml: TomlConfig = toml::from_str("[filters]\nexclude=['live-photo-stills']").unwrap();
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        assert!(cfg.filters.skip_videos);
-        assert!(cfg.filters.skip_photos);
-        assert_eq!(cfg.photos.live_photo_mode, LivePhotoMode::VideoOnly);
-    }
-    #[test]
-    fn test_build_skip_videos_and_photos_with_both_allowed() {
-        // Default live-photo-mode is Both. With both skip flags set, Live
-        // Photo MOVs still download (skip_videos targets pure videos, not
-        // Live Photo video companions). Must not error.
-        let mut sync = default_sync();
-        sync.config_overrides.skip_videos = Some(true);
-        sync.config_overrides.skip_photos = Some(true);
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert_eq!(cfg.photos.live_photo_mode, LivePhotoMode::Both);
-    }
-    #[test]
-    fn test_build_skip_videos_alone_ok() {
-        let mut sync = default_sync();
-        sync.config_overrides.skip_videos = Some(true);
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert!(cfg.filters.skip_videos);
-        assert!(!cfg.filters.skip_photos);
-    }
-    #[test]
-    fn test_build_skip_photos_alone_ok() {
-        let mut sync = default_sync();
-        sync.config_overrides.skip_photos = Some(true);
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert!(cfg.filters.skip_photos);
-        assert!(!cfg.filters.skip_videos);
     }
     #[test]
     fn test_build_media_from_toml() {

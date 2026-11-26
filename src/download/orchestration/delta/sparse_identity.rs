@@ -334,6 +334,7 @@ mod tests {
     use super::{SPARSE_LOOKUPS_PER_LIBRARY, SparseRetryContext};
     use crate::download::{DownloadConfig, DownloadRunMode};
     use crate::icloud::photos::asset::SparseShareEvidence;
+    use crate::state::ReportStateStore;
     use crate::state::{
         SparseAttemptOutcome, SparseEvidence, SparseIdentityStore, SparseSourceId, SqliteStateDb,
     };

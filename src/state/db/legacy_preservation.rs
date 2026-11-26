@@ -339,150 +339,173 @@ pub(super) fn child_publications_ready(
     Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM asset_metadata_capture_revisions WHERE library=?1 AND asset_id=?2 AND revision>=?3) AND NOT EXISTS(SELECT 1 FROM assets WHERE library=?1 AND id=?2 AND (status!='downloaded' OR is_deleted!=0 OR metadata_hash IS NULL OR (?4 AND metadata_write_failed_at IS NOT NULL) OR capture_repair_metadata_hash IS NOT NULL OR capture_repair_output_checksum IS NOT NULL OR capture_repair_output_size IS NOT NULL)) AND NOT EXISTS(SELECT 1 FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND ((?4 AND metadata_write_failed_at IS NOT NULL) OR capture_repair_metadata_hash IS NOT NULL OR capture_repair_output_checksum IS NOT NULL OR capture_repair_output_size IS NOT NULL))", params![library, id, crate::state::METADATA_CAPTURE_REVISION, requires_metadata], |row| row.get(0))?)
 }
 
-impl SqliteStateDb {
-    /// Return ready current-child receipts with verified source provenance or an
-    /// exact historical local-trust declaration. The provenances remain distinct.
-    /// Reconciliation reservations are naming evidence, not pending work, and
-    /// remain in the preparation dependency snapshot. Receipt eligibility alone
-    /// does not establish current completion or checkpoint permission.
-    pub(crate) async fn qualified_child_receipts(
-        &self,
-        library: &str,
-        id: &str,
-        requires_metadata: bool,
-    ) -> Result<Vec<crate::state::AssetRecord>, StateError> {
-        let library = library.to_owned();
-        let id = id.to_owned();
-        self.with_conn("legacy_child_receipts", move |conn| {
-            let ready = child_publications_ready(conn, &library, &id, requires_metadata)?;
-            if !ready {
-                return Ok(Vec::new());
-            }
-            let mut stmt = conn.prepare(&format!(
-                "SELECT {} FROM assets WHERE library=?1 AND id=?2 ORDER BY version_size",
-                super::rows::ASSET_COLUMNS
-            ))?;
-            let rows = stmt
-                .query_map(params![library, id], super::rows::row_to_asset_record)?
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut accepted = Vec::new();
-            for row in rows {
-                if super::trusted_legacy::provenance(
-                    conn,
-                    &library,
-                    &id,
-                    row.version_size.as_str(),
-                )?
-                .is_some()
-                {
-                    accepted.push(row);
-                }
-            }
-            Ok(accepted)
-        })
-        .await
+pub(super) fn preparation_candidates(
+    conn: &rusqlite::Connection,
+    library: String,
+    limit: usize,
+) -> Result<Vec<LegacyPreparationSnapshot>, StateError> {
+    let mut stmt=conn.prepare("SELECT DISTINCT asset_id FROM metadata_capture_retries WHERE library=?1 AND NOT EXISTS(SELECT 1 FROM unattributed_legacy p WHERE p.library=metadata_capture_retries.library AND p.asset_id=metadata_capture_retries.asset_id) ORDER BY asset_id LIMIT ?2")?;
+    let ids = stmt
+        .query_map(
+            params![library, i64::try_from(limit).unwrap_or(i64::MAX)],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut snapshots = Vec::new();
+    for id in ids {
+        if let Some(snapshot) = preparation_snapshot(conn, &library, &id)? {
+            snapshots.push(snapshot);
+        }
     }
+    Ok(snapshots)
+}
 
+pub(super) fn qualified_receipts(
+    conn: &rusqlite::Connection,
+    library: String,
+    id: String,
+    requires_metadata: bool,
+) -> Result<Vec<crate::state::AssetRecord>, StateError> {
+    let ready = child_publications_ready(conn, &library, &id, requires_metadata)?;
+    if !ready {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {} FROM assets WHERE library=?1 AND id=?2 ORDER BY version_size",
+        super::rows::ASSET_COLUMNS
+    ))?;
+    let rows = stmt
+        .query_map(params![library, id], super::rows::row_to_asset_record)?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut accepted = Vec::new();
+    for row in rows {
+        if super::trusted_legacy::provenance(conn, &library, &id, row.version_size.as_str())?
+            .is_some()
+        {
+            accepted.push(row);
+        }
+    }
+    Ok(accepted)
+}
+
+pub(super) fn prepare_validated(
+    conn: &mut rusqlite::Connection,
+    expected: LegacyPreparationSnapshot,
+    files: Vec<LegacyFileEvidence>,
+    validate_files: Box<dyn FnOnce() -> Result<(), StateError> + Send>,
+) -> Result<bool, StateError> {
+    let tx = conn.transaction()?;
+    let Some(current) = preparation_snapshot(&tx, &expected.library, &expected.asset_id)? else {
+        return Ok(false);
+    };
+    if current != expected {
+        return Ok(false);
+    }
+    let mut keys = std::collections::HashSet::new();
+    let foreign_paths = {
+        let mut paths=tx.prepare("SELECT library,id,version_size,local_path,0 FROM assets WHERE local_path IS NOT NULL UNION SELECT library,id,version_size,local_path,1 FROM asset_metadata_paths WHERE local_path IS NOT NULL")?;
+        let catalog = paths.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, bool>(4)?,
+            ))
+        })?;
+        let mut foreign_paths = std::collections::HashSet::new();
+        for row in catalog {
+            let (library, id, rendition, path, historical) = row?;
+            if historical
+                && library == expected.library
+                && expected.historical_claims.iter().any(|claim| {
+                    claim.child == id
+                        && claim.rendition == rendition
+                        && claim.historical_path == std::path::Path::new(&path)
+                })
+            {
+                continue;
+            }
+            if library != expected.library || id != expected.asset_id {
+                foreign_paths.insert(
+                    crate::fs_util::confined_path_key(std::path::Path::new(&path))
+                        .map_err(|_private_error| invalid())?,
+                );
+            }
+        }
+        foreign_paths
+    };
+    for file in &files {
+        if !file.path.is_absolute()
+            || !file.root.is_absolute()
+            || !file.path.starts_with(&file.root)
+            || file.sha256.is_some() != file.size.is_some()
+            || file.sha256.as_ref().is_some_and(|hash| {
+                hash.len() != 64 || !hash.bytes().all(|c| c.is_ascii_hexdigit())
+            })
+        {
+            return Err(invalid());
+        }
+        let key =
+            crate::fs_util::confined_path_key(&file.path).map_err(|_private_error| invalid())?;
+        if !keys.insert(key) {
+            return Err(invalid());
+        }
+    }
+    // Every media path and its exact sidecar name must be represented.
+    let required: std::collections::HashSet<_> = expected
+        .paths
+        .iter()
+        .flat_map(|path| {
+            let mut sidecar = path.as_os_str().to_os_string();
+            sidecar.push(".xmp");
+            [path.clone(), PathBuf::from(sidecar)]
+        })
+        .collect();
+    if files.len() != required.len()
+        || files.iter().any(|file| !required.contains(&file.path))
+        || expected.paths.iter().any(|path| {
+            !files
+                .iter()
+                .any(|file| &file.path == path && file.sha256.is_some())
+        })
+    {
+        return Err(invalid());
+    }
+    if keys.iter().any(|key| foreign_paths.contains(key)) {
+        tracing::warn!(
+            stage = "preparation",
+            reason = "catalog_path_conflict",
+            "Legacy preservation path is claimed by another catalogue asset; retaining attribution checkpoint hold"
+        );
+        return Ok(false);
+    }
+    let encoded = serde_json::to_string(&files).map_err(|_private_error| invalid())?;
+    tx.execute("INSERT INTO unattributed_legacy(library,asset_id,evidence_version,original_evidence,files,prepared_at) VALUES (?1,?2,1,?3,?4,?5)",params![expected.library,expected.asset_id,expected.evidence,encoded,Utc::now().timestamp()])?;
+    for file in files {
+        tx.execute(
+            "INSERT INTO unattributed_legacy_paths VALUES (?1,?2,?3,?4)",
+            params![
+                expected.library,
+                expected.asset_id,
+                crate::fs_util::confined_path_key(&file.path).map_err(|_private_error| invalid())?,
+                file.path.to_str().ok_or_else(invalid)?
+            ],
+        )?;
+    }
+    validate_files()?;
+    tx.commit()?;
+    Ok(true)
+}
+
+impl SqliteStateDb {
     #[cfg(test)]
     pub(crate) async fn legacy_child_receipts(
         &self,
         library: &str,
         id: &str,
     ) -> Result<Vec<crate::state::AssetRecord>, StateError> {
-        self.qualified_child_receipts(library, id, true).await
-    }
-
-    pub(crate) async fn legacy_preparation_snapshots(
-        &self,
-        library: &str,
-        limit: usize,
-    ) -> Result<Vec<LegacyPreparationSnapshot>, StateError> {
-        let library = library.to_owned();
-        self.with_conn("legacy_preparation_snapshots", move |conn| {
-            let mut stmt=conn.prepare("SELECT DISTINCT asset_id FROM metadata_capture_retries WHERE library=?1 AND NOT EXISTS(SELECT 1 FROM unattributed_legacy p WHERE p.library=metadata_capture_retries.library AND p.asset_id=metadata_capture_retries.asset_id) ORDER BY asset_id LIMIT ?2")?;
-            let ids=stmt.query_map(params![library,i64::try_from(limit).unwrap_or(i64::MAX)],|row|row.get::<_,String>(0))?.collect::<Result<Vec<_>,_>>()?;
-            let mut snapshots=Vec::new();
-            for id in ids { if let Some(snapshot)=preparation_snapshot(conn,&library,&id)? { snapshots.push(snapshot); } }
-            Ok(snapshots)
-        }).await
-    }
-
-    pub(crate) async fn prepare_legacy_preservation(
-        &self,
-        expected: &LegacyPreparationSnapshot,
-        files: &[LegacyFileEvidence],
-    ) -> Result<bool, StateError> {
-        // Historical exceptions require held file validation, not a caller's
-        // unchecked candidate snapshot.
-        if !expected.historical_claims.is_empty() {
-            return Ok(false);
-        }
-        self.prepare_legacy_preservation_validated(expected, files, Box::new(|| Ok(())))
-            .await
-    }
-
-    pub(crate) async fn prepare_legacy_preservation_validated(
-        &self,
-        expected: &LegacyPreparationSnapshot,
-        files: &[LegacyFileEvidence],
-        validate_files: Box<dyn FnOnce() -> Result<(), StateError> + Send>,
-    ) -> Result<bool, StateError> {
-        let expected = expected.clone();
-        let files = files.to_vec();
-        self.with_conn_mut("prepare_legacy_preservation",move |conn| {
-            let tx=conn.transaction()?;
-            let Some(current)=preparation_snapshot(&tx,&expected.library,&expected.asset_id)? else { return Ok(false); };
-            if current!=expected { return Ok(false); }
-            let mut keys=std::collections::HashSet::new();
-            let foreign_paths = {
-                let mut paths=tx.prepare("SELECT library,id,version_size,local_path,0 FROM assets WHERE local_path IS NOT NULL UNION SELECT library,id,version_size,local_path,1 FROM asset_metadata_paths WHERE local_path IS NOT NULL")?;
-                let catalog=paths.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,bool>(4)?)))?;
-                let mut foreign_paths = std::collections::HashSet::new();
-                for row in catalog {
-                    let (library,id,rendition,path,historical)=row?;
-                    if historical && library==expected.library && expected.historical_claims.iter().any(|claim|
-                        claim.child==id && claim.rendition==rendition && claim.historical_path==std::path::Path::new(&path)
-                    ) {
-                        continue;
-                    }
-                    if library!=expected.library || id!=expected.asset_id {
-                        foreign_paths.insert(crate::fs_util::confined_path_key(std::path::Path::new(&path)).map_err(|_private_error|invalid())?);
-                    }
-                }
-                foreign_paths
-            };
-            for file in &files {
-                if !file.path.is_absolute() || !file.root.is_absolute() || !file.path.starts_with(&file.root)
-                    || file.sha256.is_some()!=file.size.is_some()
-                    || file.sha256.as_ref().is_some_and(|hash| hash.len()!=64 || !hash.bytes().all(|c|c.is_ascii_hexdigit())) { return Err(invalid()); }
-                let key=crate::fs_util::confined_path_key(&file.path).map_err(|_private_error|invalid())?;
-                if !keys.insert(key) { return Err(invalid()); }
-            }
-            // Every media path and its exact sidecar name must be represented.
-            let required: std::collections::HashSet<_>=expected.paths.iter().flat_map(|path| {
-                let mut sidecar = path.as_os_str().to_os_string();
-                sidecar.push(".xmp");
-                [path.clone(), PathBuf::from(sidecar)]
-            }).collect();
-            if files.len()!=required.len() || files.iter().any(|file| !required.contains(&file.path))
-                || expected.paths.iter().any(|path| !files.iter().any(|file| &file.path==path && file.sha256.is_some())) { return Err(invalid()); }
-            if keys.iter().any(|key| foreign_paths.contains(key)) {
-                tracing::warn!(
-                    stage = "preparation",
-                    reason = "catalog_path_conflict",
-                    "Legacy preservation path is claimed by another catalogue asset; retaining attribution checkpoint hold"
-                );
-                return Ok(false);
-            }
-            let encoded=serde_json::to_string(&files).map_err(|_private_error|invalid())?;
-            tx.execute("INSERT INTO unattributed_legacy(library,asset_id,evidence_version,original_evidence,files,prepared_at) VALUES (?1,?2,1,?3,?4,?5)",params![expected.library,expected.asset_id,expected.evidence,encoded,Utc::now().timestamp()])?;
-            for file in files {
-                tx.execute("INSERT INTO unattributed_legacy_paths VALUES (?1,?2,?3,?4)",params![expected.library,expected.asset_id,crate::fs_util::confined_path_key(&file.path).map_err(|_private_error|invalid())?,file.path.to_str().ok_or_else(invalid)?])?;
-            }
-            validate_files()?;
-            tx.commit()?;
-            Ok(true)
-        }).await
+        super::MetadataRewriteStore::qualified_child_receipts(self, library, id, true).await
     }
 
     #[cfg(test)]
@@ -525,6 +548,8 @@ pub(super) fn counts(conn: &Connection, library: &str) -> Result<(u64, u64), Sta
 mod tests {
     use super::{LegacyFileEvidence, LegacyPreparationSnapshot, SqliteStateDb};
     use crate::state::CheckpointTransition;
+    use crate::state::SyncTokenStore;
+    use crate::state::{DownloadStateStore, MetadataRewriteStore, ReportStateStore};
     use std::path::Path;
 
     #[tokio::test]
@@ -1560,7 +1585,6 @@ mod tests {
 
     fn transition() -> CheckpointTransition {
         CheckpointTransition {
-            album_snapshots: Vec::new(),
             expected_metadata: vec![
                 ("sync_token:PrimarySync".into(), Some("before".into())),
                 ("enum_config_hash".into(), None),

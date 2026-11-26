@@ -1,5 +1,6 @@
 //! Actual process termination at the backup and migration transaction boundary.
 
+use crate::state::SyncTokenStore;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};

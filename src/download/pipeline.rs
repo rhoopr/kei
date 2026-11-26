@@ -26,10 +26,7 @@ mod test_support;
 
 pub(super) use crate::download::metadata_rewrite::MetadataFlags;
 pub(super) use adoption::{
-    PendingOnDiskAdoption, PendingRetryAdoption, PendingRetryFileEvidence, PendingRetryLocalPath,
-    adopt_pending_on_disk_for_retry, mark_reserved_pending_task, recorded_current_path_exists,
-    recover_confirmed_publication, recover_current_pending_publication,
-    state_confirmed_current_path_exists, validate_enumerated_reserved_pending,
+    PendingOnDiskAdoption, recorded_current_path_exists, recover_confirmed_publication,
 };
 #[cfg(test)]
 pub(super) use outcome::build_download_outcome;
@@ -40,7 +37,7 @@ pub(super) use pass::{PassConfig, PassResult, run_download_pass};
     reason = "preserve the existing download-scoped facade paths"
 )]
 pub(super) use producer::{FREE_SPACE_RESNAPSHOT_INTERVAL_BYTES, ProducerSkipSummary};
-pub(super) use progress::{format_duration, log_sync_summary};
+pub(super) use progress::format_duration;
 #[expect(
     unused_imports,
     reason = "preserve the existing download-scoped facade path"

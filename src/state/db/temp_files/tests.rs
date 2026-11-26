@@ -1,4 +1,5 @@
 //! Tests moved from `state::db::tests`, with their original names and assertions.
+use crate::state::TempFileOwnershipStore;
 use crate::state::db::SqliteStateDb;
 use crate::state::db::test_support::test_dir;
 

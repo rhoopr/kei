@@ -1,6 +1,8 @@
 //! Real cycle proof: selected sparse target uses the ordinary download pipeline.
 use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, PhotosSession};
+use crate::state::ReportStateStore;
 use crate::state::SparseIdentityStore as _;
+use crate::state::{MembershipStore, SyncTokenStore};
 use crate::sync_loop::test_support::{
     RunCycleDownloadConfigOptions, full_album_page_with_download, make_run_cycle_config,
     make_run_cycle_download_config_builder, make_run_cycle_download_config_builder_with_options,

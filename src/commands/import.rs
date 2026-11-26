@@ -3,6 +3,8 @@
     reason = "CLI subcommand whose primary purpose is to print import-existing progress to stdout"
 )]
 
+use crate::state::ReportStateStore;
+use crate::state::SyncTokenStore;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -1455,9 +1457,8 @@ fn build_import_path_config(
     config::validate_download_dir(&directory_path)?;
     let directory: Arc<Path> = Arc::from(directory_path.as_path());
 
-    let path_fields =
-        config::resolve_path_derivation_fields(config::PathDerivationCliArgs::default(), toml)?;
-    let media = config::resolve_media_selection(toml.and_then(|t| t.filters.as_ref()), None, None)?;
+    let path_fields = config::resolve_path_derivation_fields(toml)?;
+    let media = config::resolve_media_selection(toml.and_then(|t| t.filters.as_ref()))?;
 
     let config = PathDerivationConfig::from_path_fields(directory, path_fields, media);
     Ok(config)
@@ -1654,6 +1655,8 @@ mod wiremock_tests {
     //!
     //! The live test in `tests/import_existing_live.rs` covers the full
     //! binary entry point against real Apple, complementing this file.
+    use crate::state::DownloadStateStore;
+    use crate::state::SyncTokenStore;
     use std::collections::HashMap;
     use std::path::Path as StdPath;
     use std::sync::Arc;
@@ -1941,7 +1944,6 @@ mod wiremock_tests {
             repair_truncated: false,
             legacy_preservation_allow_hardlinks: false,
             concurrent_downloads: 1,
-            inventory_reconciliation: false,
             inventory_checkpoint: Default::default(),
             post_sync_metadata: false,
             retry: RetryConfig::default(),

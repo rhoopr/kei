@@ -4,7 +4,9 @@ use super::shadow_tests::{BodySession, album, capture, collect, open, owner};
 use crate::icloud::photos::album::test_support::{
     changes_asset, changes_master, make_album_with_session,
 };
+use crate::state::ReportStateStore;
 use crate::state::SqliteStateDb;
+use crate::state::SyncTokenStore;
 use crate::test_helpers::{
     assert_no_retired_inbox_archive, assert_no_temporary_backup_bundles,
     recovery_bundle_connections, snapshot_database,

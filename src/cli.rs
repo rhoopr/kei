@@ -218,12 +218,6 @@ pub struct SyncArgs {
         conflicts_with_all = ["dry_run", "only_print_filenames", "refresh_metadata"]
     )]
     pub repair_truncated: bool,
-
-    /// Test-only durable config overrides used by unit tests that exercise
-    /// resolver internals without rebuilding TOML snippets.
-    #[cfg(test)]
-    #[arg(skip)]
-    pub(crate) config_overrides: crate::config::SyncConfigOverrides,
 }
 
 /// Runtime-friendly output toggles.
@@ -1716,14 +1710,6 @@ mod tests {
     }
 
     #[test]
-    fn test_unfiled_flag_default_none() {
-        let cli = parse(&base_args());
-        let Command::Sync { sync, .. } = cli.command else {
-            panic!("expected Sync command");
-        };
-        assert_eq!(sync.config_overrides.unfiled, None);
-    }
-    #[test]
     fn test_unfiled_flag_bare_true() {
         assert_removed_sync_option(&["--unfiled"]);
     }
@@ -1809,15 +1795,6 @@ mod tests {
     #[test]
     fn test_reconcile_every_n_cycles_flag() {
         assert_removed_sync_option(&["--reconcile-every-n-cycles", "24"]);
-    }
-
-    #[test]
-    fn test_reconcile_every_n_cycles_default_unset() {
-        let cli = parse(&base_args());
-        let Command::Sync { sync, .. } = cli.command else {
-            panic!("expected Sync command");
-        };
-        assert!(sync.config_overrides.reconcile_every_n_cycles.is_none());
     }
 
     // 0 is "off" via TOML (or absence); the CLI flag rejects it so users
@@ -1967,14 +1944,6 @@ mod tests {
         assert_removed_sync_option(&["--album", "Favorites", "--album", "Vacation"]);
     }
 
-    #[test]
-    fn test_albums_empty_by_default() {
-        let cli = parse(&base_args());
-        let Command::Sync { sync, .. } = cli.command else {
-            panic!("expected Sync command");
-        };
-        assert!(sync.config_overrides.albums.is_empty());
-    }
     #[test]
     fn test_album_all_accepted() {
         assert_removed_sync_flag(&["kei", "-a", "all"]);

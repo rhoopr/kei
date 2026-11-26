@@ -191,6 +191,150 @@ fn identity_matches(
     Ok(true)
 }
 
+pub(super) fn recover_current(
+    conn: &mut rusqlite::Connection,
+    proof: PendingPublicationRecord,
+    selected: AssetRecord,
+    child: String,
+    master: String,
+    shutdown: CancellationToken,
+) -> Result<bool, StateError> {
+    if shutdown.is_cancelled() {
+        crate::support::observe_scoped(
+            &proof.library,
+            Some((&proof.id, proof.version_size.as_str())),
+            "support_publication_v1",
+            serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "cancelled"}),
+        );
+        return Ok(false);
+    }
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if selected.library.as_ref() != proof.library
+        || selected.id.as_ref() != proof.id
+        || selected.version_size != proof.version_size
+        || selected.checksum.as_ref() != proof.checksum
+        || selected.size_bytes != proof.size
+        || selected.metadata.is_deleted
+    {
+        crate::support::observe_scoped(
+            &proof.library,
+            Some((&proof.id, proof.version_size.as_str())),
+            "support_publication_v1",
+            serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "selection_source_mismatch"}),
+        );
+        return Ok(false);
+    }
+    let Some(current) = read_publication(&tx, &proof.library, &proof.id, proof.version_size)?
+    else {
+        crate::support::observe_scoped(
+            &proof.library,
+            Some((&proof.id, proof.version_size.as_str())),
+            "support_publication_v1",
+            serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "receipt_missing"}),
+        );
+        return Ok(false);
+    };
+    let mut completed = proof.clone();
+    completed.status = "downloaded".into();
+    completed.last_error = None;
+    if current != proof && current != completed {
+        crate::support::observe_scoped(
+            &proof.library,
+            Some((&proof.id, proof.version_size.as_str())),
+            "support_publication_v1",
+            serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "receipt_changed"}),
+        );
+        return Ok(false);
+    }
+    if !owns_publication(&tx, &proof)? || !identity_matches(&tx, &proof, &child, &master)? {
+        crate::support::observe_scoped(
+            &proof.library,
+            Some((&proof.id, proof.version_size.as_str())),
+            "support_publication_v1",
+            serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "publication_owner_mismatch"}),
+        );
+        return Ok(false);
+    }
+    // A managed handover may claim this path after the reader snapshot.
+    // Apply the same transactional generation and local-byte fences as
+    // ordinary downloaded-state finalization before clearing retry debt.
+    super::primary_layout::guard_slot(
+        &tx,
+        &proof.library,
+        &proof.id,
+        proof.version_size.as_str(),
+        &proof.checksum,
+        &proof.local_path,
+    )?;
+    super::primary_layout::guard_downloaded_checksum(
+        &tx,
+        &proof.local_path,
+        &proof.local_checksum,
+    )?;
+    super::asset_writes::ensure_asset_has_no_prepared_capture_repair(
+        &tx,
+        &proof.library,
+        &proof.id,
+        "recover_pending_publication",
+    )?;
+    super::provider_work::guard_projected_generation(&tx, &selected)?;
+    super::provider_work::guard_projected_mapping(&tx, &proof.library, &child, &master)?;
+    if shutdown.is_cancelled() {
+        crate::support::observe_scoped(
+            &proof.library,
+            Some((&proof.id, proof.version_size.as_str())),
+            "support_publication_v1",
+            serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "cancelled"}),
+        );
+        return Ok(false);
+    }
+    if current.status == "pending" || current.status == "failed" {
+        // This recovers a prior publication. Preserve the path, original
+        // publication timestamp, hashes, every receipt and metadata debt.
+        let changed = tx.execute(
+            "UPDATE assets SET status='downloaded',last_error=NULL \
+             WHERE library=?1 AND id=?2 AND version_size=?3 AND status IN ('pending','failed')",
+            params![proof.library, proof.id, proof.version_size.as_str()],
+        )?;
+        if changed != 1 {
+            crate::support::observe_scoped(
+                &proof.library,
+                Some((&proof.id, proof.version_size.as_str())),
+                "support_publication_v1",
+                serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "state_transition_mismatch"}),
+            );
+            return Ok(false);
+        }
+    }
+    tx.execute(
+        "DELETE FROM asset_verifications WHERE library=?1 AND id=?2 AND version_size=?3 \
+         AND state<>'unknown'",
+        params![proof.library, proof.id, proof.version_size.as_str()],
+    )?;
+    if shutdown.is_cancelled() {
+        crate::support::observe_scoped(
+            &proof.library,
+            Some((&proof.id, proof.version_size.as_str())),
+            "support_publication_v1",
+            serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "cancelled"}),
+        );
+        return Ok(false);
+    }
+    tx.commit()?;
+    crate::support::observe_scoped(
+        &proof.library,
+        Some((&proof.id, proof.version_size.as_str())),
+        "support_publication_v1",
+        serde_json::json!({
+            "operation": "receipt_recovery", "receipt_match": true,
+            "content_equal": true, "size_equal": selected.size_bytes == proof.size,
+            "publication_time_retained": true,
+            "actual_publication": false, "source_status": proof.status, "destination_status": "downloaded",
+        }),
+    );
+    Ok(true)
+}
+
 impl SqliteStateDb {
     pub(super) async fn pending_publication(
         &self,
@@ -202,114 +346,6 @@ impl SqliteStateDb {
         let id = id.to_owned();
         self.with_conn("pending_publication", move |conn| {
             read_publication(conn, &library, &id, version)
-        })
-        .await
-    }
-
-    pub(super) async fn recover_pending_publication(
-        &self,
-        proof: &PendingPublicationRecord,
-        selected: &AssetRecord,
-        child: &str,
-        master: &str,
-        shutdown: &CancellationToken,
-    ) -> Result<bool, StateError> {
-        let proof = proof.clone();
-        let selected = selected.clone();
-        let child = child.to_owned();
-        let master = master.to_owned();
-        let shutdown = shutdown.clone();
-        self.with_conn_mut("recover_pending_publication", move |conn| {
-            if shutdown.is_cancelled() {
-                crate::support::observe_scoped(&proof.library, Some((&proof.id, proof.version_size.as_str())), "support_publication_v1", serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "cancelled"}));
-                return Ok(false);
-            }
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            if selected.library.as_ref() != proof.library
-                || selected.id.as_ref() != proof.id
-                || selected.version_size != proof.version_size
-                || selected.checksum.as_ref() != proof.checksum
-                || selected.size_bytes != proof.size
-                || selected.metadata.is_deleted
-            {
-                crate::support::observe_scoped(&proof.library, Some((&proof.id, proof.version_size.as_str())), "support_publication_v1", serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "selection_source_mismatch"}));
-                return Ok(false);
-            }
-            let Some(current) =
-                read_publication(&tx, &proof.library, &proof.id, proof.version_size)?
-            else {
-                crate::support::observe_scoped(&proof.library, Some((&proof.id, proof.version_size.as_str())), "support_publication_v1", serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "receipt_missing"}));
-                return Ok(false);
-            };
-            let mut completed = proof.clone();
-            completed.status = "downloaded".into();
-            completed.last_error = None;
-            if current != proof && current != completed {
-                crate::support::observe_scoped(&proof.library, Some((&proof.id, proof.version_size.as_str())), "support_publication_v1", serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "receipt_changed"}));
-                return Ok(false);
-            }
-            if !owns_publication(&tx, &proof)? || !identity_matches(&tx, &proof, &child, &master)? {
-                crate::support::observe_scoped(&proof.library, Some((&proof.id, proof.version_size.as_str())), "support_publication_v1", serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "publication_owner_mismatch"}));
-                return Ok(false);
-            }
-            // A managed handover may claim this path after the reader snapshot.
-            // Apply the same transactional generation and local-byte fences as
-            // ordinary downloaded-state finalization before clearing retry debt.
-            super::primary_layout::guard_slot(
-                &tx,
-                &proof.library,
-                &proof.id,
-                proof.version_size.as_str(),
-                &proof.checksum,
-                &proof.local_path,
-            )?;
-            super::primary_layout::guard_downloaded_checksum(
-                &tx,
-                &proof.local_path,
-                &proof.local_checksum,
-            )?;
-            super::asset_writes::ensure_asset_has_no_prepared_capture_repair(
-                &tx,
-                &proof.library,
-                &proof.id,
-                "recover_pending_publication",
-            )?;
-            super::provider_work::guard_projected_generation(&tx, &selected)?;
-            super::provider_work::guard_projected_mapping(&tx, &proof.library, &child, &master)?;
-            if shutdown.is_cancelled() {
-                crate::support::observe_scoped(&proof.library, Some((&proof.id, proof.version_size.as_str())), "support_publication_v1", serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "cancelled"}));
-                return Ok(false);
-            }
-            if current.status == "pending" || current.status == "failed" {
-                // This recovers a prior publication. Preserve the path, original
-                // publication timestamp, hashes, every receipt and metadata debt.
-                let changed = tx.execute(
-                    "UPDATE assets SET status='downloaded',last_error=NULL \
-                     WHERE library=?1 AND id=?2 AND version_size=?3 AND status IN ('pending','failed')",
-                    params![proof.library, proof.id, proof.version_size.as_str()],
-                )?;
-                if changed != 1 {
-                    crate::support::observe_scoped(&proof.library, Some((&proof.id, proof.version_size.as_str())), "support_publication_v1", serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "state_transition_mismatch"}));
-                return Ok(false);
-                }
-            }
-            tx.execute(
-                "DELETE FROM asset_verifications WHERE library=?1 AND id=?2 AND version_size=?3 \
-                 AND state<>'unknown'",
-                params![proof.library, proof.id, proof.version_size.as_str()],
-            )?;
-            if shutdown.is_cancelled() {
-                crate::support::observe_scoped(&proof.library, Some((&proof.id, proof.version_size.as_str())), "support_publication_v1", serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "cancelled"}));
-                return Ok(false);
-            }
-            tx.commit()?;
-            crate::support::observe_scoped(&proof.library, Some((&proof.id, proof.version_size.as_str())), "support_publication_v1", serde_json::json!({
-                "operation": "receipt_recovery", "receipt_match": true,
-                "content_equal": true, "size_equal": selected.size_bytes == proof.size,
-                "publication_time_retained": true,
-                "actual_publication": false, "source_status": proof.status, "destination_status": "downloaded",
-            }));
-            Ok(true)
         })
         .await
     }

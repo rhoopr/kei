@@ -5,6 +5,8 @@ use crate::download::metadata_rewrite::queued::run_pending;
 #[cfg(feature = "xmp")]
 use crate::download::metadata_rewrite::test_support::minimal_jpeg_bytes;
 #[cfg(feature = "xmp")]
+use crate::state::{DownloadStateStore, MetadataRewriteStore};
+#[cfg(feature = "xmp")]
 use std::sync::Arc;
 #[cfg(feature = "xmp")]
 use tokio_util::sync::CancellationToken;

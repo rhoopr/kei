@@ -1,5 +1,7 @@
 //! Shared fixtures for orchestration production-path tests.
 
+use crate::state::DownloadStateStore;
+use crate::state::MembershipStore;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -742,4 +744,36 @@ pub(super) fn hard_deleted_change_record(record_name: &str) -> Value {
         "fields": {},
         "deleted": true,
     })
+}
+
+pub(super) async fn read_delta(
+    client: &reqwest::Client,
+    passes: &[AlbumPass],
+    config: &Arc<DownloadConfig>,
+    cursor: &str,
+    controls: super::models::DownloadControls,
+    cancel: tokio_util::sync::CancellationToken,
+) -> anyhow::Result<super::delta::IncrementalDeltaSummary> {
+    match super::incremental::read_zone_delta(client, passes, config, cursor, controls, &cancel)
+        .await?
+    {
+        std::ops::ControlFlow::Continue(delta) => Ok(delta),
+        std::ops::ControlFlow::Break(refused) => anyhow::bail!("unexpected refusal: {refused:?}"),
+    }
+}
+
+pub(super) async fn dispatch_delta(
+    client: &reqwest::Client,
+    passes: &[AlbumPass],
+    config: &Arc<DownloadConfig>,
+    cursor: &str,
+    controls: super::models::DownloadControls,
+    cancel: tokio_util::sync::CancellationToken,
+) -> anyhow::Result<super::models::SyncResult> {
+    let mut config = config.as_ref().clone();
+    config.sync_mode = SyncMode::Incremental {
+        zone_sync_token: cursor.into(),
+    };
+    super::dispatch::download_photos_with_sync(client, passes, Arc::new(config), controls, cancel)
+        .await
 }

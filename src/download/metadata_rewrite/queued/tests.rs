@@ -16,6 +16,9 @@ use crate::download::metadata_rewrite::test_support::{minimal_jpeg_bytes, now_lo
 #[cfg(feature = "xmp")]
 use crate::state::db::CaptureRepairReceipt;
 use crate::state::db::MetadataRewriteQueue;
+use crate::state::{DownloadStateStore, MetadataRewriteStore};
+#[cfg(feature = "xmp")]
+use crate::state::{MembershipStore, ReportStateStore, SyncTokenStore};
 #[cfg(feature = "xmp")]
 use chrono::{FixedOffset, TimeZone};
 #[cfg(feature = "xmp")]

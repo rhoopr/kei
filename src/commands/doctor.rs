@@ -3,6 +3,7 @@
     reason = "CLI diagnostics command whose primary purpose is to print a report to stdout"
 )]
 
+use crate::state::ReportStateStore;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;

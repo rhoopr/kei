@@ -28,7 +28,7 @@ echo "--- stored token decisions stay incremental ---"
 run_lib_test sync_cycle::tests::determine_sync_mode_two_normal_syncs_reuse_stored_token
 
 echo "--- failed rows use targeted retry without full enumeration ---"
-run_lib_test download::orchestration::recovery::tests::incremental_with_failed_rows_uses_targeted_retry_not_full_enumeration
+run_lib_test download::orchestration::dispatch::retry_tests::pending_peer_progresses_during_partial_failure_without_extra_same_cycle_attempts
 
 echo "--- pending rows with existing files are adopted ---"
 run_lib_test download::pipeline::adoption::tests::producer_adopts_pending_on_disk_skip_as_downloaded

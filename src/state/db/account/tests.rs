@@ -1,4 +1,5 @@
 use super::{AccountOwner, adopt_legacy, state_path};
+use crate::state::SyncTokenStore;
 use crate::state::{SqliteStateDb, error::StateError};
 
 #[tokio::test]

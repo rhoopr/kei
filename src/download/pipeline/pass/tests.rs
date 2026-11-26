@@ -1,3 +1,4 @@
+use crate::state::ReportStateStore;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -528,7 +529,6 @@ async fn shutdown_cancellation_exits_download_pass_promptly() {
         repair_truncated: false,
         legacy_preservation_allow_hardlinks: false,
         concurrent_downloads: 10,
-        inventory_reconciliation: false,
         inventory_checkpoint: Default::default(),
         post_sync_metadata: false,
         retry: crate::retry::RetryConfig {

@@ -610,6 +610,8 @@ pub(super) fn clear_proven(
 #[cfg(test)]
 mod tests {
     use super::{SparseAttemptOutcome, SparseEvidence, SparseIdentityStore, SparseSourceId};
+    use crate::state::ReportStateStore;
+    use crate::state::SyncTokenStore;
     use crate::state::{CheckpointTransition, SqliteStateDb, unresolved_identity_key};
     use chrono::{TimeDelta, Utc};
 
@@ -678,7 +680,6 @@ mod tests {
             .proof()
             .with_target(super::SparseTargetProof::Selected(target));
         let transition = || CheckpointTransition {
-            album_snapshots: Vec::new(),
             expected_metadata: Vec::new(),
             sparse_identity_proofs: vec![proof.clone()],
             metadata_updates: vec![
@@ -1022,7 +1023,6 @@ mod tests {
             .await
             .unwrap();
         let transition = |proofs| CheckpointTransition {
-            album_snapshots: Vec::new(),
             expected_metadata: Vec::new(),
             sparse_identity_proofs: proofs,
             metadata_updates: vec![

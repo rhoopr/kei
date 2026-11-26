@@ -428,6 +428,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::state::ReportStateStore;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 

@@ -1,4 +1,6 @@
 //! Tests moved from `state::db::tests`, with their original names and assertions.
+use crate::state::DownloadStateStore;
+use crate::state::MembershipStore;
 use crate::state::VersionSizeKey;
 use chrono::DateTime;
 use std::collections::HashSet;

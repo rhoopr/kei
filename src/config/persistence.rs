@@ -523,9 +523,9 @@ mod tests {
         let mut globals = default_globals();
         let pw = default_password();
         globals.domain = Some(crate::types::Domain::Cn);
-        let mut sync = default_sync();
-        sync.config_overrides.file_match_policy = Some(crate::types::FileMatchPolicy::NameId7);
-        let cfg = Config::build(&globals, &pw, sync, None).unwrap();
+        let toml: TomlConfig =
+            toml::from_str("[photos]\nfile_match_policy = \"name-id7\"\n").unwrap();
+        let cfg = Config::build(&globals, &pw, default_sync(), Some(&toml)).unwrap();
         let toml = cfg.to_toml();
         assert_eq!(
             toml.auth.as_ref().unwrap().domain,
@@ -668,9 +668,14 @@ mod tests {
     }
     #[test]
     fn test_to_toml_keeps_inline_album_excludes_canonical() {
-        let mut sync = default_sync();
-        sync.config_overrides.albums = vec!["!Family".to_string()];
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let toml: TomlConfig = toml::from_str("[filters]\nalbums = [\"!Family\"]\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         let toml = cfg.to_toml();
         let filters = toml.filters.as_ref().unwrap();
         assert_eq!(
@@ -771,9 +776,15 @@ mod tests {
     }
     #[test]
     fn test_to_toml_roundtrip_bandwidth_limit() {
-        let mut sync = default_sync();
-        sync.config_overrides.bandwidth_limit = Some(5_000_000);
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let toml: TomlConfig =
+            toml::from_str("[download]\nbandwidth_limit = \"5000000\"\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         let serialized = cfg.to_toml();
         assert_eq!(
             serialized
@@ -825,11 +836,10 @@ mod tests {
         if let Some(p) = password {
             pw_args.password = Some(p.to_string());
         }
-        let mut sync = default_sync();
-        if let Some(d) = directory {
-            sync.config_overrides.download_dir = Some(d.to_string());
-        }
-        Config::build(&globals, &pw_args, sync, None).unwrap()
+        let toml = directory.map(|d| {
+            toml::from_str::<TomlConfig>(&format!("[download]\ndirectory = {d:?}\n")).unwrap()
+        });
+        Config::build(&globals, &pw_args, default_sync(), toml.as_ref()).unwrap()
     }
     #[test]
     fn test_persist_first_run_creates_config() {
@@ -925,9 +935,8 @@ mod tests {
         let mut pw = default_password();
         pw.password_file = Some("/run/secrets/pw".to_string());
         globals.domain = Some(crate::types::Domain::Cn);
-        let mut sync = default_sync();
-        sync.config_overrides.download_dir = Some("/photos".to_string());
-        let config = Config::build(&globals, &pw, sync, None).unwrap();
+        let toml: TomlConfig = toml::from_str("[download]\ndirectory = \"/photos\"\n").unwrap();
+        let config = Config::build(&globals, &pw, default_sync(), Some(&toml)).unwrap();
 
         persist_first_run_config(&config_path, &config, Some("/data")).unwrap();
 
@@ -982,11 +991,17 @@ mod tests {
     }
     #[test]
     fn test_folder_structure_per_category_round_trips_custom() {
-        let mut sync = default_sync();
-        sync.config_overrides.folder_structure_albums = Some("{album}/%Y".to_string());
-        sync.config_overrides.folder_structure_smart_folders =
-            Some("{smart-folder}/%Y".to_string());
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let toml: TomlConfig = toml::from_str(
+            "[download]\nfolder_structure_albums = \"{album}/%Y\"\nfolder_structure_smart_folders = \"{smart-folder}/%Y\"\n",
+        )
+        .unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         let toml = cfg.to_toml();
         let dl = toml.download.unwrap();
         assert_eq!(dl.folder_structure_albums.as_deref(), Some("{album}/%Y"));
@@ -999,9 +1014,14 @@ mod tests {
     fn test_to_toml_omits_delay_when_matches_smart_default() {
         // Smart default for per_transfer=3 is 5. to_toml should NOT write
         // `delay = 5` back out because it's redundant.
-        let mut sync = default_sync();
-        sync.config_overrides.max_retries = Some(3);
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let toml: TomlConfig = toml::from_str("[download.retry]\nper_transfer = 3\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
         let toml = cfg.to_toml();
         let retry = toml.download.unwrap().retry.unwrap();
         assert_eq!(retry.per_transfer, Some(3));

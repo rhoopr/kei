@@ -1,5 +1,6 @@
 #![cfg(test)]
 
+use crate::state::{DownloadStateStore, ReportStateStore, TempFileOwnershipStore};
 use std::sync::Arc;
 
 use bytes::Bytes;

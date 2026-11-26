@@ -2512,7 +2512,9 @@ mod tests {
         DownloadConfig, EditedNaming, LayoutOperation, LayoutOutcome, LayoutSession, decision,
         digest, family, file_receipt, finish, plan, recover, sidecar,
     };
+    use crate::state::DownloadStateStore;
     use crate::state::SqliteStateDb;
+    use crate::state::SyncTokenStore;
     use crate::test_helpers::{TestAssetRecord, TestPhotoAsset};
     use rusqlite::types::Value;
     use std::path::Path;

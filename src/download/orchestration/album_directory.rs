@@ -1,4 +1,4 @@
-//! One exclusive `{album}` directory, moved as one entry with its user contents.
+//! Establish stable album directories and finish any already-journaled move.
 
 use std::path::{Path, PathBuf};
 
@@ -9,8 +9,7 @@ use crate::commands::{AlbumPass, PassKind};
 use crate::download::file::primary_layout;
 use crate::fs_util::{ConfinedParents, ConfinedPath, file_identity};
 use crate::state::db::primary_layout::directory::{
-    AlbumDirectoryBinding, AlbumDirectoryFallback, AlbumDirectoryFile, AlbumDirectoryOperation,
-    AlbumDirectoryRoute, AlbumDirectorySource, relocated_path, same_container,
+    AlbumDirectoryBinding, relocated_path, same_container,
 };
 use crate::state::db::provider_selection::SelectionPath;
 
@@ -250,194 +249,26 @@ pub(super) async fn prepare(
             .db
             .album_directory_operation(capture.owner.clone(), binding.clone())
             .await?;
-        let resumed_pending = pending.is_some();
-        let binding = if pending.is_none()
-            && config.folder_structure_albums.contains("{album}")
-            && (binding.additional_projection.is_some()
-                || template_parent(config)?.as_ref() != Some(&binding.root.to_path()))
-        {
-            capture
-                .db
-                .remember_album_additional_projection(
-                    capture.owner.clone(),
-                    binding,
-                    SelectionPath::from_path(&crate::fs_util::absolute_lexical(&config.directory)?),
-                    config.folder_structure_albums.to_string(),
-                )
-                .await?
-        } else {
-            binding
-        };
-        if pending.is_none() && binding.applied_name == pass.album.name.as_ref() {
+        let Some((op, _phase)) = pending else {
+            // Only the recorded directory is authorized for this container.
+            primary_layout::verify_album_directory(
+                &root,
+                &binding.path.to_path(),
+                binding.identity,
+            )
+            .await?;
             continue;
-        }
-        let op = if let Some((op, _)) = pending {
-            anyhow::ensure!(
-                same_container(&op.next.scope, &pass.album.selection_scope()),
-                "Pending album rename requires its recorded provider selection"
-            );
-            op
-        } else {
-            let mut ordinal = 0_u32;
-            let path = loop {
-                anyhow::ensure!(
-                    !cancel.is_cancelled(),
-                    "Album directory preparation interrupted"
-                );
-                let path = candidate(&root, &pass.album.name, ordinal);
-                if !capture
-                    .db
-                    .album_directory_path_available(
-                        capture.owner.clone(),
-                        SelectionPath::from_path(&path),
-                    )
-                    .await?
-                {
-                    ordinal = ordinal
-                        .checked_add(1)
-                        .context("Album directory collision budget exhausted")?;
-                    continue;
-                }
-                match tokio::fs::symlink_metadata(&path).await {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => break path,
-                    Err(error) => return Err(error.into()),
-                    Ok(_) => {
-                        ordinal = ordinal
-                            .checked_add(1)
-                            .context("Album directory collision budget exhausted")?
-                    }
-                }
-            };
-            let next = AlbumDirectoryBinding {
-                path: SelectionPath::from_path(&path),
-                scope: pass.album.selection_scope(),
-                pass: super::generation::pass_key(pass),
-                applied_name: pass.album.name.to_string(),
-                generation: binding
-                    .generation
-                    .checked_add(1)
-                    .context("Album directory generation exhausted")?,
-                unclaimed: mixed,
-                ..binding.clone()
-            };
-            let mut op = AlbumDirectoryOperation {
-                format: 1,
-                operation: format!("album-directory:{}", uuid::Uuid::new_v4()),
-                old: binding,
-                next,
-                fallback: None,
-                staged_directory: None,
-                directories: Vec::new(),
-                user_entries: Vec::new(),
-            };
-            let sources = capture
-                .db
-                .album_directory_sources(capture.owner.clone(), op.old.clone())
-                .await?;
-            let mut files = Vec::with_capacity(sources.len());
-            let unsettled_native = capture
-                .db
-                .album_directory_has_unsettled_publication(capture.owner.clone(), op.old.clone())
-                .await?;
-            let retained_history = capture
-                .db
-                .album_directory_has_preserved_history(capture.owner.clone(), op.old.clone())
-                .await?;
-            let mut needs_files = op.old.unclaimed
-                || unsettled_native
-                || mixed
-                || op.old.path.to_path().parent() != op.next.path.to_path().parent()
-                || retained_history;
-            for source in sources {
-                anyhow::ensure!(
-                    !cancel.is_cancelled(),
-                    "Album directory preparation interrupted"
-                );
-                let path = source.path.to_path();
-                if !path.starts_with(op.old.path.to_path()) {
-                    plan_projection_route(pass, config, &mut op, &source).await?;
-                    needs_files = true;
-                }
-                let file_root = op
-                    .old
-                    .additional_projection
-                    .as_ref()
-                    .map_or(&op.old.root, |extra| &extra.root)
-                    .to_path();
-                for target in [&path, &sidecar(&path)] {
-                    anyhow::ensure!(
-                        !crate::download::file::has_replacement_journal(&file_root, target).await?,
-                        "Finish the existing file publication journal before moving its album directory"
-                    );
-                }
-                let fingerprint = primary_layout::snapshot(&file_root, &path).await?;
-                let xmp = primary_layout::snapshot(&file_root, &sidecar(&path)).await?;
-                needs_files |= fingerprint.as_ref().is_none_or(|actual| {
-                    data_encoding::HEXLOWER.encode(&actual.sha256) != source.local_checksum
-                }) || source
-                    .expected_sidecar
-                    .as_ref()
-                    .is_some_and(|expected| expected != &xmp);
-                files.push(AlbumDirectoryFile {
-                    native: source.native,
-                    library: source.library,
-                    child: source.child,
-                    version: source.version,
-                    provider_checksum: source.provider_checksum,
-                    next: relocated_path(&op, &source.path)?,
-                    old: source.path,
-                    fingerprint,
-                    sidecar: xmp,
-                    prior_local_checksum: Some(source.local_checksum),
-                });
-            }
-            if needs_files {
-                primary_layout::verify_album_directory(
-                    &root,
-                    &op.old.path.to_path(),
-                    op.old.identity,
-                )
-                .await?;
-                op.fallback = Some(AlbumDirectoryFallback::IndependentFiles);
-                if !op.old.unclaimed && !unsettled_native && !retained_history {
-                    op.user_entries =
-                        primary_layout::album_user_entries(&root, &op.old.path.to_path(), &files)
-                            .await?;
-                }
-                let id = op
-                    .operation
-                    .strip_prefix("album-directory:")
-                    .context("Invalid album operation identity")?;
-                let staged = op
-                    .next
-                    .path
-                    .to_path()
-                    .with_file_name(format!(".kei-album-stage-{id}"));
-                op.next.identity = create_directory(root.clone(), staged.clone()).await?;
-                op.staged_directory = Some(SelectionPath::from_path(&staged));
-                #[cfg(all(test, target_os = "linux"))]
-                crate::test_helpers::process_death_point("album-directory-before-journal");
-                for file in &mut files {
-                    file.next = relocated_path(&op, &file.old)?;
-                }
-            } else {
-                for file in &mut files {
-                    file.prior_local_checksum = None;
-                }
-            }
-            capture
-                .db
-                .begin_album_directory_rename(capture.owner.clone(), op.clone(), files)
-                .await?;
-            op
         };
+        anyhow::ensure!(
+            same_container(&op.next.scope, &pass.album.selection_scope()),
+            "Pending album rename requires its recorded provider selection"
+        );
         anyhow::ensure!(
             !cancel.is_cancelled(),
             "Album directory preparation interrupted"
         );
         #[cfg(all(test, target_os = "linux"))]
         crate::test_helpers::process_death_point("album-directory-planned");
-        let renamed_again = op.next.applied_name != pass.album.name.as_ref();
         if !op.directories.is_empty() {
             let route_root = op
                 .old
@@ -513,9 +344,6 @@ pub(super) async fn prepare(
                 .db
                 .publish_album_directory(capture.owner.clone(), op.operation, files)
                 .await?;
-            if renamed_again || resumed_pending {
-                return Box::pin(prepare(passes, config, cancel)).await;
-            }
             continue;
         }
         let files = capture
@@ -608,132 +436,7 @@ pub(super) async fn prepare(
             .db
             .publish_album_directory(capture.owner.clone(), op.operation, files)
             .await?;
-        if renamed_again || resumed_pending {
-            return Box::pin(prepare(passes, config, cancel)).await;
-        }
     }
-    Ok(())
-}
-
-async fn plan_projection_route(
-    pass: &AlbumPass,
-    config: &DownloadConfig,
-    op: &mut AlbumDirectoryOperation,
-    source: &AlbumDirectorySource,
-) -> Result<()> {
-    let old = source.path.to_path();
-    let parent = old.parent().context("Album file has no parent")?;
-    if op
-        .directories
-        .iter()
-        .any(|route| route.old.to_path() == parent)
-    {
-        return Ok(());
-    }
-    let (capture, _, _) = pass
-        .album
-        .current_selection_scope()?
-        .context("Missing authenticated album selection")?;
-    let (root, templates) = if let Some(extra) = &op.old.additional_projection {
-        (extra.root.to_path(), &extra.templates)
-    } else {
-        (
-            op.old.root.to_path(),
-            op.old
-                .projection
-                .as_ref()
-                .context("Missing album projection recipe")?,
-        )
-    };
-    let previous = capture
-        .db
-        .album_projection_routes(capture.owner.clone(), op.old.clone())
-        .await?;
-    let date = source
-        .created
-        .context("Album path has no capture-date evidence")?;
-    let render = |template: &str, name: &str| {
-        let template = crate::download::paths::expand_named_token(
-            template,
-            "{library}",
-            Some(crate::download::paths::truncate_library_zone(
-                &config.library,
-            )),
-        );
-        crate::download::paths::local_download_dir(&root, &template, &date, Some(name))
-    };
-    let recipe = previous
-        .iter()
-        .find(|route| route.next.to_path() == parent)
-        .map(|route| route.template.as_str())
-        .or_else(|| {
-            templates
-                .iter()
-                .find(|template| render(template, &op.old.applied_name) == parent)
-                .map(String::as_str)
-        })
-        // Unknown legacy recipes preserve source bytes and establish selection independently.
-        .unwrap_or(&config.folder_structure_albums);
-    let desired = render(recipe, &op.next.applied_name);
-    anyhow::ensure!(
-        !op.directories.iter().any(|route| desired
-            .parent()
-            .is_some_and(|parent| parent.starts_with(route.next.to_path()))),
-        "Nested album route destinations require disjoint templates"
-    );
-    let mut ordinal = 0_u32;
-    let next = loop {
-        let candidate = if ordinal == 0 {
-            desired.clone()
-        } else {
-            desired.with_file_name(format!(
-                "{} ({ordinal})",
-                desired
-                    .file_name()
-                    .context("Album path has no leaf")?
-                    .to_string_lossy()
-            ))
-        };
-        let overlaps = |other: &Path| candidate.starts_with(other) || other.starts_with(&candidate);
-        anyhow::ensure!(
-            op.old.projection.is_some()
-                || (!overlaps(&op.old.path.to_path()) && !overlaps(&op.next.path.to_path())),
-            "External album route overlaps its anchor"
-        );
-        if !op
-            .directories
-            .iter()
-            .any(|route| overlaps(&route.next.to_path()))
-            && capture
-                .db
-                .album_directory_path_available(
-                    capture.owner.clone(),
-                    SelectionPath::from_path(&candidate),
-                )
-                .await?
-            && !tokio::fs::try_exists(&candidate).await?
-        {
-            break candidate;
-        }
-        ordinal = ordinal
-            .checked_add(1)
-            .context("Album collision budget exhausted")?;
-    };
-    let staged = next.with_file_name(format!(
-        ".kei-album-stage-{}-{}",
-        op.operation
-            .strip_prefix("album-directory:")
-            .context("Invalid album operation")?,
-        op.directories.len()
-    ));
-    let identity = create_directory(root, staged.clone()).await?;
-    op.directories.push(AlbumDirectoryRoute {
-        template: recipe.to_owned(),
-        old: SelectionPath::from_path(parent),
-        next: SelectionPath::from_path(&next),
-        staged: SelectionPath::from_path(&staged),
-        identity,
-    });
     Ok(())
 }
 
@@ -802,79 +505,13 @@ async fn prepare_projection(
         .db
         .album_directory_operation(capture.owner.clone(), binding.clone())
         .await?;
-    let resumed_pending = pending.is_some();
-    if pending.is_none() && binding.applied_name == pass.album.name.as_ref() {
-        capture
-            .db
-            .remember_album_projection(
-                capture.owner.clone(),
-                binding,
-                config.folder_structure_albums.to_string(),
-            )
-            .await?;
+    let Some((op, _phase)) = pending else {
         return Ok(());
-    }
-    let op = if let Some((op, _phase)) = pending {
-        anyhow::ensure!(
-            same_container(&op.next.scope, &pass.album.selection_scope()),
-            "Resume the recorded album transition first"
-        );
-        op
-    } else {
-        let next = AlbumDirectoryBinding {
-            scope: pass.album.selection_scope(),
-            pass: super::generation::pass_key(pass),
-            applied_name: pass.album.name.to_string(),
-            generation: binding
-                .generation
-                .checked_add(1)
-                .context("Album generation exhausted")?,
-            ..binding.clone()
-        };
-        let mut op = AlbumDirectoryOperation {
-            format: 1,
-            operation: format!("album-directory:{}", uuid::Uuid::new_v4()),
-            old: binding,
-            next,
-            fallback: Some(AlbumDirectoryFallback::IndependentFiles),
-            staged_directory: None,
-            directories: Vec::new(),
-            user_entries: Vec::new(),
-        };
-        let sources = capture
-            .db
-            .album_directory_sources(capture.owner.clone(), op.old.clone())
-            .await?;
-        let mut files = Vec::with_capacity(sources.len());
-        for source in sources {
-            anyhow::ensure!(!cancel.is_cancelled(), "Album projection interrupted");
-            let old = source.path.to_path();
-            plan_projection_route(pass, config, &mut op, &source).await?;
-            for path in [&old, &sidecar(&old)] {
-                anyhow::ensure!(
-                    !crate::download::file::has_replacement_journal(&root, path).await?,
-                    "Finish the existing file publication before rerouting its album path"
-                );
-            }
-            files.push(AlbumDirectoryFile {
-                native: source.native,
-                library: source.library,
-                child: source.child,
-                version: source.version,
-                provider_checksum: source.provider_checksum,
-                next: relocated_path(&op, &source.path)?,
-                old: source.path,
-                fingerprint: primary_layout::snapshot(&root, &old).await?,
-                sidecar: primary_layout::snapshot(&root, &sidecar(&old)).await?,
-                prior_local_checksum: Some(source.local_checksum),
-            });
-        }
-        capture
-            .db
-            .begin_album_directory_rename(capture.owner.clone(), op.clone(), files)
-            .await?;
-        op
     };
+    anyhow::ensure!(
+        same_container(&op.next.scope, &pass.album.selection_scope()),
+        "Resume the recorded album transition first"
+    );
     #[cfg(all(test, target_os = "linux"))]
     crate::test_helpers::process_death_point("album-projection-planned");
     for (index, route) in op.directories.iter().enumerate() {
@@ -923,14 +560,9 @@ async fn prepare_projection(
         .db
         .album_directory_files(capture.owner.clone(), op.operation.clone())
         .await?;
-    let renamed_again = op.next.applied_name != pass.album.name.as_ref();
-    let next_binding = op.next.clone();
     capture
         .db
         .publish_album_directory(capture.owner.clone(), op.operation, files)
         .await?;
-    if renamed_again || resumed_pending {
-        Box::pin(prepare_projection(pass, config, Some(next_binding), cancel)).await?;
-    }
     Ok(())
 }

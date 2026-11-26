@@ -214,17 +214,6 @@ fn test_legacy_download_config_hash_changes_on_skip_created_before() {
 }
 
 #[test]
-fn inventory_request_does_not_change_historical_uncapped_hash() {
-    let config1 = test_config();
-    let mut config2 = config1.clone();
-    config2.inventory_reconciliation = true;
-    assert_eq!(
-        hash_download_config(&config1),
-        hash_download_config(&config2)
-    );
-}
-
-#[test]
 fn test_hash_download_config_changes_on_force_resolution() {
     let mut config1 = test_config();
     config1.force_resolution = false;
@@ -286,19 +275,20 @@ fn test_compute_config_hash_matches_hash_download_config() {
         domain: None,
         data_dir: Some("/tmp".to_string()),
     };
+    let toml: crate::config::TomlConfig = toml::from_str(&format!(
+        "[download]\ndirectory = {:?}\nfolder_structure = {:?}\n",
+        dl_config.directory.display().to_string(),
+        dl_config.folder_structure
+    ))
+    .unwrap();
     let app_config = Config::build(
         &globals,
         &crate::cli::PasswordArgs::default(),
         crate::cli::SyncArgs {
-            config_overrides: crate::config::SyncConfigOverrides {
-                download_dir: Some(dl_config.directory.display().to_string()),
-                folder_structure: Some(dl_config.folder_structure.clone()),
-                ..Default::default()
-            },
             no_progress_bar: true,
             ..Default::default()
         },
-        None,
+        Some(&toml),
     )
     .unwrap();
 
@@ -330,14 +320,13 @@ fn test_compute_config_hash_matches_hash_download_config() {
 
 // ── compute_config_hash tests ──────────────────────────────────
 
-/// Build a `Config` via `Config::build` with the given overrides.
+/// Build a `Config` via `Config::build` with a TOML overlay.
 /// Uses a tempdir for cookie_directory so tests don't touch the real filesystem.
 fn build_config_with(
     cookie_dir: &std::path::Path,
     directory: &str,
-    overrides: impl FnOnce(&mut crate::cli::SyncArgs),
+    configure: impl FnOnce(&mut crate::config::TomlConfig),
 ) -> crate::config::Config {
-    use crate::cli::SyncArgs;
     use crate::config::GlobalArgs;
 
     let globals = GlobalArgs {
@@ -346,16 +335,23 @@ fn build_config_with(
         domain: None,
         data_dir: Some(cookie_dir.to_string_lossy().into_owned()),
     };
-    let mut sync = SyncArgs {
-        config_overrides: crate::config::SyncConfigOverrides {
-            download_dir: Some(directory.to_string()),
-            ..Default::default()
-        },
-        ..SyncArgs::default()
-    };
-    overrides(&mut sync);
-    crate::config::Config::build(&globals, &crate::cli::PasswordArgs::default(), sync, None)
-        .expect("Config::build should succeed")
+    let mut toml: crate::config::TomlConfig =
+        toml::from_str(&format!("[download]\ndirectory = {directory:?}\n"))
+            .expect("parse test config");
+    configure(&mut toml);
+    crate::config::Config::build(
+        &globals,
+        &crate::cli::PasswordArgs::default(),
+        crate::cli::SyncArgs::default(),
+        Some(&toml),
+    )
+    .expect("Config::build should succeed")
+}
+
+fn filters_mut(config: &mut crate::config::TomlConfig) -> &mut crate::config::TomlFilters {
+    config
+        .filters
+        .get_or_insert_with(crate::config::TomlFilters::default)
 }
 
 #[test]
@@ -393,7 +389,7 @@ fn test_compute_config_hash_different_skip_videos() {
     let tmp = TempDir::new().unwrap();
     let a = build_config_with(tmp.path(), "/photos", |_| {});
     let b = build_config_with(tmp.path(), "/photos", |s| {
-        s.config_overrides.skip_videos = Some(true);
+        filters_mut(s).exclude = Some(vec![crate::config::MediaExclusion::Videos]);
     });
     assert_ne!(compute_config_hash(&a), compute_config_hash(&b));
 }
@@ -403,7 +399,7 @@ fn test_compute_config_hash_different_albums() {
     let tmp = TempDir::new().unwrap();
     let a = build_config_with(tmp.path(), "/photos", |_| {});
     let b = build_config_with(tmp.path(), "/photos", |s| {
-        s.config_overrides.albums = vec!["Favorites".to_string()];
+        filters_mut(s).albums = Some(vec!["Favorites".to_string()]);
     });
     assert_eq!(
         compute_config_hash(&a),
@@ -417,7 +413,7 @@ fn test_compute_config_hash_different_inline_album_excludes() {
     let tmp = TempDir::new().unwrap();
     let a = build_config_with(tmp.path(), "/photos", |_| {});
     let b = build_config_with(tmp.path(), "/photos", |s| {
-        s.config_overrides.albums = vec!["!Hidden".to_string()];
+        filters_mut(s).albums = Some(vec!["!Hidden".to_string()]);
     });
     assert_eq!(
         compute_config_hash(&a),
@@ -440,7 +436,7 @@ fn test_compute_config_hash_different_smart_folders() {
     let tmp = TempDir::new().unwrap();
     let a = build_config_with(tmp.path(), "/photos", |_| {});
     let b = build_config_with(tmp.path(), "/photos", |s| {
-        s.config_overrides.smart_folders = vec!["Favorites".to_string()];
+        filters_mut(s).smart_folders = Some(vec!["Favorites".to_string()]);
     });
     assert_eq!(
         compute_config_hash(&a),
@@ -458,12 +454,12 @@ fn test_compute_config_hash_different_unfiled() {
     let tmp = TempDir::new().unwrap();
     let a = build_config_with(tmp.path(), "/photos", |_| {});
     let b = build_config_with(tmp.path(), "/photos", |s| {
-        s.config_overrides.unfiled = Some(false);
+        filters_mut(s).unfiled = Some(false);
     });
     assert_ne!(
         compute_config_hash(&a),
         compute_config_hash(&b),
-        "changing --unfiled must change the config hash so the \
+        "changing [filters].unfiled must change the config hash so the \
          stored sync token is invalidated"
     );
 }
@@ -473,7 +469,7 @@ fn test_compute_config_hash_different_library() {
     let tmp = TempDir::new().unwrap();
     let a = build_config_with(tmp.path(), "/photos", |_| {});
     let b = build_config_with(tmp.path(), "/photos", |s| {
-        s.config_overrides.libraries = vec!["all".to_string()];
+        filters_mut(s).libraries = Some(vec!["all".to_string()]);
     });
     assert_eq!(
         compute_config_hash(&a),
@@ -487,10 +483,18 @@ fn test_compute_config_hash_path_only_changes_same_hash() {
     let tmp = TempDir::new().unwrap();
     let a = build_config_with(tmp.path(), "/photos-a", |_| {});
     let b = build_config_with(tmp.path(), "/photos-b", |s| {
-        s.config_overrides.folder_structure = Some("%Y/%m".to_string());
-        s.config_overrides.folder_structure_albums = Some("{album}/albums/%Y".to_string());
-        s.config_overrides.folder_structure_smart_folders = Some("{smart-folder}/%Y".to_string());
-        s.config_overrides.keep_unicode_in_filenames = Some(true);
+        let download = s.download.as_mut().expect("download table");
+        download.folder_structure = Some("%Y/%m".to_string());
+        download.folder_structure_albums = Some("{album}/albums/%Y".to_string());
+        download.folder_structure_smart_folders = Some("{smart-folder}/%Y".to_string());
+        s.photos = Some(
+            toml::from_str::<crate::config::TomlConfig>(
+                "[photos]\nkeep_unicode_in_filenames = true\n",
+            )
+            .expect("parse photos")
+            .photos
+            .expect("photos table"),
+        );
     });
     assert_eq!(
         compute_config_hash(&a),
@@ -504,7 +508,7 @@ fn test_compute_config_hash_fixed_date_drift_requires_inventory() {
     let tmp = TempDir::new().unwrap();
     let a = build_config_with(tmp.path(), "/photos", |_| {});
     let b = build_config_with(tmp.path(), "/photos", |s| {
-        s.skip_created_before = Some("2025-01-01".into());
+        filters_mut(s).skip_created_before = Some("2025-01-01".into());
     });
     assert_ne!(
         compute_config_hash(&a),
@@ -517,9 +521,8 @@ fn test_compute_config_hash_fixed_date_drift_requires_inventory() {
 fn test_compute_config_hash_different_dry_run_same_hash() {
     let tmp = TempDir::new().unwrap();
     let a = build_config_with(tmp.path(), "/photos", |_| {});
-    let b = build_config_with(tmp.path(), "/photos", |s| {
-        s.dry_run = true;
-    });
+    let mut b = build_config_with(tmp.path(), "/photos", |_| {});
+    b.runtime.dry_run = true;
     assert_eq!(
         compute_config_hash(&a),
         compute_config_hash(&b),
@@ -856,11 +859,11 @@ fn golden_compute_config_hash_defaults() {
 fn golden_compute_config_hash_with_albums() {
     let tmp = TempDir::new().unwrap();
     let config = build_config_with(tmp.path(), "/photos", |s| {
-        s.config_overrides.albums = vec![
+        filters_mut(s).albums = Some(vec![
             "Favorites".to_string(),
             "Travel".to_string(),
             "!Hidden".to_string(),
-        ];
+        ]);
     });
     let hash = compute_config_hash(&config);
     assert_eq!(
@@ -875,7 +878,7 @@ fn golden_compute_config_hash_with_smart_folders() {
     // safety hash. This pins that selection-only changes stay stable.
     let tmp = TempDir::new().unwrap();
     let config = build_config_with(tmp.path(), "/photos", |s| {
-        s.config_overrides.smart_folders = vec!["Favorites".to_string(), "Videos".to_string()];
+        filters_mut(s).smart_folders = Some(vec!["Favorites".to_string(), "Videos".to_string()]);
     });
     let hash = compute_config_hash(&config);
     assert_eq!(
@@ -892,7 +895,7 @@ fn golden_compute_config_hash_with_unfiled_false() {
     // collapsing the two branches is caught.
     let tmp = TempDir::new().unwrap();
     let config = build_config_with(tmp.path(), "/photos", |s| {
-        s.config_overrides.unfiled = Some(false);
+        filters_mut(s).unfiled = Some(false);
     });
     let hash = compute_config_hash(&config);
     assert_eq!(

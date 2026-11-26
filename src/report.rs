@@ -351,19 +351,16 @@ mod tests {
             domain: None,
             data_dir: None,
         };
-        let sync = crate::cli::SyncArgs {
-            config_overrides: crate::config::SyncConfigOverrides {
-                download_dir: Some(download_dir.path().display().to_string()),
-                threads: Some(6),
-                ..Default::default()
-            },
-            ..crate::cli::SyncArgs::default()
-        };
+        let toml: crate::config::TomlConfig = toml::from_str(&format!(
+            "[download]\ndirectory = {:?}\nthreads = 6\n",
+            download_dir.path().display().to_string()
+        ))
+        .expect("parse download config");
         let config = crate::config::Config::build(
             &globals,
             &crate::cli::PasswordArgs::default(),
-            sync,
-            None,
+            crate::cli::SyncArgs::default(),
+            Some(&toml),
         )
         .expect("build config");
 
@@ -395,20 +392,15 @@ mod tests {
             domain: None,
             data_dir: None,
         };
-        let sync = crate::cli::SyncArgs {
-            config_overrides: crate::config::SyncConfigOverrides {
-                download_dir: Some(download_dir.path().display().to_string()),
-                ..Default::default()
-            },
-            ..crate::cli::SyncArgs::default()
-        };
-        let toml: crate::config::TomlConfig =
-            toml::from_str("[filters]\nexclude = ['live-photo-stills', 'live-photo-videos']\n")
-                .expect("parse media config");
+        let toml: crate::config::TomlConfig = toml::from_str(&format!(
+            "[download]\ndirectory = {:?}\n[filters]\nexclude = ['live-photo-stills', 'live-photo-videos']\n",
+            download_dir.path().display().to_string()
+        ))
+        .expect("parse media config");
         let config = crate::config::Config::build(
             &globals,
             &crate::cli::PasswordArgs::default(),
-            sync,
+            crate::cli::SyncArgs::default(),
             Some(&toml),
         )
         .expect("build config");

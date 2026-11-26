@@ -1,4 +1,6 @@
 //! Provisional provider inventories through real cycles, files, and SQLite reopen.
+use crate::state::{DownloadStateStore, ReportStateStore};
+use crate::state::{MembershipStore, SyncTokenStore};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

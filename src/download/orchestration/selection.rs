@@ -9,7 +9,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::icloud::photos::PhotoAsset;
 
 use super::config::DownloadConfig;
-use super::models::{DownloadControls, FullEnumerationReason};
+use super::models::DownloadControls;
 
 /// Pre-compute one `Arc<DownloadConfig>` per pass. Each pass_index maps to
 /// a derived config that pre-expands `{album}` and pins the pass's
@@ -39,25 +39,6 @@ pub(super) fn build_pass_configs_with_download_concurrency(
             Arc::new(config)
         })
         .collect()
-}
-
-#[cfg(test)]
-fn incremental_requires_full_enumeration(passes: &[crate::commands::AlbumPass]) -> bool {
-    passes
-        .iter()
-        .any(|pass| pass.kind != crate::commands::PassKind::Unfiled)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum IncrementalRoutingDecision {
-    Safe,
-    TargetedAlbumBackfill {
-        pass_indices: Vec<usize>,
-        reason: FullEnumerationReason,
-    },
-    NeedsFull {
-        reason: FullEnumerationReason,
-    },
 }
 
 #[derive(Debug)]
@@ -116,72 +97,6 @@ impl IncrementalPassRouting {
     }
 }
 
-pub(super) async fn determine_incremental_routing_decision(
-    passes: &[crate::commands::AlbumPass],
-    config: &DownloadConfig,
-    controls: DownloadControls,
-) -> IncrementalRoutingDecision {
-    let has_unmapped_album_pass = passes.iter().any(|pass| {
-        pass.kind == crate::commands::PassKind::Album && pass.album.container_id().is_none()
-    });
-    if has_unmapped_album_pass {
-        return IncrementalRoutingDecision::NeedsFull {
-            reason: FullEnumerationReason::AlbumRelationHydrationIncomplete,
-        };
-    }
-
-    let routing = IncrementalPassRouting::from_passes(passes);
-    if !routing.has_selected_albums() {
-        return IncrementalRoutingDecision::Safe;
-    }
-
-    let Some(db) = &config.state_db else {
-        return IncrementalRoutingDecision::NeedsFull {
-            reason: FullEnumerationReason::AlbumRelationHydrationIncomplete,
-        };
-    };
-
-    let mut backfill_pass_indices = Vec::new();
-    for (index, pass) in passes.iter().enumerate() {
-        if pass.kind != crate::commands::PassKind::Album {
-            continue;
-        }
-        let Some(container_id) = pass.album.container_id() else {
-            continue;
-        };
-        match db
-            .selected_album_containers_have_complete_snapshots(&config.library, &[container_id])
-            .await
-        {
-            Ok(true) => {}
-            Ok(false) => backfill_pass_indices.push(index),
-            Err(e) => {
-                tracing::warn!(
-                    container_id,
-                    error = %e,
-                    "Failed to verify album membership snapshot for incremental routing"
-                );
-                return IncrementalRoutingDecision::NeedsFull {
-                    reason: FullEnumerationReason::OtherStaticReason,
-                };
-            }
-        }
-    }
-
-    if backfill_pass_indices.is_empty() {
-        IncrementalRoutingDecision::Safe
-    } else if should_record_album_snapshots(passes, config, controls) {
-        IncrementalRoutingDecision::TargetedAlbumBackfill {
-            pass_indices: backfill_pass_indices,
-            reason: FullEnumerationReason::AlbumRelationHydrationIncomplete,
-        }
-    } else {
-        IncrementalRoutingDecision::NeedsFull {
-            reason: FullEnumerationReason::AlbumRelationHydrationIncomplete,
-        }
-    }
-}
-
 pub(super) async fn route_incremental_asset_to_passes(
     asset: &PhotoAsset,
     routing: &IncrementalPassRouting,
@@ -223,18 +138,6 @@ pub(super) async fn route_incremental_asset_to_passes(
     let mut pass_indices: Vec<usize> = pass_indices.into_iter().collect();
     pass_indices.sort_unstable();
     Ok(pass_indices)
-}
-
-pub(super) fn split_incremental_and_smart_folder_passes(
-    passes: &[crate::commands::AlbumPass],
-) -> (
-    Vec<crate::commands::AlbumPass>,
-    Vec<crate::commands::AlbumPass>,
-) {
-    passes
-        .iter()
-        .cloned()
-        .partition(|pass| pass.kind != crate::commands::PassKind::SmartFolder)
 }
 
 async fn collect_pass_asset_ids(pass: &crate::commands::AlbumPass) -> Result<FxHashSet<String>> {
@@ -314,6 +217,3 @@ pub(super) fn deferred_unfiled_index(passes: &[crate::commands::AlbumPass]) -> O
         pass.kind == crate::commands::PassKind::Unfiled && pass.exclude_ids.is_empty()
     })
 }
-
-#[cfg(test)]
-mod tests;

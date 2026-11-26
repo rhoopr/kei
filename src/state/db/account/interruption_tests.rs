@@ -1,5 +1,6 @@
 //! Deterministic process death in the actual adoption owner, not power loss.
 
+use crate::state::SyncTokenStore;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};

@@ -564,6 +564,7 @@ async fn verify_files(
 #[cfg(test)]
 mod tests {
     use super::{fingerprint, sidecar, verify_files};
+    use crate::state::SyncTokenStore;
     use tokio_util::sync::CancellationToken;
 
     #[tokio::test]

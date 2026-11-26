@@ -378,6 +378,7 @@ pub(super) fn resolve_download_path(
 
 #[cfg(test)]
 mod tests {
+    use crate::state::DownloadStateStore;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;

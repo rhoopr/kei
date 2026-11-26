@@ -2,6 +2,8 @@
 
 //! Bounded, replayable event orderings across metadata-capture recovery.
 
+use crate::state::SyncTokenStore;
+use crate::state::{DownloadStateStore, ReportStateStore};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 

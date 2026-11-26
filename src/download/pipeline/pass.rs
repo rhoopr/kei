@@ -65,7 +65,7 @@ impl std::fmt::Debug for PassConfig<'_> {
 #[derive(Debug)]
 pub(in crate::download) struct PassResult {
     pub(in crate::download) downloaded: usize,
-    pub(in crate::download) downloaded_tasks: Vec<DownloadTask>,
+
     pub(in crate::download) exif_failures: usize,
     pub(in crate::download) failed: Vec<DownloadTask>,
     pub(in crate::download) auth_errors: usize,
@@ -74,8 +74,7 @@ pub(in crate::download) struct PassResult {
     pub(in crate::download) bytes_downloaded: u64,
     pub(in crate::download) disk_bytes_written: u64,
     pub(in crate::download) rate_limit_observations: usize,
-    pub(in crate::download) url_expired: bool,
-    pub(in crate::download) expired_tasks: Vec<DownloadTask>,
+
     /// Photos / videos / recap observed during this pass, mirroring
     /// `StreamingResult`. Folded into the cycle's `SyncStats` at the
     /// caller. Defaults are zero / empty so the existing cleanup-pass
@@ -168,8 +167,7 @@ pub(in crate::download) async fn run_download_pass(
     let mut videos_downloaded = 0usize;
     let mut recap = crate::download::recap::RunRecap::default();
     let mut state_write_circuit_open = false;
-    let mut url_expired = false;
-    let mut expired_tasks = Vec::new();
+
     let mut failure_state_writes = 0usize;
     // Cleanup pass doesn't carry an album label (it's a flat retry list);
     // recap.observe gets the library name so a recovered asset still
@@ -287,8 +285,6 @@ pub(in crate::download) async fn run_download_pass(
                         });
                     }
                     DownloadTaskErrorClass::ExpiredUrl => {
-                        url_expired = true;
-                        expired_tasks.push(task.clone());
                         pb.suspend(|| {
                             tracing::warn!(target: "kei::download::pipeline",
                                 path = %task.download_path.display(),
@@ -367,7 +363,7 @@ pub(in crate::download) async fn run_download_pass(
     pb.finish_and_clear();
     PassResult {
         downloaded,
-        downloaded_tasks,
+
         exif_failures,
         failed,
         auth_errors,
@@ -376,8 +372,7 @@ pub(in crate::download) async fn run_download_pass(
         bytes_downloaded: bytes_downloaded_total,
         disk_bytes_written: disk_bytes_total,
         rate_limit_observations: rate_limit_counter.load(std::sync::atomic::Ordering::Relaxed),
-        url_expired,
-        expired_tasks,
+
         photos_downloaded,
         videos_downloaded,
         recap,

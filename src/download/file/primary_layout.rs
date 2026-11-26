@@ -179,58 +179,6 @@ pub(in crate::download) async fn verify_album_directory(
     .await?
 }
 
-/// Freeze maximal user subtrees that contain no managed media or sidecars.
-/// Private layout history stays at its original receipt paths.
-pub(in crate::download) async fn album_user_entries(
-    root: &Path,
-    directory: &Path,
-    files: &[crate::state::db::primary_layout::directory::AlbumDirectoryFile],
-) -> Result<Vec<crate::state::db::primary_layout::directory::AlbumUserEntry>> {
-    let (root, directory) = (root.to_owned(), directory.to_owned());
-    let managed: Vec<_> = files
-        .iter()
-        .flat_map(|file| {
-            let path = file.old.to_path();
-            let mut sidecar = path.as_os_str().to_owned();
-            sidecar.push(".xmp");
-            [path, PathBuf::from(sidecar)]
-        })
-        .collect();
-    tokio::task::spawn_blocking(move || {
-        let mut pending = vec![directory];
-        let mut entries = Vec::new();
-        while let Some(parent) = pending.pop() {
-            for entry in std::fs::read_dir(&parent)? {
-                let entry = entry?;
-                let path = entry.path();
-                if entry.file_name() == ".kei-history" || managed.contains(&path) {
-                    continue;
-                }
-                let directory = entry.file_type()?.is_dir();
-                let confined = ConfinedPath::open(&root, &path, ConfinedParents::Existing)?;
-                let identity = confined.entry_identity()?;
-                if managed.iter().any(|managed| managed.starts_with(&path)) {
-                    anyhow::ensure!(directory, "Managed album parent is not a directory");
-                    confined.open_directory()?;
-                    pending.push(path);
-                } else {
-                    entries.push(
-                        crate::state::db::primary_layout::directory::AlbumUserEntry {
-                            path: crate::state::db::provider_selection::SelectionPath::from_path(
-                                &path,
-                            ),
-                            identity,
-                        },
-                    );
-                }
-            }
-        }
-        entries.sort_by_key(|entry| entry.path.to_path());
-        Ok(entries)
-    })
-    .await?
-}
-
 pub(in crate::download) async fn move_album_user_entry(
     root: &Path,
     entry: &crate::state::db::primary_layout::directory::AlbumUserEntry,

@@ -1658,6 +1658,7 @@ const _: () = assert!(
 
 #[cfg(test)]
 mod tests {
+    use crate::state::{MetadataRewriteStore, ReportStateStore};
     use std::sync::Arc;
 
     use rustc_hash::FxHashSet;

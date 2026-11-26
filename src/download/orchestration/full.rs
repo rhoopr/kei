@@ -22,10 +22,10 @@ use crate::icloud::photos::PhotoAsset;
 use super::config::{DownloadConfig, IndexingWindow, inventory_scope};
 use super::context::{DownloadContext, preload_download_context};
 use super::models::{
-    DATE_BOUNDED_FULL_ENUMERATION_REASON, DownloadControls, DownloadStore, FullEnumerationReason,
+    DATE_BOUNDED_FULL_ENUMERATION_REASON, DownloadControls, DownloadStore,
     ICLOUD_ALBUM_COUNT_ERROR_REASON, InventoryMeasurement, PassKey, RecoveryAction, SyncResult,
-    merge_streaming_result, merge_token_recovery_result, set_full_enumeration_reason,
-    sync_token_blocked_explanation, sync_token_blocked_source,
+    merge_streaming_result, merge_token_recovery_result, sync_token_blocked_explanation,
+    sync_token_blocked_source,
 };
 use super::selection::{
     build_pass_configs_resolving_deferred_excludes, build_pass_configs_with_download_concurrency,
@@ -90,7 +90,6 @@ where
 
 #[derive(Debug)]
 struct PerPassStreamingResult {
-    deferred_album_snapshot: Option<(String, String, i64)>,
     pass_index: usize,
     kind: crate::commands::PassKind,
     label: String,
@@ -666,39 +665,13 @@ where
         .deferring_metadata_drain(),
     )
     .await?;
-    if let Some(snapshot) = &options.album_snapshot
-        && !pass_config.inventory_reconciliation
-    {
+    if let Some(snapshot) = &options.album_snapshot {
         snapshot.complete_if_clean(&mut result).await;
     }
-    if pass_config.inventory_reconciliation
-        && options
-            .album_snapshot
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.write_failed.load(Ordering::Relaxed))
-    {
-        result.state_write_failures += 1;
-    }
-    let deferred_album_snapshot = options
-        .album_snapshot
-        .filter(|snapshot| {
-            pass_config.inventory_reconciliation
-                && !snapshot.write_failed.load(Ordering::Relaxed)
-                && result.enumeration_errors == 0
-                && result.enumeration_complete
-        })
-        .map(|snapshot| {
-            (
-                snapshot.library.to_string(),
-                snapshot.container_id.to_string(),
-                snapshot.generation,
-            )
-        });
 
     let elapsed = pass_start.elapsed();
     pass_pb.finish_and_clear();
     Ok(PerPassStreamingResult {
-        deferred_album_snapshot,
         pass_index: options.pass_index,
         kind: options.kind,
         label: pass_config.pass_label().to_string(),
@@ -707,21 +680,6 @@ where
         token_rx,
         result,
     })
-}
-
-pub(super) async fn download_photos_full_with_reason(
-    download_client: &Client,
-    passes: &[crate::commands::AlbumPass],
-    config: &Arc<DownloadConfig>,
-    controls: DownloadControls,
-    shutdown_token: CancellationToken,
-    reason: FullEnumerationReason,
-) -> Result<SyncResult> {
-    let mut result =
-        download_photos_full_with_token(download_client, passes, config, controls, shutdown_token)
-            .await?;
-    set_full_enumeration_reason(&mut result, reason);
-    Ok(result)
 }
 
 /// Fold per-pass `album.len()` results into a `(counts, error_count)` tuple,
@@ -905,7 +863,6 @@ pub(super) async fn download_photos_full_with_token_policy(
         }
         _ => None,
     };
-    let mut deferred_album_snapshots = Vec::new();
     let record_album_snapshots = should_record_album_snapshots(passes, config, controls);
     let needs_per_pass = config.requires_per_pass_paths() || record_album_snapshots;
 
@@ -1115,7 +1072,6 @@ pub(super) async fn download_photos_full_with_token_policy(
         let mut deferred_exclusions_complete = true;
         for pass_result in pass_results {
             let PerPassStreamingResult {
-                deferred_album_snapshot,
                 pass_index,
                 kind,
                 label,
@@ -1124,7 +1080,6 @@ pub(super) async fn download_photos_full_with_token_policy(
                 token_rx,
                 result,
             } = pass_result?;
-            deferred_album_snapshots.extend(deferred_album_snapshot);
 
             if deferred_unfiled.is_some()
                 && kind == crate::commands::PassKind::Album
@@ -1932,7 +1887,6 @@ pub(super) async fn download_photos_full_with_token_policy(
     checkpoint.project(stats);
     result.sync_token = sync_token;
     result.full_enumeration_ran = true;
-    result.deferred_album_snapshots = deferred_album_snapshots;
     // Counts are diagnostic only. Natural completion and the actual queried
     // passes, not a full-query flag or the composed activity total, establish
     // coverage. Configured bounds never seed a complete inventory baseline.

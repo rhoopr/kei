@@ -168,8 +168,32 @@ impl SqliteStateDb {
         })
         .await
     }
+}
 
-    pub(crate) async fn get_all_imported_records(
+#[async_trait]
+impl ImportStateStore for SqliteStateDb {
+    async fn import_adopt(
+        &self,
+        record: &AssetRecord,
+        local_path: &Path,
+        local_checksum: &str,
+        imported_size: u64,
+        imported_mtime: Option<i64>,
+        identity: Option<(&str, &str)>,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::import_adopt_with_identity(
+            self,
+            record,
+            local_path,
+            local_checksum,
+            imported_size,
+            imported_mtime,
+            identity,
+        )
+        .await
+    }
+
+    async fn get_all_imported_records(
         &self,
         library: &str,
     ) -> Result<HashMap<(String, String), ImportedRecord>, StateError> {
@@ -212,37 +236,6 @@ impl SqliteStateDb {
             Ok(out)
         })
         .await
-    }
-}
-
-#[async_trait]
-impl ImportStateStore for SqliteStateDb {
-    async fn import_adopt(
-        &self,
-        record: &AssetRecord,
-        local_path: &Path,
-        local_checksum: &str,
-        imported_size: u64,
-        imported_mtime: Option<i64>,
-        identity: Option<(&str, &str)>,
-    ) -> Result<(), StateError> {
-        SqliteStateDb::import_adopt_with_identity(
-            self,
-            record,
-            local_path,
-            local_checksum,
-            imported_size,
-            imported_mtime,
-            identity,
-        )
-        .await
-    }
-
-    async fn get_all_imported_records(
-        &self,
-        library: &str,
-    ) -> Result<HashMap<(String, String), ImportedRecord>, StateError> {
-        SqliteStateDb::get_all_imported_records(self, library).await
     }
 }
 

@@ -673,6 +673,7 @@ pub(crate) use album::selection_capture::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::SyncTokenStore;
     use std::sync::Mutex;
 
     /// Captured request from a stub session call.

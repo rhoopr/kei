@@ -2,6 +2,7 @@ use super::{DownloadStore, Fixture, controls, destination_pass, owner};
 use crate::download::orchestration::generation::TEST_METADATA_WRITER_BUDGET;
 use crate::icloud::photos::inbox::ShadowCapture;
 use crate::state::SqliteStateDb;
+use crate::state::SyncTokenStore;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;

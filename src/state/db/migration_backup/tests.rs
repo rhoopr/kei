@@ -1,3 +1,4 @@
+use crate::state::SyncTokenStore;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 

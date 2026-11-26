@@ -52,5 +52,4 @@ pub(super) use tasks::{DownloadTask, filter_asset_to_tasks, filter_asset_to_task
 pub(super) use versions::{VersionsView, extract_skip_candidates};
 pub(crate) use versions::{
     metadata_capture, metadata_for_selected_version, provider_version_for_frozen_resource,
-    provider_version_for_selected,
 };

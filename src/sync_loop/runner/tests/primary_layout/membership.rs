@@ -1,6 +1,7 @@
 use super::{ORIGINAL, assert_bytes, db_count, fixture_owner, records, server, versioned_records};
 use crate::commands::{AlbumPass, PassKind};
 use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, PhotoLibrary, PhotosSession};
+use crate::state::MembershipStore;
 use crate::sync_loop::test_support::{
     make_run_cycle_config, make_run_cycle_download_config_builder,
     make_run_cycle_library_state_with_passes, make_shared_session_for_run_cycle,

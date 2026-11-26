@@ -1,3 +1,4 @@
+use crate::state::DownloadStateStore;
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;

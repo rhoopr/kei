@@ -286,6 +286,7 @@ async fn apply_source_state_update<'a>(
     }
 }
 
+// CONTRACT: POLICY_EXCLUDED_REQUIRES_EXPLICIT_SOURCE_DELETION
 async fn hard_delete_state_transition_key<'a>(
     event: &'a ChangeEvent,
     config: &DownloadConfig,
@@ -1212,6 +1213,7 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
                     ..
                 }
                 | RecordResolution::MasterChanged { .. }
+                // CONTRACT: UNKNOWN_PROVIDER_IDENTITY_REMAINS_PENDING
                 | RecordResolution::Unknown => {
                     summary.block_identity();
                     tracing::debug!(
@@ -1371,7 +1373,6 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
 pub(super) struct IncrementalAssetHydrationContext<'a> {
     pub(super) asset_to_master: &'a mut FxHashMap<String, String>,
     pub(super) complete_delta_assets: &'a mut Vec<PhotoAsset>,
-    pub(super) downloadable_assets: &'a mut Vec<(PhotoAsset, usize)>,
     pub(super) download_ctx: Option<&'a DownloadContext>,
     pub(super) claimed_legacy_master_states: &'a mut ClaimedLegacyMasterStates,
     pub(super) claim_mode: LegacyOwnerClaimMode,
@@ -1515,14 +1516,7 @@ pub(super) async fn hydrate_missing_selected_relation_assets(
             context
                 .asset_to_master
                 .insert(asset_record_name.clone(), asset.id().to_string());
-            context.complete_delta_assets.push(asset.clone());
-            if let Some(pass_indices) = pass_indices {
-                for pass_index in pass_indices {
-                    context
-                        .downloadable_assets
-                        .push((asset.clone(), *pass_index));
-                }
-            }
+            context.complete_delta_assets.push(asset);
         }
     }
 }

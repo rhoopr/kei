@@ -1,5 +1,6 @@
 //! Bundled media reaches provider decoding, planning, HTTP, publication and SQLite.
 
+use crate::state::ReportStateStore;
 mod counters;
 mod metadata;
 mod naming;

@@ -1,3 +1,4 @@
+use crate::state::{ReportStateStore, TempFileOwnershipStore};
 #[cfg(unix)]
 use std::sync::Arc;
 

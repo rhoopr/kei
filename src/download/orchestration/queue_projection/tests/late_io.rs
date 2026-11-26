@@ -4,6 +4,8 @@
 //! fault switches. Other platform/storage/power-loss claims remain out of scope.
 
 use super::{Fixture, destination_pass, reopen_destination_fixture};
+use crate::state::DownloadStateStore;
+use crate::state::SyncTokenStore;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

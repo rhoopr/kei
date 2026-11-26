@@ -5,9 +5,10 @@ use super::{
 };
 use crate::commands::{AlbumPass, PassKind};
 use crate::download::planner::TaskPlanner;
-use crate::download::retry::build_pending_retry_download_tasks;
-use crate::download::{DownloadConfig, DownloadRunMode, file};
+use crate::download::{DownloadConfig, file};
 use crate::icloud::photos::{PhotoAsset, PhotosSession};
+use crate::state::SyncTokenStore;
+use crate::state::{DownloadStateStore, ReportStateStore};
 use crate::state::{ReconciliationContent, ReconciliationPathKey, ReconciliationReservation};
 use crate::state::{ReconciliationStateStore, SqliteStateDb, VersionSizeKey};
 use crate::test_helpers::TestAssetRecord;
@@ -254,6 +255,43 @@ fn expected_hidden_original_request_key(config: &DownloadConfig, records: &[Valu
     crate::fs_util::confined_path_key(&requested.path).unwrap()
 }
 
+async fn seed_reserved_destination(
+    config: &DownloadConfig,
+    records: &[Value],
+    destination: &std::path::Path,
+    version: VersionSizeKey,
+) {
+    let asset = PhotoAsset::new(records[0].clone(), records[1].clone())
+        .with_state_record_name(Arc::from("PENDING"));
+    let hidden = issue_770_pass(PassKind::SmartFolder, records);
+    let derived = crate::download::filter::expected_paths_for(&asset, &config.with_pass(&hidden))
+        .into_iter()
+        .find(|path| path.version_size == version)
+        .unwrap();
+    config
+        .state_db
+        .as_ref()
+        .unwrap()
+        .reserve_reconciliation_paths(&[ReconciliationReservation {
+            library: Arc::from("PrimarySync"),
+            asset_id: "PENDING".into(),
+            version_size: version,
+            content: Some(ReconciliationContent {
+                checksum: derived.checksum.as_ref().into(),
+                size: derived.size,
+            }),
+            requested_path_key: ReconciliationPathKey(
+                crate::fs_util::confined_path_key(&derived.path).unwrap(),
+            ),
+            destination_path_key: ReconciliationPathKey(
+                crate::fs_util::confined_path_key(destination).unwrap(),
+            ),
+            destination_path: destination.into(),
+        }])
+        .await
+        .unwrap();
+}
+
 async fn issue_770_seed(root: &TempDir) -> (DownloadConfig, Vec<Value>, std::path::PathBuf) {
     let records = incremental_photo_records_with_url(
         "PENDING",
@@ -352,162 +390,6 @@ async fn issue_770_seed_records(
 }
 
 #[tokio::test]
-async fn issue_770_recovery_recorded_choice_replays_across_sqlite_reopen() {
-    let root = TempDir::new().unwrap();
-    let (mut config, records, old_path) = issue_770_seed(&root).await;
-    let hidden = vec![issue_770_pass(PassKind::SmartFolder, &records)];
-    let first = build_pending_retry_download_tasks(
-        &hidden,
-        &config,
-        DownloadRunMode::Download,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(first.tasks.len(), 1);
-    assert_eq!(first.tasks[0].download_path, old_path);
-    assert!(matches!(
-        first.tasks[0].publication(),
-        file::FinalPublication::NoReplace
-    ));
-    let db = config.state_db.take().unwrap();
-    let before = db.get_reconciliation_reservations().await.unwrap();
-    let reservation = before
-        .iter()
-        .find(|r| r.asset_id.as_ref() == "PENDING")
-        .unwrap();
-    assert_eq!(
-        reservation.requested_path_key.0,
-        expected_hidden_original_request_key(&config, &records)
-    );
-    assert_eq!(reservation.destination_path, old_path);
-    assert!(!old_path.exists());
-    drop(db);
-    // No manual insertion of the problematic row: the retry owner wrote it.
-    for cycle in 0..2 {
-        config.state_db = Some(Arc::new(
-            SqliteStateDb::open(&root.path().join("state.db"))
-                .await
-                .unwrap(),
-        ));
-        let replay = build_pending_retry_download_tasks(
-            &hidden,
-            &config,
-            DownloadRunMode::Download,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(replay.tasks.len(), 1);
-        assert_eq!(replay.tasks[0].download_path, old_path);
-        assert!(replay.unmatched_targets.is_empty());
-        let db = config.state_db.take().unwrap();
-        assert_eq!(db.get_reconciliation_reservations().await.unwrap(), before);
-        let pending = db.get_pending().await.unwrap();
-        assert_eq!(pending.len(), 1, "cycle {cycle}");
-        assert_eq!(pending[0].local_path.as_ref(), Some(&old_path));
-        assert!(!pending[0].metadata.is_hidden);
-        assert_eq!(
-            db.get_metadata("sync_token:PrimarySync")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("checkpoint-before")
-        );
-        assert_eq!(
-            db.get_metadata("config_hash").await.unwrap().as_deref(),
-            Some("active-before")
-        );
-        assert_eq!(
-            db.get_metadata("pending_download_config_hash")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("staged-after")
-        );
-        assert!(!old_path.exists());
-    }
-}
-
-#[tokio::test]
-async fn issue_770_recovery_both_pass_orders_match_without_ledger_changes() {
-    let root = TempDir::new().unwrap();
-    let (mut config, records, old_path) = issue_770_seed(&root).await;
-    let hidden = issue_770_pass(PassKind::SmartFolder, &records);
-    build_pending_retry_download_tasks(
-        std::slice::from_ref(&hidden),
-        &config,
-        DownloadRunMode::Download,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-    config.state_db = None;
-    config.state_db = Some(Arc::new(
-        SqliteStateDb::open(&root.path().join("state.db"))
-            .await
-            .unwrap(),
-    ));
-    let before = config
-        .state_db
-        .as_ref()
-        .unwrap()
-        .get_reconciliation_reservations()
-        .await
-        .unwrap();
-    let unfiled = issue_770_pass(PassKind::Unfiled, &records);
-    // Read-only modes must select the exact destination without changing the ledger.
-    for passes in [
-        vec![hidden.clone(), unfiled.clone()],
-        vec![unfiled.clone(), hidden],
-    ] {
-        let replay = build_pending_retry_download_tasks(
-            &passes,
-            &config,
-            DownloadRunMode::DryRun,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(replay.tasks.len(), 1);
-        assert!(replay.unmatched_targets.is_empty());
-        assert_eq!(replay.tasks[0].download_path, old_path);
-    }
-    let control = build_pending_retry_download_tasks(
-        &[unfiled],
-        &config,
-        DownloadRunMode::DryRun,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(control.tasks.len(), 1);
-    assert!(control.unmatched_targets.is_empty());
-    assert_eq!(control.tasks[0].download_path, old_path);
-    assert_eq!(
-        config
-            .state_db
-            .as_ref()
-            .unwrap()
-            .get_reconciliation_reservations()
-            .await
-            .unwrap(),
-        before
-    );
-    assert_eq!(
-        config
-            .state_db
-            .as_ref()
-            .unwrap()
-            .get_pending()
-            .await
-            .unwrap()
-            .len(),
-        1
-    );
-}
-
-#[tokio::test]
 async fn issue_770_recovery_preserves_smart_selection_completeness_veto() {
     let root = TempDir::new().unwrap();
     let (config, records, old_path) = issue_770_seed(&root).await;
@@ -578,17 +460,7 @@ impl RecoveryFixture {
         records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum);
         let root = TempDir::new().unwrap();
         let (mut config, records, destination) = issue_770_seed_records(&root, records).await;
-        let hidden = issue_770_pass(PassKind::SmartFolder, &records);
-        let first = build_pending_retry_download_tasks(
-            &[hidden],
-            &config,
-            DownloadRunMode::Download,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(first.tasks.len(), 1);
-        assert_eq!(first.tasks[0].download_path, destination);
+        seed_reserved_destination(&config, &records, &destination, VersionSizeKey::Original).await;
         let expected_requested_key = expected_hidden_original_request_key(&config, &records);
         let ledger = config
             .state_db
@@ -836,64 +708,6 @@ async fn issue_770_recovery_publishes_exact_choice_and_reaches_quiet_restart() {
 }
 
 #[tokio::test]
-async fn issue_770_recovery_refuses_ordinary_cross_parent_replay_and_outside_root() {
-    let root = TempDir::new().unwrap();
-    let (mut config, records, destination) = issue_770_seed(&root).await;
-    let hidden = issue_770_pass(PassKind::SmartFolder, &records);
-    build_pending_retry_download_tasks(
-        std::slice::from_ref(&hidden),
-        &config,
-        DownloadRunMode::Download,
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-    let asset = PhotoAsset::new(records[0].clone(), records[1].clone())
-        .with_state_record_name(Arc::from("PENDING"));
-    let hidden_config = config.with_pass(&hidden);
-    let db = config.state_db.as_ref().unwrap();
-    let ledger = db.get_reconciliation_reservations().await.unwrap();
-    for reconciliation in [false, true] {
-        let mut planner = TaskPlanner::for_download(Some(db.as_ref())).await.unwrap();
-        let plan = if reconciliation {
-            planner
-                .plan_reconciliation_asset(&asset, &hidden_config)
-                .await
-        } else {
-            planner.plan_download_asset(&asset, &hidden_config).await
-        };
-        let error = plan.err().unwrap();
-        assert!(
-            error.to_string().contains("left its requested directory"),
-            "{error:#}"
-        );
-    }
-    // Change only the configured root; the stored request must still match
-    // to exercise the new confinement check rather than a different slot.
-    let new_root = root.path().join("Hidden");
-    config.directory = Arc::from(new_root);
-    config.folder_structure_smart_folders = Arc::from("%Y/%m");
-    let error = build_pending_retry_download_tasks(
-        &[hidden],
-        &config,
-        DownloadRunMode::Download,
-        CancellationToken::new(),
-    )
-    .await
-    .err()
-    .unwrap();
-    assert!(
-        error
-            .to_string()
-            .contains("outside the current download root"),
-        "{error:#}"
-    );
-    assert_eq!(db.get_reconciliation_reservations().await.unwrap(), ledger);
-    assert_eq!(db.get_pending().await.unwrap().len(), 1);
-    assert!(!destination.exists());
-}
-
-#[tokio::test]
 async fn issue_770_recovery_finalization_failure_retains_unreceipted_bytes_and_restart_debt() {
     let server = crate::start_wiremock_or_skip!();
     let mut fixture = RecoveryFixture::new(&server).await;
@@ -906,7 +720,17 @@ async fn issue_770_recovery_finalization_failure_retains_unreceipted_bytes_and_r
     fixture.db.acquire_lock("inject exact finalization failure").unwrap()
         .execute_batch("CREATE TEMP TRIGGER issue_770_fail BEFORE UPDATE OF status ON assets WHEN NEW.id = 'PENDING' AND NEW.status = 'downloaded' BEGIN SELECT RAISE(FAIL, 'injected issue 770 finalization failure'); END;").unwrap();
     let kinds = [PassKind::SmartFolder, PassKind::Unfiled];
-    let failed = fixture.run(&kinds, CancellationToken::new()).await;
+    let probe = crate::download::finalize::finalization_probe::FailedFinalizationProbe::for_path(
+        &fixture.destination,
+    );
+    let observed = async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), probe.observed())
+            .await
+            .expect("landed file must reach the failed receipt transaction");
+        assert_eq!(std::fs::read(&fixture.destination).unwrap(), fixture.bytes);
+        drop(probe);
+    };
+    let (failed, ()) = tokio::join!(fixture.run(&kinds, CancellationToken::new()), observed);
     assert!(failed.stats.state_write_failures > 0, "{failed:?}");
     assert_eq!(std::fs::read(&fixture.destination).unwrap(), fixture.bytes);
     fixture.assert_preserved().await;
@@ -1316,135 +1140,11 @@ async fn issue_770_recovery_reservation_failure_blocks_publication_then_recovers
 }
 
 #[tokio::test]
-async fn issue_770_recovery_foreign_catalog_ownership_cannot_reuse_saved_choice() {
-    for (library, id, version) in [
-        ("OtherLibrary", "PENDING", VersionSizeKey::Original),
-        ("PrimarySync", "OTHER", VersionSizeKey::Original),
-        ("PrimarySync", "PENDING", VersionSizeKey::Adjusted),
-    ] {
-        let root = TempDir::new().unwrap();
-        let (config, records, destination) = issue_770_seed(&root).await;
-        let hidden = issue_770_pass(PassKind::SmartFolder, &records);
-        build_pending_retry_download_tasks(
-            std::slice::from_ref(&hidden),
-            &config,
-            DownloadRunMode::Download,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        let db = Arc::new(
-            SqliteStateDb::open(&root.path().join("state.db"))
-                .await
-                .unwrap(),
-        );
-        db.upsert_seen(
-            &TestAssetRecord::new(id)
-                .library(library)
-                .version_size(version)
-                .checksum("foreign-generation")
-                .size(1024)
-                .build(),
-        )
-        .await
-        .unwrap();
-        db.mark_downloaded(
-            library,
-            id,
-            version.as_str(),
-            &destination,
-            "foreign-local-checksum",
-            None,
-        )
-        .await
-        .unwrap();
-        let ledger = db.get_reconciliation_reservations().await.unwrap();
-        let error = build_pending_retry_download_tasks(
-            &[hidden],
-            &config,
-            DownloadRunMode::Download,
-            CancellationToken::new(),
-        )
-        .await
-        .err()
-        .unwrap();
-        assert!(error.to_string().contains("another owner"), "{error:#}");
-        assert_eq!(db.get_reconciliation_reservations().await.unwrap(), ledger);
-        assert_eq!(db.get_pending().await.unwrap().len(), 1);
-        assert!(!destination.exists());
-    }
-}
-
-#[tokio::test]
-async fn issue_770_recovery_rejects_traversal_and_inconsistent_saved_keys() {
-    for traversal in [false, true] {
-        let root = TempDir::new().unwrap();
-        let (config, records, destination) = issue_770_seed(&root).await;
-        let hidden = issue_770_pass(PassKind::SmartFolder, &records);
-        build_pending_retry_download_tasks(
-            std::slice::from_ref(&hidden),
-            &config,
-            DownloadRunMode::Download,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        let db = SqliteStateDb::open(&root.path().join("state.db"))
-            .await
-            .unwrap();
-        // A damaged durable spelling is retained as evidence, never normalized
-        // into permission to publish somewhere else.
-        let damaged = if traversal {
-            root.path().join("old-album/../pending.jpg")
-        } else {
-            root.path().join("different.jpg")
-        };
-        db.acquire_lock("seed damaged path spelling")
-            .unwrap()
-            .execute(
-                "UPDATE reconciliation_paths SET destination_path = ?1 WHERE id = 'PENDING'",
-                rusqlite::params![damaged.to_str().unwrap()],
-            )
-            .unwrap();
-        let ledger = db.get_reconciliation_reservations().await.unwrap();
-        let error = build_pending_retry_download_tasks(
-            &[hidden],
-            &config,
-            DownloadRunMode::Download,
-            CancellationToken::new(),
-        )
-        .await
-        .err()
-        .unwrap();
-        assert!(
-            error.to_string().contains(if traversal {
-                "parent components"
-            } else {
-                "inconsistent destination key"
-            }),
-            "{error:#}"
-        );
-        assert_eq!(db.get_reconciliation_reservations().await.unwrap(), ledger);
-        assert_eq!(db.get_pending().await.unwrap().len(), 1);
-        assert!(!destination.exists());
-        assert!(!damaged.exists());
-    }
-}
-
-#[tokio::test]
 async fn issue_770_recovery_changed_content_and_unknown_legacy_choices_stay_occupied() {
     for unknown in [false, true] {
         let root = TempDir::new().unwrap();
         let (config, mut records, destination) = issue_770_seed(&root).await;
-        let hidden = issue_770_pass(PassKind::SmartFolder, &records);
-        build_pending_retry_download_tasks(
-            &[hidden],
-            &config,
-            DownloadRunMode::Download,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
+        seed_reserved_destination(&config, &records, &destination, VersionSizeKey::Original).await;
         let db = SqliteStateDb::open(&root.path().join("state.db"))
             .await
             .unwrap();
@@ -1633,29 +1333,13 @@ async fn issue_770_recovery_publishes_reserved_still_and_motion_without_duplicat
         )
         .await
         .unwrap();
-    let hidden = fixture.passes(&[PassKind::SmartFolder]);
-    let plan = build_pending_retry_download_tasks(
-        &hidden,
+    seed_reserved_destination(
         &fixture.config,
-        DownloadRunMode::Download,
-        CancellationToken::new(),
+        &fixture.records,
+        &motion_path,
+        VersionSizeKey::LiveOriginal,
     )
-    .await
-    .unwrap();
-    assert_eq!(plan.tasks.len(), 2);
-    assert!(plan.unmatched_targets.is_empty());
-    assert!(
-        plan.tasks
-            .iter()
-            .any(|task| task.version_size == VersionSizeKey::Original
-                && task.download_path == fixture.destination)
-    );
-    assert!(
-        plan.tasks
-            .iter()
-            .any(|task| task.version_size == VersionSizeKey::LiveOriginal
-                && task.download_path == motion_path)
-    );
+    .await;
     fixture.ledger = fixture
         .config
         .state_db
@@ -1870,86 +1554,6 @@ async fn issue_770_recovery_reserved_links_cannot_publish_outside_root() {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-#[tokio::test]
-async fn issue_770_recovery_case_equivalent_root_replays_absence_and_durable_proof() {
-    for with_proof in [false, true] {
-        let server = crate::start_wiremock_or_skip!();
-        let fixture = RecoveryFixture::new(&server).await;
-        if with_proof {
-            std::fs::create_dir_all(fixture.destination.parent().unwrap()).unwrap();
-            std::fs::write(&fixture.destination, &fixture.bytes).unwrap();
-            let hash = file::compute_sha256(&fixture.destination).await.unwrap();
-            fixture
-                .db
-                .mark_downloaded(
-                    "PrimarySync",
-                    "PENDING",
-                    "original",
-                    &fixture.destination,
-                    &hash,
-                    None,
-                )
-                .await
-                .unwrap();
-            fixture
-                .db
-                .mark_failed("PrimarySync", "PENDING", "original", "synthetic retry")
-                .await
-                .unwrap();
-            fixture
-                .db
-                .prepare_for_retry(
-                    Some("PrimarySync"),
-                    crate::state::RetryErrorRetention::Clear,
-                )
-                .await
-                .unwrap();
-        }
-        let root = fixture.root.path();
-        let alternate = root.with_file_name(
-            root.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .to_ascii_uppercase(),
-        );
-        assert_ne!(alternate, root);
-        let mut config = fixture.config.clone();
-        config.directory = Arc::from(alternate);
-        let retry = build_pending_retry_download_tasks(
-            &fixture.passes(&[PassKind::SmartFolder, PassKind::Unfiled]),
-            &config,
-            DownloadRunMode::Download,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        if with_proof {
-            assert!(retry.tasks.is_empty());
-            assert!(retry.unmatched_targets.is_empty());
-            let rows = fixture.db.get_downloaded_page(0, 10).await.unwrap();
-            assert_eq!(rows.len(), 1);
-            assert_eq!(
-                crate::fs_util::confined_path_key(rows[0].local_path.as_ref().unwrap()).unwrap(),
-                crate::fs_util::confined_path_key(&fixture.destination).unwrap()
-            );
-        } else {
-            assert_eq!(retry.tasks.len(), 1);
-            assert!(
-                retry.tasks[0]
-                    .download_path
-                    .starts_with(config.directory.as_ref())
-            );
-            assert_eq!(
-                crate::fs_util::confined_path_key(&retry.tasks[0].download_path).unwrap(),
-                crate::fs_util::confined_path_key(&fixture.destination).unwrap()
-            );
-        }
-        assert!(server.received_requests().await.unwrap().is_empty());
-        fixture.assert_preserved().await;
-    }
-}
-
 #[tokio::test]
 async fn issue_770_recovery_targeted_cleanup_preserves_required_publication_proof() {
     let server = crate::start_wiremock_or_skip!();
@@ -2073,129 +1677,20 @@ async fn issue_770_recovery_targeted_cleanup_preserves_required_publication_proo
 }
 
 #[tokio::test]
-async fn issue_770_recovery_collecting_incremental_revalidates_deferred_publication() {
-    for changed in [false, true] {
-        let server = crate::start_wiremock_or_skip!();
-        let fixture = RecoveryFixture::new(&server).await;
-        Mock::given(method("GET"))
-            .and(path("/pending.jpg"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_bytes(fixture.bytes.clone())
-                    .insert_header("content-type", "image/jpeg"),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-        let mut config = fixture.config.clone();
-        config.folder_structure = "old-album".into();
-        let asset = PhotoAsset::new(fixture.records[0].clone(), fixture.records[1].clone());
-        let mut planner = TaskPlanner::for_download(Some(fixture.db.as_ref()))
-            .await
-            .unwrap();
-        let plan = planner.plan_download_asset(&asset, &config).await.unwrap();
-        assert_eq!(plan.tasks.len(), 1);
-        let published = plan.tasks[0].download_path.clone();
-        let mut pass = issue_770_pass(PassKind::Unfiled, &fixture.records);
-        pass.album = album_with_session(
-            "PrimarySync",
-            "",
-            Box::new(
-                crate::test_helpers::MockPhotosFlow::new()
-                    .changes_zone_page(
-                        fixture.records.clone(),
-                        "synthetic-created-successor",
-                        false,
-                    )
-                    .build(),
-            ),
-        );
-        fixture.db.acquire_lock("770 collecting finalization fault").unwrap().execute_batch(
-            "CREATE TEMP TRIGGER issue_770_collecting_fail BEFORE UPDATE OF status ON assets WHEN NEW.status = 'downloaded' BEGIN SELECT RAISE(FAIL, 'injected collecting finalization failure'); END;"
-        ).unwrap();
-        let probe =
-            crate::download::finalize::finalization_probe::FailedFinalizationProbe::for_path(
-                &published,
-            );
-        let watcher = async {
-            tokio::time::timeout(std::time::Duration::from_secs(10), probe.observed())
-                .await
-                .expect("must observe the failed initial receipt transaction");
-            let mut bytes = fixture.bytes.clone();
-            if changed {
-                *bytes.last_mut().unwrap() ^= 1;
-            }
-            assert_eq!(std::fs::read(&published).unwrap(), fixture.bytes);
-            if changed {
-                std::fs::write(&published, &bytes).unwrap();
-            }
-            fixture
-                .db
-                .acquire_lock("770 permit deferred retry")
-                .unwrap()
-                .execute_batch("DROP TRIGGER issue_770_collecting_fail;")
-                .unwrap();
-            probe.release();
-            bytes
-        };
-        let passes = [pass];
-        let config = Arc::new(config);
-        let client = Client::new();
-        let operation = crate::download::orchestration::incremental::download_photos_incremental_collecting_inner(
-            &client, &passes, &config, "synthetic-created-predecessor",
-            DownloadControls::download_hidden(), CancellationToken::new(),
-            std::time::Duration::from_secs(3600),
-        );
-        let (result, bytes) = tokio::join!(operation, watcher);
-        let result = result.unwrap();
-        assert_eq!(std::fs::read(&published).unwrap(), bytes);
-        assert_eq!(
-            fixture.db.get_downloaded_page(0, 10).await.unwrap().len(),
-            usize::from(!changed),
-            "collecting incremental cannot finalize stale publication bytes: {result:?}"
-        );
-        if changed {
-            assert!(result.stats.state_write_failures > 0);
-            assert!(
-                !fixture.db.get_pending().await.unwrap().is_empty()
-                    || !fixture.db.get_failed().await.unwrap().is_empty()
-            );
-        }
-        let ledger = fixture.db.get_reconciliation_reservations().await.unwrap();
-        assert!(fixture.ledger.iter().all(|row| ledger.contains(row)));
-    }
-}
-
-#[tokio::test]
-async fn issue_770_recovery_collecting_incremental_retains_unreceipted_reserved_file() {
+async fn quiet_delta_does_not_resurrect_an_unselected_reserved_file() {
     let server = crate::start_wiremock_or_skip!();
     let mut fixture = RecoveryFixture::new(&server).await;
     std::fs::create_dir_all(fixture.destination.parent().unwrap()).unwrap();
     std::fs::write(&fixture.destination, &fixture.bytes).unwrap();
-    fixture.config.folder_structure = "old-album".into();
     for _ in 0..2 {
         fixture.reopen().await;
-        let mut pass = issue_770_pass(PassKind::Unfiled, &fixture.records);
-        pass.album = album_with_session(
-            "PrimarySync",
-            "",
-            Box::new(
-                crate::test_helpers::MockPhotosFlow::new()
-                    .changes_zone_page(
-                        fixture.records.clone(),
-                        "synthetic-created-successor",
-                        false,
-                    )
-                    .build(),
-            ),
-        );
-        let result = crate::download::orchestration::incremental::download_photos_incremental_collecting_inner(
-            &Client::new(), &[pass], &Arc::new(fixture.config.clone()),
-            "synthetic-created-predecessor", DownloadControls::download_hidden(),
-            CancellationToken::new(), std::time::Duration::from_secs(3600),
-        ).await.unwrap();
+        fixture.config.sync_mode = crate::download::SyncMode::Incremental {
+            zone_sync_token: "old".into(),
+        };
+        let result = fixture
+            .run(&[PassKind::Unfiled], CancellationToken::new())
+            .await;
         assert_eq!(result.stats.downloaded, 0);
-        assert!(result.stats.enumeration_errors > 0);
         assert_eq!(std::fs::read(&fixture.destination).unwrap(), fixture.bytes);
         assert!(server.received_requests().await.unwrap().is_empty());
         fixture.assert_preserved().await;

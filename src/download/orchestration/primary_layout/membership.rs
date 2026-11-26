@@ -146,7 +146,7 @@ pub(in crate::download::orchestration) async fn reconcile(
             }
             let source = passes
                 .iter()
-                .find(|pass| super::super::generation::pass_key(pass) == prior.pass)
+                .find(|pass| config.pass_key(pass) == prior.pass)
                 .or_else(|| passes.first())
                 .map(|pass| &pass.album)
                 .or(recovery_source)

@@ -1,4 +1,6 @@
 use super::{IncrementalDeltaSummary, hydrate_unpaired_created_asset_deltas};
+use crate::state::{DownloadStateStore, ReportStateStore};
+use crate::state::{MembershipStore, SyncTokenStore};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -14,15 +16,13 @@ use crate::state::{SqliteStateDb, VersionSizeKey};
 use crate::test_helpers::{MockPhotosFlow, TestAssetRecord};
 
 use super::super::dispatch::download_photos_with_sync;
-use super::super::incremental::{
-    download_photos_incremental, download_photos_incremental_collecting_inner,
-};
 use super::super::models::{
     ASSET_DELTA_HYDRATION_INCOMPLETE_REASON, ASSET_MASTER_MAPPING_STATE_WRITE_FAILED_REASON,
     DownloadControls, DownloadOutcome, DownloadReporting, DownloadRunMode, DownloadStore,
     INCREMENTAL_DELETE_STATE_WRITE_FAILED_REASON, INCREMENTAL_HIDDEN_STATE_WRITE_FAILED_REASON,
-    SyncMode, SyncResult, UNKNOWN_ALBUM_RELATION_ASSET_REASON, UNPARSABLE_RELATION_DELTA_REASON,
+    SyncMode, UNKNOWN_ALBUM_RELATION_ASSET_REASON, UNPARSABLE_RELATION_DELTA_REASON,
 };
+use super::super::test_support::read_delta;
 use super::super::test_support::{
     album_with_session_and_container, changes_album, changes_album_with_container,
     changes_zone_session, changes_zone_session_with_query_page, hard_deleted_change_record,
@@ -30,7 +30,6 @@ use super::super::test_support::{
     relation_delete_record, relation_delta_record, seed_complete_album_snapshot,
     seed_downloaded_metadata_asset, test_config, unused_unfiled_changes_pass,
 };
-use super::super::url_refresh::INCREMENTAL_PREFLIGHT_URL_REFRESH_AFTER;
 
 #[derive(Clone)]
 struct RelationHydrationSession {
@@ -160,7 +159,7 @@ fn assert_source_flags(
 async fn run_incremental_change_records(
     db: Arc<crate::state::SqliteStateDb>,
     records: Vec<Value>,
-) -> SyncResult {
+) -> IncrementalDeltaSummary {
     let session = MockPhotosFlow::new()
         .changes_zone_page(records, "zone-token-after", false)
         .build();
@@ -172,7 +171,7 @@ async fn run_incremental_change_records(
 
     let mut config = test_config();
     config.state_db = Some(db);
-    download_photos_incremental(
+    read_delta(
         &Client::new(),
         &passes,
         &Arc::new(config),
@@ -212,22 +211,19 @@ async fn download_incremental_delete_and_hidden_events_mark_state_without_downlo
     config.directory = Arc::from(dir.path());
     config.state_db = Some(db.clone());
 
-    let result = download_photos_incremental(
+    let result = read_delta(
         &Client::new(),
         &passes,
         &Arc::new(config),
         "zone-token-before",
-        DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
+        DownloadControls::download_hidden(),
         CancellationToken::new(),
     )
     .await
     .unwrap();
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
-    assert_eq!(
-        result.sync_token, None,
-        "print-only incremental runs must not advance the sync token"
-    );
+    assert_eq!(result.state_transition_failures, 0);
+    assert!(result.token_unsafe_reason.is_none());
     let pending = db.get_pending().await.unwrap();
     assert!(
         pending.iter().all(
@@ -254,15 +250,12 @@ async fn incremental_soft_delete_write_error_blocks_sync_token() {
     )
     .await;
 
-    assert!(matches!(
-        result.outcome,
-        DownloadOutcome::PartialFailure { failed_count: 1 }
-    ));
-    assert_eq!(result.sync_token, None);
-    assert_eq!(result.stats.state_write_failures, 1);
-    assert!(result.stats.sync_token_blocked);
+    assert_eq!(result.state_transition_failures, 1);
+
+    assert_eq!(result.state_transition_failures, 1);
+    assert!(result.token_unsafe_reason.is_some());
     assert_eq!(
-        result.stats.sync_token_blocked_reason,
+        result.token_unsafe_reason,
         Some(INCREMENTAL_DELETE_STATE_WRITE_FAILED_REASON)
     );
 }
@@ -283,15 +276,12 @@ async fn incremental_hidden_write_error_blocks_sync_token() {
     )
     .await;
 
-    assert!(matches!(
-        result.outcome,
-        DownloadOutcome::PartialFailure { failed_count: 1 }
-    ));
-    assert_eq!(result.sync_token, None);
-    assert_eq!(result.stats.state_write_failures, 1);
-    assert!(result.stats.sync_token_blocked);
+    assert_eq!(result.state_transition_failures, 1);
+
+    assert_eq!(result.state_transition_failures, 1);
+    assert!(result.token_unsafe_reason.is_some());
     assert_eq!(
-        result.stats.sync_token_blocked_reason,
+        result.token_unsafe_reason,
         Some(INCREMENTAL_HIDDEN_STATE_WRITE_FAILED_REASON)
     );
 }
@@ -305,10 +295,10 @@ async fn incremental_untracked_cplmaster_soft_delete_zero_rows_advances_sync_tok
     )
     .await;
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
+    assert_eq!(result.state_transition_failures, 0);
     assert_eq!(result.sync_token.as_deref(), Some("zone-token-after"));
-    assert_eq!(result.stats.state_write_failures, 0);
-    assert!(!result.stats.sync_token_blocked);
+    assert_eq!(result.state_transition_failures, 0);
+    assert!(result.token_unsafe_reason.is_none());
     assert!(db.get_pending().await.unwrap().is_empty());
 }
 
@@ -324,10 +314,10 @@ async fn incremental_untracked_cplasset_soft_delete_zero_rows_advances_sync_toke
     )
     .await;
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
+    assert_eq!(result.state_transition_failures, 0);
     assert_eq!(result.sync_token.as_deref(), Some("zone-token-after"));
-    assert_eq!(result.stats.state_write_failures, 0);
-    assert!(!result.stats.sync_token_blocked);
+    assert_eq!(result.state_transition_failures, 0);
+    assert!(result.token_unsafe_reason.is_none());
 }
 
 #[tokio::test]
@@ -341,10 +331,10 @@ async fn incremental_untracked_cplasset_soft_delete_without_master_ref_advances_
     )
     .await;
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
+    assert_eq!(result.state_transition_failures, 0);
     assert_eq!(result.sync_token.as_deref(), Some("zone-token-after"));
-    assert_eq!(result.stats.state_write_failures, 0);
-    assert!(!result.stats.sync_token_blocked);
+    assert_eq!(result.state_transition_failures, 0);
+    assert!(result.token_unsafe_reason.is_none());
 }
 
 #[tokio::test]
@@ -362,10 +352,10 @@ async fn incremental_cplasset_soft_delete_prunes_master_ref_pending_row() {
     )
     .await;
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
+    assert_eq!(result.state_transition_failures, 0);
     assert_eq!(result.sync_token.as_deref(), Some("zone-token-after"));
-    assert_eq!(result.stats.state_write_failures, 0);
-    assert!(!result.stats.sync_token_blocked);
+    assert_eq!(result.state_transition_failures, 0);
+    assert!(result.token_unsafe_reason.is_none());
     assert!(
         db.get_pending().await.unwrap().is_empty(),
         "source-deleted pending row should be removed"
@@ -387,10 +377,10 @@ async fn incremental_cplasset_hidden_marks_master_ref_row() {
     )
     .await;
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
+    assert_eq!(result.state_transition_failures, 0);
     assert_eq!(result.sync_token.as_deref(), Some("zone-token-after"));
-    assert_eq!(result.stats.state_write_failures, 0);
-    assert!(!result.stats.sync_token_blocked);
+    assert_eq!(result.state_transition_failures, 0);
+    assert!(result.token_unsafe_reason.is_none());
     let pending = db.get_pending().await.unwrap();
     assert_source_flags(&pending, "TRACKED_HIDDEN_MASTER", false, true);
 }
@@ -417,10 +407,10 @@ async fn incremental_cplasset_soft_delete_prunes_sibling_pending_row_before_mast
     )
     .await;
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
+    assert_eq!(result.state_transition_failures, 0);
     assert_eq!(result.sync_token.as_deref(), Some("zone-token-after"));
-    assert_eq!(result.stats.state_write_failures, 0);
-    assert!(!result.stats.sync_token_blocked);
+    assert_eq!(result.state_transition_failures, 0);
+    assert!(result.token_unsafe_reason.is_none());
     let pending = db.get_pending().await.unwrap();
     assert_source_flags(&pending, "TRACKED_MASTER", false, false);
     assert!(
@@ -457,10 +447,10 @@ async fn incremental_cplasset_hidden_marks_sibling_state_row_before_master_ref()
     )
     .await;
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
+    assert_eq!(result.state_transition_failures, 0);
     assert_eq!(result.sync_token.as_deref(), Some("zone-token-after"));
-    assert_eq!(result.stats.state_write_failures, 0);
-    assert!(!result.stats.sync_token_blocked);
+    assert_eq!(result.state_transition_failures, 0);
+    assert!(result.token_unsafe_reason.is_none());
     let pending = db.get_pending().await.unwrap();
     assert_source_flags(&pending, "TRACKED_HIDDEN_MASTER", false, false);
     assert_source_flags(&pending, "asset-TRACKED_HIDDEN_SIBLING", false, true);
@@ -475,7 +465,7 @@ async fn incremental_change_persists_asset_master_mapping() {
     )
     .await;
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
+    assert_eq!(result.state_transition_failures, 0);
     assert_eq!(
         db.get_master_record_name_for_asset("PrimarySync", "asset-MAPPED_MASTER")
             .await
@@ -494,10 +484,10 @@ async fn incremental_untracked_hidden_zero_rows_advances_sync_token() {
     )
     .await;
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
+    assert_eq!(result.state_transition_failures, 0);
     assert_eq!(result.sync_token.as_deref(), Some("zone-token-after"));
-    assert_eq!(result.stats.state_write_failures, 0);
-    assert!(!result.stats.sync_token_blocked);
+    assert_eq!(result.state_transition_failures, 0);
+    assert!(result.token_unsafe_reason.is_none());
 }
 
 #[tokio::test]
@@ -512,10 +502,10 @@ async fn incremental_unresolved_hard_delete_zero_rows_advances_sync_token() {
     )
     .await;
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
+    assert_eq!(result.state_transition_failures, 0);
     assert_eq!(result.sync_token.as_deref(), Some("zone-token-after"));
-    assert_eq!(result.stats.state_write_failures, 0);
-    assert!(!result.stats.sync_token_blocked);
+    assert_eq!(result.state_transition_failures, 0);
+    assert!(result.token_unsafe_reason.is_none());
     let pending = db.get_pending().await.unwrap();
     assert_source_flags(&pending, "TRACKED_MASTER", false, false);
 }
@@ -539,10 +529,10 @@ async fn incremental_unresolved_master_hard_delete_prunes_sibling_pending_rows()
     )
     .await;
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
+    assert_eq!(result.state_transition_failures, 0);
     assert_eq!(result.sync_token.as_deref(), Some("zone-token-after"));
-    assert_eq!(result.stats.state_write_failures, 0);
-    assert!(!result.stats.sync_token_blocked);
+    assert_eq!(result.state_transition_failures, 0);
+    assert!(result.token_unsafe_reason.is_none());
     assert!(
         db.get_pending().await.unwrap().is_empty(),
         "master-family hard delete should remove pending retry rows"
@@ -577,10 +567,10 @@ async fn incremental_hard_delete_uses_library_scoped_asset_master_mapping() {
         run_incremental_change_records(db.clone(), vec![hard_deleted_change_record("asset-SAME")])
             .await;
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
+    assert_eq!(result.state_transition_failures, 0);
     assert_eq!(result.sync_token.as_deref(), Some("zone-token-after"));
-    assert_eq!(result.stats.state_write_failures, 0);
-    assert!(!result.stats.sync_token_blocked);
+    assert_eq!(result.state_transition_failures, 0);
+    assert!(result.token_unsafe_reason.is_none());
 
     let pending = db.get_pending().await.unwrap();
     assert!(
@@ -749,17 +739,18 @@ async fn album_delta_missing_name_preserves_container_and_blocks_checkpoint() {
     let mut config = test_config();
     config.directory = Arc::from(dir.path());
     config.state_db = Some(db.clone());
-    let result = download_photos_incremental(
+    let result = read_delta(
         &Client::new(),
         &passes,
         &Arc::new(config),
         "zone-token-before",
-        DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
+        DownloadControls::download_hidden(),
         CancellationToken::new(),
     )
     .await
     .unwrap();
-    assert_eq!(result.sync_token, None);
+
+    assert!(result.token_unsafe_reason.is_some());
     let name: String = db.acquire_lock("test").unwrap().query_row(
         "SELECT album_name FROM album_containers WHERE library='PrimarySync' AND container_id='container-a'",
         [], |row| row.get(0),
@@ -769,58 +760,66 @@ async fn album_delta_missing_name_preserves_container_and_blocks_checkpoint() {
 
 #[tokio::test]
 async fn changes_stream_mixed_malformed_asset_relation_preserves_valid_and_blocks_token() {
-    let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
-    db.upsert_album_container("PrimarySync", "container-a", "Vacation", "album")
-        .await
-        .unwrap();
+    use super::super::test_support::{
+        SelectedMediaSession, dispatch_delta, initialize_empty_selection, open_fixture_db,
+        selected_pass_with_session,
+    };
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use wiremock::{Mock, ResponseTemplate, matchers::method};
+    let server = crate::start_wiremock_or_skip!();
+    let bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/media/pattern.jpg"
+    ));
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.as_slice()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = TempDir::new().unwrap();
+    let db = open_fixture_db(&dir.path().join("state.db")).await;
     let mut malformed = incremental_photo_records("MALFORMED_ASSET");
     malformed[0]["fields"]["resOriginalRes"]["value"]
         .as_object_mut()
         .expect("resource value object")
         .remove("downloadURL");
-    let mut records = incremental_photo_records("VALID_ASSET");
+    let mut records = super::super::test_support::incremental_photo_records_with_url(
+        "VALID_ASSET",
+        "valid.jpg",
+        &server.uri(),
+        bytes.len() as u64,
+    );
+    records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+        json!(base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes)));
+    for pair in [&mut records, &mut malformed] {
+        pair[1]["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+            json!("_defaultOwner");
+    }
     records.extend(malformed);
     records.push(relation_delta_record("container-a", "asset-VALID_ASSET"));
-    let session = MockPhotosFlow::new()
-        .changes_zone_page(records, "zone-token-after", false)
-        .build();
-    let passes = vec![
-        AlbumPass {
-            kind: PassKind::Album,
-            album: changes_album_with_container("Vacation", Some("container-a"), session),
-            exclude_ids: Arc::new(FxHashSet::default()),
-        },
-        unused_unfiled_changes_pass(),
-    ];
-
+    let passes = [selected_pass_with_session(
+        &db,
+        "",
+        Box::new(SelectedMediaSession(Arc::new(records))),
+    )];
     let mut config = test_config();
-    let dir = TempDir::new().unwrap();
-    config.directory = Arc::from(dir.path());
+    config.directory = Arc::from(dir.path().join("media"));
     config.state_db = Some(db.clone());
-    let result = download_photos_incremental(
+    initialize_empty_selection(&db, &config).await;
+    let result = dispatch_delta(
         &Client::new(),
         &passes,
         &Arc::new(config),
         "zone-token-before",
-        DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
+        DownloadControls::download_hidden(),
         CancellationToken::new(),
     )
     .await
     .unwrap();
 
-    assert!(matches!(
-        result.outcome,
-        DownloadOutcome::PartialFailure { failed_count: 1 }
-    ));
-    assert_eq!(result.sync_token, None);
-    assert_eq!(result.stats.enumeration_errors, 1);
-    let pending = db.get_pending().await.unwrap();
-    assert!(
-        pending
-            .iter()
-            .any(|record| record.id.as_ref() == "asset-VALID_ASSET"),
-        "valid incremental asset should still be recorded for the planned work"
-    );
+    assert_eq!(result.sync_token, None, "{result:?}");
+    assert_eq!(result.stats.downloaded, 1, "{result:?}");
     let memberships = db
         .get_live_selected_album_memberships_for_asset(
             "PrimarySync",
@@ -905,7 +904,7 @@ async fn asset_only_delta_recovers_identity_refreshes_metadata_and_advances_toke
         let media_path =
             seed_downloaded_metadata_asset(db.as_ref(), &config, &pass, &stored_asset).await;
 
-        let result = download_photos_incremental(
+        let result = read_delta(
             &Client::new(),
             std::slice::from_ref(&pass),
             &Arc::new(config),
@@ -916,10 +915,9 @@ async fn asset_only_delta_recovers_identity_refreshes_metadata_and_advances_toke
         .await
         .expect("asset-only delta should hydrate");
 
-        assert!(matches!(result.outcome, DownloadOutcome::Success));
-        assert_eq!(result.stats.downloaded, 0, "{identity_source:?}");
+        assert_eq!(result.state_transition_failures, 0);
         assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
-        assert!(!result.stats.sync_token_blocked);
+        assert!(result.token_unsafe_reason.is_none());
         assert_eq!(
             session_probe.records_query_count(),
             match identity_source {
@@ -1093,7 +1091,7 @@ async fn unresolved_asset_only_delta_preserves_incremental_token() {
     let mut config = test_config();
     config.state_db = Some(Arc::new(SqliteStateDb::open_in_memory().expect("state db")));
 
-    let result = download_photos_incremental(
+    let result = read_delta(
         &Client::new(),
         std::slice::from_ref(&pass),
         &Arc::new(config),
@@ -1104,10 +1102,9 @@ async fn unresolved_asset_only_delta_preserves_incremental_token() {
     .await
     .expect("inconclusive hydration should remain a safe partial sync");
 
-    assert_eq!(result.sync_token, None);
-    assert!(result.stats.sync_token_blocked);
+    assert!(result.token_unsafe_reason.is_some());
     assert_eq!(
-        result.stats.sync_token_blocked_reason,
+        result.token_unsafe_reason,
         Some(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON)
     );
 }
@@ -1154,7 +1151,7 @@ async fn issue956_missing_old_master_keeps_changed_child_held_across_reopens() {
             original_bytes = tokio::fs::read(&path).await.unwrap();
             original_path = Some(path);
         }
-        let result = download_photos_incremental(
+        let result = read_delta(
             &Client::new(),
             std::slice::from_ref(&pass),
             &Arc::new(config),
@@ -1165,16 +1162,15 @@ async fn issue956_missing_old_master_keeps_changed_child_held_across_reopens() {
         .await
         .unwrap();
         // Transfer success is not checkpoint proof: unresolved identity vetoes the token.
-        assert!(matches!(result.outcome, DownloadOutcome::Success));
-        assert_eq!(result.sync_token, None);
+        assert_eq!(result.state_transition_failures, 0);
+
         assert_eq!(
-            result.stats.sync_token_blocked_reason,
+            result.token_unsafe_reason,
             Some(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON)
         );
-        assert!(result.stats.sync_token_blocked);
-        assert!(result.stats.identity_incomplete);
-        assert_eq!(result.stats.state_write_failures, 0);
-        assert_eq!(result.stats.downloaded, 0);
+        assert!(result.token_unsafe_reason.is_some());
+        assert!(result.identity_incomplete);
+        assert_eq!(result.state_transition_failures, 0);
         assert_eq!(
             probe.records_query_count(),
             2,
@@ -1264,7 +1260,7 @@ async fn asset_only_delta_master_deletion_tombstones_entire_family() {
     let mut config = test_config();
     config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
 
-    let result = download_photos_incremental(
+    let result = read_delta(
         &Client::new(),
         std::slice::from_ref(&pass),
         &Arc::new(config),
@@ -1275,9 +1271,9 @@ async fn asset_only_delta_master_deletion_tombstones_entire_family() {
     .await
     .expect("master deletion should resolve the complete family");
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
+    assert_eq!(result.state_transition_failures, 0);
     assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
-    assert!(!result.stats.sync_token_blocked);
+    assert!(result.token_unsafe_reason.is_none());
     let summary = db.get_summary().await.expect("read state summary");
     assert_eq!(summary.source_deleted, 3);
     assert_eq!(summary.pending, 0);
@@ -1309,23 +1305,30 @@ async fn incremental_relation_add_before_photo_routes_to_album_not_unfiled() {
     config.folder_structure = "Unfiled".to_string();
     config.folder_structure_albums = Arc::from("{album}");
     config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
-    let result = download_photos_incremental(
+    let result = read_delta(
         &Client::new(),
         &passes,
         &Arc::new(config),
         "zone-token-prev",
-        DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
+        DownloadControls::download_hidden(),
         CancellationToken::new(),
     )
     .await
     .expect("relation-add routing should succeed");
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
-    let album_rows = db.get_all_asset_albums("PrimarySync").await.unwrap();
+    assert_eq!(result.state_transition_failures, 0);
+    let live = db
+        .get_live_selected_album_memberships_for_asset(
+            "PrimarySync",
+            "asset-MASTER_CHANGED",
+            &["container-vacation"],
+        )
+        .await
+        .unwrap();
+    assert_eq!(live.len(), 1);
     assert_eq!(
-        album_rows,
-        vec![("asset-MASTER_CHANGED".to_string(), "Vacation".to_string())],
-        "relation add should route the photo event through the album pass"
+        live[0].master_record_name.as_deref(),
+        Some("MASTER_CHANGED")
     );
 }
 
@@ -1361,18 +1364,18 @@ async fn incremental_relation_delete_before_photo_routes_to_unfiled() {
     config.folder_structure = "Unfiled".to_string();
     config.folder_structure_albums = Arc::from("{album}");
     config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
-    let result = download_photos_incremental(
+    let result = read_delta(
         &Client::new(),
         &passes,
         &Arc::new(config),
         "zone-token-prev",
-        DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
+        DownloadControls::download_hidden(),
         CancellationToken::new(),
     )
     .await
     .expect("relation-delete routing should succeed");
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
+    assert_eq!(result.state_transition_failures, 0);
     let album_rows = db.get_all_asset_albums("PrimarySync").await.unwrap();
     assert!(
         album_rows.is_empty(),
@@ -1400,7 +1403,7 @@ async fn selected_relation_add_without_photo_blocks_incremental_token() {
 
     let mut config = test_config();
     config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
-    let result = download_photos_incremental(
+    let result = read_delta(
         &Client::new(),
         &passes,
         &Arc::new(config),
@@ -1411,11 +1414,11 @@ async fn selected_relation_add_without_photo_blocks_incremental_token() {
     .await
     .expect("unknown selected relation add should not fall back to full here");
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
-    assert_eq!(result.sync_token, None);
-    assert!(result.stats.sync_token_blocked);
+    assert_eq!(result.state_transition_failures, 0);
+
+    assert!(result.token_unsafe_reason.is_some());
     assert_eq!(
-        result.stats.sync_token_blocked_reason,
+        result.token_unsafe_reason,
         Some(UNKNOWN_ALBUM_RELATION_ASSET_REASON)
     );
 }
@@ -1443,7 +1446,7 @@ async fn selected_relation_add_without_photo_uses_persisted_asset_master_mapping
 
     let mut config = test_config();
     config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
-    let result = download_photos_incremental(
+    let result = read_delta(
         &Client::new(),
         &passes,
         &Arc::new(config),
@@ -1454,9 +1457,9 @@ async fn selected_relation_add_without_photo_uses_persisted_asset_master_mapping
     .await
     .expect("known selected relation add should not fall back to full here");
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
+    assert_eq!(result.state_transition_failures, 0);
     assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
-    assert!(!result.stats.sync_token_blocked);
+    assert!(result.token_unsafe_reason.is_none());
     let memberships = db
         .get_live_selected_album_memberships_for_asset(
             "PrimarySync",
@@ -1492,19 +1495,19 @@ async fn selected_relation_add_without_photo_hydrates_missing_asset() {
 
     let mut config = test_config();
     config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
-    let result = download_photos_incremental(
+    let result = read_delta(
         &Client::new(),
         &passes,
         &Arc::new(config),
         "zone-token-prev",
-        DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
+        DownloadControls::download_hidden(),
         CancellationToken::new(),
     )
     .await
     .expect("missing selected relation asset should hydrate");
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
-    assert!(!result.stats.sync_token_blocked);
+    assert_eq!(result.state_transition_failures, 0);
+    assert!(result.token_unsafe_reason.is_none());
     assert_eq!(
         session.incremental_calls.load(Ordering::SeqCst),
         1,
@@ -1549,7 +1552,7 @@ async fn incremental_relation_add_unknown_unselected_container_advances_sync_tok
 
     let mut config = test_config();
     config.state_db = Some(db);
-    let result = download_photos_incremental(
+    let result = read_delta(
         &Client::new(),
         &passes,
         &Arc::new(config),
@@ -1560,9 +1563,9 @@ async fn incremental_relation_add_unknown_unselected_container_advances_sync_tok
     .await
     .expect("unknown relation container should not fall back to full here");
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
+    assert_eq!(result.state_transition_failures, 0);
     assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
-    assert!(!result.stats.sync_token_blocked);
+    assert!(result.token_unsafe_reason.is_none());
 }
 
 #[tokio::test]
@@ -1588,7 +1591,7 @@ async fn incremental_album_delta_delete_invalidates_snapshot_through_download_fl
 
     let mut config = test_config();
     config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
-    let result = download_photos_incremental(
+    let result = read_delta(
         &Client::new(),
         &passes,
         &Arc::new(config),
@@ -1599,7 +1602,7 @@ async fn incremental_album_delta_delete_invalidates_snapshot_through_download_fl
     .await
     .expect("album delete delta should be applied through incremental flow");
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
+    assert_eq!(result.state_transition_failures, 0);
     assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
     assert!(
         !db.selected_album_containers_have_complete_snapshots(
@@ -1631,7 +1634,7 @@ async fn incremental_relation_add_writes_membership_after_album_delta() {
 
     let mut config = test_config();
     config.state_db = Some(db.clone());
-    let result = download_photos_incremental(
+    let result = read_delta(
         &Client::new(),
         &passes,
         &Arc::new(config),
@@ -1642,7 +1645,7 @@ async fn incremental_relation_add_writes_membership_after_album_delta() {
     .await
     .expect("incremental relation delta should succeed");
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
+    assert_eq!(result.state_transition_failures, 0);
     assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
     let memberships = db
         .get_live_selected_album_memberships_for_asset(
@@ -1690,7 +1693,7 @@ async fn incremental_relation_delete_marks_membership_deleted() {
 
     let mut config = test_config();
     config.state_db = Some(db.clone());
-    let result = download_photos_incremental(
+    let result = read_delta(
         &Client::new(),
         &passes,
         &Arc::new(config),
@@ -1701,7 +1704,7 @@ async fn incremental_relation_delete_marks_membership_deleted() {
     .await
     .expect("incremental relation delete should succeed");
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
+    assert_eq!(result.state_transition_failures, 0);
     let memberships = db
         .get_live_selected_album_memberships_for_asset(
             "PrimarySync",
@@ -1727,7 +1730,7 @@ async fn unparsable_relation_delete_blocks_incremental_token() {
     }];
 
     let config = Arc::new(test_config());
-    let result = download_photos_incremental(
+    let result = read_delta(
         &Client::new(),
         &passes,
         &config,
@@ -1738,77 +1741,52 @@ async fn unparsable_relation_delete_blocks_incremental_token() {
     .await
     .expect("unparsable relation delete should not fall back to full here");
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
-    assert_eq!(result.sync_token, None);
-    assert!(result.stats.sync_token_blocked);
+    assert_eq!(result.state_transition_failures, 0);
+
+    assert!(result.token_unsafe_reason.is_some());
     assert_eq!(
-        result.stats.sync_token_blocked_reason,
+        result.token_unsafe_reason,
         Some(UNPARSABLE_RELATION_DELTA_REASON)
     );
 }
 
-#[derive(Clone, Copy, Debug)]
-enum DeltaExecution {
-    Streaming,
-    Collecting,
-}
-
-impl DeltaExecution {
-    async fn run(
-        self,
-        db: &Arc<SqliteStateDb>,
-        dir: &TempDir,
-        records: Vec<Value>,
-        shutdown: CancellationToken,
-    ) -> SyncResult {
-        let session = changes_zone_session_with_query_page(
-            Arc::new(AtomicUsize::new(0)),
-            records,
-            json!({"records": []}),
-            0,
-        );
-        let passes = [AlbumPass {
-            kind: PassKind::Unfiled,
-            album: changes_album("", session),
-            exclude_ids: Arc::new(FxHashSet::default()),
-        }];
-        let mut config = test_config();
-        config.directory = Arc::from(dir.path());
-        config.state_db = Some(db.clone());
-        let config = Arc::new(config);
-        let client = Client::new();
-        match self {
-            Self::Streaming => {
-                download_photos_incremental(
-                    &client,
-                    &passes,
-                    &config,
-                    "zone-token-prev",
-                    DownloadControls::download_hidden(),
-                    shutdown,
-                )
-                .await
-            }
-            Self::Collecting => {
-                download_photos_incremental_collecting_inner(
-                    &client,
-                    &passes,
-                    &config,
-                    "zone-token-prev",
-                    DownloadControls::download_hidden(),
-                    shutdown,
-                    INCREMENTAL_PREFLIGHT_URL_REFRESH_AFTER,
-                )
-                .await
-            }
-        }
-        .unwrap_or_else(|error| panic!("{self:?}: {error:#}"))
-    }
+async fn apply_records(
+    db: &Arc<SqliteStateDb>,
+    dir: &TempDir,
+    records: Vec<Value>,
+    shutdown: CancellationToken,
+) -> IncrementalDeltaSummary {
+    let session = changes_zone_session_with_query_page(
+        Arc::new(AtomicUsize::new(0)),
+        records,
+        json!({"records": []}),
+        0,
+    );
+    let passes = [AlbumPass {
+        kind: PassKind::Unfiled,
+        album: changes_album("", session),
+        exclude_ids: Arc::new(FxHashSet::default()),
+    }];
+    let mut config = test_config();
+    config.directory = Arc::from(dir.path());
+    config.state_db = Some(db.clone());
+    let config = Arc::new(config);
+    let client = Client::new();
+    read_delta(
+        &client,
+        &passes,
+        &config,
+        "zone-token-prev",
+        DownloadControls::download_hidden(),
+        shutdown,
+    )
+    .await
+    .unwrap()
 }
 
 #[tokio::test]
 async fn shared_delta_state_preserves_transitions_relations_and_unchanged_cycle() {
-    for execution in [DeltaExecution::Streaming, DeltaExecution::Collecting] {
+    {
         let dir = TempDir::new().unwrap();
         let db = Arc::new(
             SqliteStateDb::open(&dir.path().join("state.db"))
@@ -1843,16 +1821,11 @@ async fn shared_delta_state_preserves_transitions_relations_and_unchanged_cycle(
         records.extend(flagged_incremental_records("HIDDEN", ("isHidden", 1)));
 
         for delta in [records, Vec::new()] {
-            let result = execution
-                .run(&db, &dir, delta, CancellationToken::new())
-                .await;
-            assert!(
-                matches!(result.outcome, DownloadOutcome::Success),
-                "{execution:?}"
-            );
+            let result = apply_records(&db, &dir, delta, CancellationToken::new()).await;
+            assert_eq!(result.state_transition_failures, 0);
             assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
-            assert!(!result.stats.sync_token_blocked);
-            assert_eq!(result.stats.state_write_failures, 0);
+            assert!(result.token_unsafe_reason.is_none());
+            assert_eq!(result.state_transition_failures, 0);
             let pending = db.get_pending().await.unwrap();
             assert_eq!(pending.len(), 1);
             assert_source_flags(&pending, "HIDDEN", false, true);
@@ -1884,7 +1857,7 @@ async fn shared_delta_state_preserves_transitions_relations_and_unchanged_cycle(
 
 #[tokio::test]
 async fn shared_delta_state_failed_write_replays_then_stays_unchanged() {
-    for execution in [DeltaExecution::Streaming, DeltaExecution::Collecting] {
+    {
         for (write, reason, hidden_after_failure) in [
             (
                 "UPDATE ON assets",
@@ -1914,17 +1887,12 @@ async fn shared_delta_state_failed_write_replays_then_stays_unchanged() {
                 ))
                 .unwrap();
             let records = flagged_incremental_records("HIDDEN", ("isHidden", 1));
-            let failed = execution
-                .run(&db, &dir, records.clone(), CancellationToken::new())
-                .await;
-            assert_eq!(failed.sync_token, None);
-            assert!(failed.stats.sync_token_blocked);
-            assert_eq!(failed.stats.sync_token_blocked_reason, Some(reason));
-            assert_eq!(failed.stats.state_write_failures, 1);
-            assert!(matches!(
-                failed.outcome,
-                DownloadOutcome::PartialFailure { failed_count: 1 }
-            ));
+            let failed = apply_records(&db, &dir, records.clone(), CancellationToken::new()).await;
+
+            assert!(failed.token_unsafe_reason.is_some());
+            assert_eq!(failed.token_unsafe_reason, Some(reason));
+            assert_eq!(failed.state_transition_failures, 1);
+            assert_eq!(failed.state_transition_failures, 1);
             assert_source_flags(
                 &db.get_pending().await.unwrap(),
                 "HIDDEN",
@@ -1936,12 +1904,10 @@ async fn shared_delta_state_failed_write_replays_then_stays_unchanged() {
                 .execute_batch("DROP TRIGGER reject_delta;")
                 .unwrap();
             for delta in [records, Vec::new()] {
-                let result = execution
-                    .run(&db, &dir, delta, CancellationToken::new())
-                    .await;
+                let result = apply_records(&db, &dir, delta, CancellationToken::new()).await;
                 assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
-                assert_eq!(result.stats.state_write_failures, 0);
-                assert!(!result.stats.sync_token_blocked);
+                assert_eq!(result.state_transition_failures, 0);
+                assert!(result.token_unsafe_reason.is_none());
                 assert_source_flags(&db.get_pending().await.unwrap(), "HIDDEN", false, true);
             }
         }
@@ -1952,7 +1918,7 @@ async fn shared_delta_state_failed_write_replays_then_stays_unchanged() {
 async fn shared_delta_state_malformed_and_unresolved_events_keep_token_unsafe() {
     use crate::icloud::photos::asset::MALFORMED_REQUIRED_ASSET_FIELDS_REASON;
 
-    for execution in [DeltaExecution::Streaming, DeltaExecution::Collecting] {
+    {
         let dir = TempDir::new().unwrap();
         let db = Arc::new(
             SqliteStateDb::open(&dir.path().join("state.db"))
@@ -1975,12 +1941,11 @@ async fn shared_delta_state_malformed_and_unresolved_events_keep_token_unsafe() 
             let mut records = invalid;
             records.extend(flagged_incremental_records("HIDDEN", ("isHidden", 1)));
             for _ in 0..2 {
-                let result = execution
-                    .run(&db, &dir, records.clone(), CancellationToken::new())
-                    .await;
-                assert_eq!(result.sync_token, None, "{execution:?}: {reason}");
-                assert!(result.stats.sync_token_blocked);
-                assert_eq!(result.stats.sync_token_blocked_reason, Some(reason));
+                let result =
+                    apply_records(&db, &dir, records.clone(), CancellationToken::new()).await;
+
+                assert!(result.token_unsafe_reason.is_some());
+                assert_eq!(result.token_unsafe_reason, Some(reason));
                 let pending = db.get_pending().await.unwrap();
                 assert_eq!(pending.len(), 1);
                 assert_source_flags(&pending, "HIDDEN", false, true);
@@ -1991,7 +1956,7 @@ async fn shared_delta_state_malformed_and_unresolved_events_keep_token_unsafe() 
 
 #[tokio::test]
 async fn shared_delta_state_interrupted_before_consumption_preserves_state() {
-    for execution in [DeltaExecution::Streaming, DeltaExecution::Collecting] {
+    {
         let dir = TempDir::new().unwrap();
         let db = Arc::new(
             SqliteStateDb::open(&dir.path().join("state.db"))
@@ -2003,15 +1968,14 @@ async fn shared_delta_state_interrupted_before_consumption_preserves_state() {
             .unwrap();
         let shutdown = CancellationToken::new();
         shutdown.cancel();
-        let result = execution
-            .run(
-                &db,
-                &dir,
-                flagged_incremental_records("HIDDEN", ("isHidden", 1)),
-                shutdown,
-            )
-            .await;
-        assert!(result.stats.interrupted);
+        let result = apply_records(
+            &db,
+            &dir,
+            flagged_incremental_records("HIDDEN", ("isHidden", 1)),
+            shutdown,
+        )
+        .await;
+        assert_eq!(result.total_events, 0);
         assert_source_flags(&db.get_pending().await.unwrap(), "HIDDEN", false, false);
         assert_eq!(
             db.get_master_record_name_for_asset("PrimarySync", "asset-HIDDEN")
@@ -2028,7 +1992,7 @@ async fn shared_delta_state_interrupted_before_consumption_preserves_state() {
 async fn shared_delta_state_preserves_strategy_failure_precedence() {
     use crate::icloud::photos::asset::MALFORMED_REQUIRED_ASSET_FIELDS_REASON;
 
-    for execution in [DeltaExecution::Streaming, DeltaExecution::Collecting] {
+    {
         let dir = TempDir::new().unwrap();
         let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
         db.upsert_seen(&TestAssetRecord::new("HIDDEN").build())
@@ -2048,19 +2012,12 @@ async fn shared_delta_state_preserves_strategy_failure_precedence() {
             .unwrap()
             .remove("assetDate");
         records.extend(malformed);
-        let result = execution
-            .run(&db, &dir, records, CancellationToken::new())
-            .await;
-        // Streaming encounters the write failure first. Collecting observes
-        // every provider event before writing, so the malformed event wins.
-        let reason = match execution {
-            DeltaExecution::Streaming => INCREMENTAL_HIDDEN_STATE_WRITE_FAILED_REASON,
-            DeltaExecution::Collecting => MALFORMED_REQUIRED_ASSET_FIELDS_REASON,
-        };
-        assert_eq!(result.sync_token, None);
-        assert!(result.stats.sync_token_blocked);
-        assert_eq!(result.stats.sync_token_blocked_reason, Some(reason));
-        assert_eq!(result.stats.state_write_failures, 1);
+        let result = apply_records(&db, &dir, records, CancellationToken::new()).await;
+        let reason = MALFORMED_REQUIRED_ASSET_FIELDS_REASON;
+
+        assert!(result.token_unsafe_reason.is_some());
+        assert_eq!(result.token_unsafe_reason, Some(reason));
+        assert_eq!(result.state_transition_failures, 1);
         assert_source_flags(&db.get_pending().await.unwrap(), "HIDDEN", false, false);
     }
 }
@@ -2671,13 +2628,11 @@ async fn issue958_album_groups_share_one_fallback_per_source() {
         let config = test_config();
         let mut mapping = Default::default();
         let mut complete = Vec::new();
-        let mut downloads = Vec::new();
         let mut claims = Default::default();
         let pass_configs: Vec<_> = passes.iter().map(|_| Arc::new(test_config())).collect();
         let mut context = super::IncrementalAssetHydrationContext {
             asset_to_master: &mut mapping,
             complete_delta_assets: &mut complete,
-            downloadable_assets: &mut downloads,
             download_ctx: None,
             claimed_legacy_master_states: &mut claims,
             claim_mode: LegacyOwnerClaimMode::ReadOnly,
@@ -2700,7 +2655,7 @@ async fn issue958_album_groups_share_one_fallback_per_source() {
             assert!(calls.is_empty());
             assert_eq!(summary.auth_errors, 1);
             assert!(summary.token_unsafe_reason.is_some());
-            assert!(mapping.is_empty() && complete.is_empty() && downloads.is_empty());
+            assert!(mapping.is_empty() && complete.is_empty());
             assert!(
                 !capture
                     .events()
@@ -2753,10 +2708,6 @@ async fn issue958_album_groups_share_one_fallback_per_source() {
         );
         assert_eq!(mapping.len(), usize::from(target_page.is_some()));
         assert_eq!(complete.len(), usize::from(target_page.is_some()));
-        assert_eq!(
-            downloads.len(),
-            if target_page.is_some() { groups } else { 0 }
-        );
     }
 }
 

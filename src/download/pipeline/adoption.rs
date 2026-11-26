@@ -124,10 +124,8 @@ async fn enumerated_reserved_pending(
     );
     let evidence = PendingRetryFileEvidence {
         version_size: derived.version_size,
-        filename: &derived.filename,
         checksum: &derived.checksum,
         size: derived.size,
-        local_path: PendingRetryLocalPath::Unrecorded,
         cross_parent_recorded_file: recorded,
     };
     Ok(Some(
@@ -353,162 +351,11 @@ impl From<PendingOnDiskAdoption> for PendingRetryAdoption {
 
 pub(in crate::download) struct PendingRetryFileEvidence<'a> {
     pub(in crate::download) version_size: VersionSizeKey,
-    pub(in crate::download) filename: &'a str,
     pub(in crate::download) checksum: &'a str,
-    pub(in crate::download) local_path: PendingRetryLocalPath<'a>,
     /// Stored current-generation proof, checked by confined keys only in the
     /// cross-parent route; ordinary adoption keeps its existing spelling policy.
     pub(in crate::download) cross_parent_recorded_file: Option<&'a RecordedLocalFile>,
     pub(in crate::download) size: u64,
-}
-
-pub(in crate::download) enum PendingRetryLocalPath<'a> {
-    Unrecorded,
-    Current(&'a RecordedLocalFile),
-    Historical,
-}
-
-pub(in crate::download) async fn adopt_pending_on_disk_for_retry(
-    db: &dyn DownloadStore,
-    config: &DownloadConfig,
-    asset: &PhotoAsset,
-    task_planner: &mut TaskPlanner,
-    planned_tasks: &[DownloadTask],
-    evidence: PendingRetryFileEvidence<'_>,
-) -> Result<PendingRetryAdoption> {
-    let reserved = task_planner.cross_parent_retry_destinations(
-        effective_asset_library(asset, config),
-        asset.state_id(),
-        evidence.version_size,
-        evidence.checksum,
-        evidence.size,
-    )?;
-    if !reserved.is_empty() {
-        return adopt_cross_parent_pending_file(
-            db,
-            config,
-            asset,
-            task_planner,
-            &evidence,
-            &reserved,
-            true,
-        )
-        .await;
-    }
-    // A content change can leave historical catalog evidence after the new
-    // reserved sibling was published but finalization failed. Its immutable
-    // content-specific reservation and verified bytes permit adoption; the old
-    // recorded file still cannot stand in for the new provider generation.
-    let mut has_reserved_destination = false;
-    for task in planned_tasks.iter().filter(|task| {
-        task.version_size == evidence.version_size
-            && task.checksum.as_ref() == evidence.checksum
-            && task.size == evidence.size
-    }) {
-        if task_planner.has_durable_destination(task) {
-            has_reserved_destination = true;
-            if let Some(adoption) =
-                adopt_pending_task_path(db, config, asset, task_planner, task, None).await
-            {
-                return Ok(adoption.into());
-            }
-        }
-    }
-    // An older catalog copy is not completion of this selected reservation.
-    if has_reserved_destination {
-        return Ok(PendingRetryAdoption::NotFound);
-    }
-    if matches!(evidence.local_path, PendingRetryLocalPath::Historical) {
-        return Ok(PendingRetryAdoption::NotFound);
-    }
-
-    if let PendingRetryLocalPath::Current(recorded_file) = evidence.local_path {
-        let local_path = &recorded_file.path;
-        let recorded_filename_matches = local_path
-            .file_name()
-            .and_then(|filename| filename.to_str())
-            .is_some_and(|filename| pending_filename_matches_derived(evidence.filename, filename));
-        if !recorded_filename_matches {
-            return Ok(PendingRetryAdoption::NotFound);
-        }
-
-        task_planner.prepare_path_parent(local_path).await;
-        for task in planned_tasks.iter().filter(|task| {
-            task.version_size == evidence.version_size
-                && task.checksum.as_ref() == evidence.checksum
-                && task.size == evidence.size
-        }) {
-            let mut recorded_task = task.clone();
-            recorded_task.download_path = local_path.to_path_buf();
-            if let Some(adoption) = adopt_pending_task_path(
-                db,
-                config,
-                asset,
-                task_planner,
-                &recorded_task,
-                Some(recorded_file),
-            )
-            .await
-            {
-                return Ok(adoption.into());
-            }
-        }
-
-        for derived in derive_expected_paths(asset, config)
-            .into_iter()
-            .filter(|derived| {
-                derived.version_size == evidence.version_size
-                    && derived.checksum.as_ref() == evidence.checksum
-                    && derived.size == evidence.size
-                    && pending_filename_matches_derived(evidence.filename, &derived.filename)
-            })
-        {
-            if let Some(adoption) = adopt_pending_derived_path_at(
-                db,
-                config,
-                asset,
-                task_planner,
-                &derived,
-                local_path,
-                Some(recorded_file),
-            )
-            .await
-            {
-                return Ok(adoption.into());
-            }
-        }
-        return Ok(PendingRetryAdoption::NotFound);
-    }
-
-    for task in planned_tasks.iter().filter(|task| {
-        task.version_size == evidence.version_size
-            && task.checksum.as_ref() == evidence.checksum
-            && task.size == evidence.size
-    }) {
-        if let Some(adoption) =
-            adopt_pending_task_path(db, config, asset, task_planner, task, None).await
-        {
-            return Ok(adoption.into());
-        }
-    }
-
-    for derived in derive_expected_paths(asset, config)
-        .into_iter()
-        .filter(|derived| {
-            derived.version_size == evidence.version_size
-                && derived.checksum.as_ref() == evidence.checksum
-                && derived.size == evidence.size
-                && pending_filename_matches_derived(evidence.filename, &derived.filename)
-        })
-    {
-        if let Some(adoption) =
-            adopt_pending_derived_path(db, config, asset, task_planner, &derived, None).await
-        {
-            return Ok(adoption.into());
-        }
-    }
-
-    Ok(PendingRetryAdoption::NotFound)
 }
 
 /// Saved provider generations identify ownership, not hashes of local bytes.

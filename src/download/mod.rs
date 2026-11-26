@@ -41,7 +41,6 @@ pub(crate) use orchestration::generation::recover_deleted_album_selection;
 pub(crate) use orchestration::maintenance::{
     MetadataDrainOutcome, drain_pending_metadata_rewrites,
 };
-use orchestration::models::PENDING_RETRY_UNMATCHED_REASON;
 pub(super) use orchestration::models::PRODUCER_ENUMERATION_INCOMPLETE_REASON;
 pub(crate) use orchestration::models::{
     CheckpointEvidence, DownloadControls, DownloadReporting, DownloadRunMode, DownloadStore,
@@ -55,8 +54,7 @@ pub use orchestration::models::{
 #[cfg(test)]
 pub(crate) use orchestration::reconciliation::reconcile_catalog_paths;
 pub(crate) use orchestration::reconciliation::reconcile_catalog_paths_with_client;
-use orchestration::selection::build_pass_configs_resolving_deferred_excludes;
-use orchestration::url_refresh::{RetryTaskKey, UrlRetrySource};
+use orchestration::url_refresh::RetryTaskKey;
 
 #[expect(
     unused_imports,

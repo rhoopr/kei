@@ -1,4 +1,5 @@
 //! Tests moved from `state::db::tests`, with their original names and assertions.
+use crate::state::{DownloadContextStateStore, MetadataRewriteStore, ReportStateStore};
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;

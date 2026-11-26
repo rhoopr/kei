@@ -1,4 +1,6 @@
 //! Durable smart-folder path configuration transitions through the production cycle.
+use crate::state::ReportStateStore;
+use crate::state::SyncTokenStore;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 

@@ -214,17 +214,4 @@ impl SqliteStateDb {
         })
         .await
     }
-    pub(crate) async fn legacy_child_provenance(
-        &self,
-        library: &str,
-        child: &str,
-        rendition: &str,
-    ) -> Result<Option<LegacyReceiptProvenance>, StateError> {
-        let (library, child, rendition) =
-            (library.to_owned(), child.to_owned(), rendition.to_owned());
-        self.with_conn("legacy_child_provenance", move |conn| {
-            provenance(conn, &library, &child, &rendition)
-        })
-        .await
-    }
 }

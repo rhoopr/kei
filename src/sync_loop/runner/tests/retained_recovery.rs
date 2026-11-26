@@ -1,4 +1,6 @@
 //! A new checkpoint needs current coverage, not a repaired historical receipt.
+use crate::state::SyncTokenStore;
+use crate::state::{DownloadStateStore, MetadataRewriteStore, ReportStateStore};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

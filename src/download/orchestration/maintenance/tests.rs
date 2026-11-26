@@ -1,3 +1,5 @@
+use crate::state::SyncTokenStore;
+use crate::state::{DownloadStateStore, MetadataRewriteStore, ReportStateStore};
 use crate::test_helpers::TracingCapture;
 use std::collections::HashMap;
 use std::path::Path;
@@ -19,7 +21,7 @@ use crate::test_helpers::{MockPhotosFlow, TestAssetRecord};
 use super::super::dispatch::download_photos_with_sync;
 use super::super::models::{
     DownloadControls, DownloadOutcome, DownloadReporting, DownloadRunMode, DownloadStore,
-    FullEnumerationReason, METADATA_CAPTURE_REPAIR_FAILED_REASON, SyncMode,
+    METADATA_CAPTURE_REPAIR_FAILED_REASON, SyncMode,
 };
 use super::super::test_support::{
     PendingLookupSession, album_with_session, changes_zone_response, incremental_photo_records,
@@ -29,7 +31,7 @@ use super::super::test_support::{
 use super::run_metadata_capture_repair;
 
 #[tokio::test]
-async fn incremental_with_metadata_backfill_records_full_enumeration_reason() {
+async fn preview_with_historical_metadata_debt_enumerates_only_selection() {
     let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
     let dir = TempDir::new().expect("temp dir");
     let record = crate::test_helpers::TestAssetRecord::new("BACKFILL_BEFORE_SYNC")
@@ -87,10 +89,9 @@ async fn incremental_with_metadata_backfill_records_full_enumeration_reason() {
     .expect("metadata backfill should fall back to full enumeration");
 
     assert!(result.full_enumeration_ran);
-    assert_eq!(
-        result.stats.full_enumeration_reason,
-        Some(FullEnumerationReason::MetadataBackfill)
-    );
+    assert_eq!(result.stats.full_enumeration_reason, None);
+    assert_eq!(result.stats.downloaded, 0);
+    assert_eq!(result.sync_token, None);
 }
 
 #[tokio::test]

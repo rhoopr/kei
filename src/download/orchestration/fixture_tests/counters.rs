@@ -1,3 +1,4 @@
+use crate::state::ReportStateStore;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -73,6 +74,11 @@ async fn assert_reporting(
     // Feed the production final stats into the same reporting boundary used by sync/watch.
     let dir = h.config.directory.parent().unwrap();
     let report_path = dir.join("sync_report.json");
+    let toml: crate::config::TomlConfig = toml::from_str(&format!(
+        "[download]\ndirectory = {:?}\n",
+        h.config.directory.to_string_lossy()
+    ))
+    .unwrap();
     let config = crate::config::Config::build(
         &crate::config::GlobalArgs {
             config_source: Default::default(),
@@ -81,14 +87,8 @@ async fn assert_reporting(
             data_dir: Some(dir.to_string_lossy().into_owned()),
         },
         &crate::cli::PasswordArgs::default(),
-        crate::cli::SyncArgs {
-            config_overrides: crate::config::SyncConfigOverrides {
-                download_dir: Some(h.config.directory.to_string_lossy().into_owned()),
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-        None,
+        crate::cli::SyncArgs::default(),
+        Some(&toml),
     )
     .unwrap();
     let notifier = Notifier::new(None);

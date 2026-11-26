@@ -612,6 +612,7 @@ pub(super) async fn recover_expired_cycle(
 #[cfg(test)]
 mod tests {
     use crate::auth;
+    use crate::state::SyncTokenStore;
     use crate::sync_loop::session::{
         SyncAuthErrorClass, classify_sync_auth_error, clear_validation_cache_for_reauth,
         is_session_error, prepare_mid_cycle_reauth, reacquire_session_lock_after_idle,

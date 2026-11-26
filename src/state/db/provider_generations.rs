@@ -423,6 +423,63 @@ fn insert_selection_rows(
     Ok(())
 }
 
+pub(super) fn record_prepared_metadata(
+    conn: &mut rusqlite::Connection,
+    pending: super::PendingMetadataRewrite,
+    output: String,
+    output_size: u64,
+) -> Result<Option<super::SelectionMetadataReceipt>, StateError> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let receipt = pending
+        .selection_receipt
+        .as_ref()
+        .ok_or(StateError::ProviderSelectionInvalid)?;
+    let path = super::provider_selection::SelectionPath::from_path(
+        pending
+            .asset
+            .local_path
+            .as_deref()
+            .ok_or(StateError::ProviderSelectionInvalid)?,
+    )
+    .key()?;
+    let current = metadata_receipt(
+        &tx,
+        &receipt.generation,
+        &receipt.pass_key,
+        &receipt.child,
+        pending.asset.version_size.as_str(),
+        &path,
+    )?;
+    if current.asset.local_checksum != pending.asset.local_checksum
+        || current.source_checksum != pending.source_checksum
+        || current.selection_receipt.as_ref().is_none_or(|r| {
+            r.grouping_hash != receipt.grouping_hash
+                || r.metadata_flags != receipt.metadata_flags
+                || r.prepared != receipt.prepared
+                || r.preserved_local != receipt.preserved_local
+        })
+    {
+        return Ok(None);
+    }
+    let root = load_generation(&tx, &receipt.generation)?;
+    let manifest = load_decision(&tx, &root, &receipt.pass_key, &receipt.child)?;
+    let destination = manifest
+        .decision
+        .destinations
+        .iter()
+        .find(|d| {
+            d.version_size == pending.asset.version_size.as_str()
+                && d.path.key().ok().as_deref() == Some(path.as_str())
+        })
+        .ok_or(StateError::ProviderSelectionInvalid)?;
+    let hash = prepared_metadata_hash(&tx, &root, &manifest, destination, &output, output_size)?;
+    tx.execute("UPDATE provider_active_destinations SET prepared_checksum=?6,prepared_size=?7,prepared_hash=?8 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",params![root.id,receipt.pass_key,receipt.child,pending.asset.version_size.as_str(),path,output,i64::try_from(output_size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?,hash])?;
+    let mut prepared = receipt.clone();
+    prepared.prepared = Some((output, output_size));
+    tx.commit()?;
+    Ok(Some(prepared))
+}
+
 impl SqliteStateDb {
     pub(crate) async fn cancelled_selection_layouts(
         &self,
@@ -3342,7 +3399,7 @@ fn first_inventory_identity_matches(
         "SELECT EXISTS(SELECT 1 FROM metadata WHERE key IN (?1,?2))",
         params![
             crate::sync_cycle::sync_token_key(zone),
-            crate::sync_cycle::inventory_reconciliation_key(zone)
+            crate::sync_cycle::indexing_reconciliation_key(zone)
         ],
         |row| row.get(0),
     )?;
@@ -4159,22 +4216,6 @@ fn settle_directory_publications(
     Ok(())
 }
 
-pub(super) fn has_unsettled_directory_publication(
-    conn: &Connection,
-    binding: &super::primary_layout::directory::AlbumDirectoryBinding,
-) -> Result<bool, StateError> {
-    for (operation, _, _) in pending_directory_publications(conn, None)? {
-        let (op, _) = super::primary_layout::directory::load_operation(conn, &operation)?;
-        if op.next.library == binding.library
-            && op.next.container == binding.container
-            && op.next.generation == binding.generation
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 fn directory_publication_source(
     conn: &Connection,
     scope: &str,
@@ -4231,10 +4272,10 @@ fn directory_publication_source(
 /// Exact native publication evidence, not a legacy asset or path row.
 pub(super) fn album_directory_native_sources(
     conn: &Connection,
-    pass_key: Option<&str>,
+    pass_key: &str,
     prefix: &Path,
 ) -> Result<Vec<super::primary_layout::directory::AlbumDirectorySource>, StateError> {
-    let mut statement = conn.prepare("SELECT generation,pass_key,child,version_size,path,local_checksum,source_checksum,embedded_metadata_receipt FROM provider_active_destinations WHERE current_publication=1 AND verified_media=1 AND preserved_local IS NULL AND (?1 IS NULL OR pass_key=?1)")?;
+    let mut statement = conn.prepare("SELECT generation,pass_key,child,version_size,path,local_checksum,source_checksum,embedded_metadata_receipt FROM provider_active_destinations WHERE current_publication=1 AND verified_media=1 AND preserved_local IS NULL AND pass_key=?1")?;
     let rows = statement.query_map([pass_key], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -4302,8 +4343,6 @@ pub(super) fn album_directory_native_sources(
             provider_checksum: destination.checksum.clone(),
             path,
             local_checksum,
-            expected_sidecar: None,
-            created: None,
             native: Some(DirectoryPublicationSource {
                 embedded,
                 generation,
@@ -6495,32 +6534,6 @@ impl SqliteStateDb {
             }
             tx.commit()?;
             Ok(inherited)
-        }).await
-    }
-}
-
-impl SqliteStateDb {
-    pub(crate) async fn record_selection_metadata_prepared(
-        &self,
-        pending: &super::PendingMetadataRewrite,
-        output_checksum: &str,
-        output_size: u64,
-    ) -> Result<Option<super::SelectionMetadataReceipt>, StateError> {
-        let pending = pending.clone();
-        let output = output_checksum.to_owned();
-        self.with_conn_mut("recording prepared selected metadata output",move|conn|{
-            let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let receipt=pending.selection_receipt.as_ref().ok_or(StateError::ProviderSelectionInvalid)?;
-            let path=super::provider_selection::SelectionPath::from_path(pending.asset.local_path.as_deref().ok_or(StateError::ProviderSelectionInvalid)?).key()?;
-            let current=metadata_receipt(&tx,&receipt.generation,&receipt.pass_key,&receipt.child,pending.asset.version_size.as_str(),&path)?;
-            if current.asset.local_checksum!=pending.asset.local_checksum || current.source_checksum!=pending.source_checksum || current.selection_receipt.as_ref().is_none_or(|r|r.grouping_hash!=receipt.grouping_hash || r.metadata_flags!=receipt.metadata_flags || r.prepared!=receipt.prepared || r.preserved_local!=receipt.preserved_local) {return Ok(None)}
-            let root=load_generation(&tx,&receipt.generation)?;
-            let manifest=load_decision(&tx,&root,&receipt.pass_key,&receipt.child)?;
-            let destination=manifest.decision.destinations.iter().find(|d|d.version_size==pending.asset.version_size.as_str() && d.path.key().ok().as_deref()==Some(path.as_str())).ok_or(StateError::ProviderSelectionInvalid)?;
-            let hash=prepared_metadata_hash(&tx,&root,&manifest,destination,&output,output_size)?;
-            tx.execute("UPDATE provider_active_destinations SET prepared_checksum=?6,prepared_size=?7,prepared_hash=?8 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",params![root.id,receipt.pass_key,receipt.child,pending.asset.version_size.as_str(),path,output,i64::try_from(output_size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?,hash])?;
-            let mut prepared=receipt.clone();prepared.prepared=Some((output,output_size));
-            tx.commit()?;Ok(Some(prepared))
         }).await
     }
 }

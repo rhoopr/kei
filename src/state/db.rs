@@ -31,6 +31,8 @@ pub(crate) mod provider_inbox;
 pub(crate) mod provider_selection;
 pub(crate) mod provider_work;
 pub(crate) mod trusted_legacy;
+#[cfg(test)]
+pub(crate) use contracts::AssetVerificationState;
 pub(crate) use legacy_preservation::{LegacyFileEvidence, LegacyPreparationSnapshot};
 pub(crate) mod primary_layout;
 mod reconciliation;
@@ -53,11 +55,10 @@ pub use contracts::{
     SyncTokenStore,
 };
 pub(crate) use contracts::{
-    AssetGroupingRows, AssetVerificationState, CheckpointTransition, DownloadContextStateStore,
-    DownloadedFileRecord, ManifestAssetRow, OwnedTempFile, PendingPublicationRecord,
-    ReconciliationCatalogPath, ReconciliationContent, ReconciliationPathKey,
-    ReconciliationReservation, ReconciliationStateStore, ScopedDbSyncToken,
-    SelectionMetadataReceipt, TempFileOwnershipStore,
+    AssetGroupingRows, CheckpointTransition, DownloadContextStateStore, DownloadedFileRecord,
+    ManifestAssetRow, OwnedTempFile, PendingPublicationRecord, ReconciliationCatalogPath,
+    ReconciliationContent, ReconciliationPathKey, ReconciliationReservation,
+    ReconciliationStateStore, ScopedDbSyncToken, SelectionMetadataReceipt, TempFileOwnershipStore,
 };
 
 #[cfg(test)]

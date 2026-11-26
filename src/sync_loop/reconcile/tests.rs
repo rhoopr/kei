@@ -1,4 +1,5 @@
 use crate::state;
+use crate::state::{DownloadStateStore, ReportStateStore};
 use crate::sync_loop::reconcile::run_bounded_local_drift_probe;
 use crate::sync_loop::should_reconcile_this_cycle;
 

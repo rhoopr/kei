@@ -64,8 +64,9 @@ impl OwnedTempPathKey {
     }
 }
 
-impl SqliteStateDb {
-    pub(crate) async fn claim_temp_file(&self, path: &Path) -> Result<(), StateError> {
+#[async_trait]
+impl TempFileOwnershipStore for SqliteStateDb {
+    async fn claim_temp_file(&self, path: &Path) -> Result<(), StateError> {
         let path_key = OwnedTempPathKey::from_path(path)?.0;
         let claimed_at = Utc::now().timestamp();
         self.with_conn("claim_temp_file", move |conn| {
@@ -80,7 +81,7 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn get_owned_temp_files_before(
+    async fn get_owned_temp_files_before(
         &self,
         claimed_before: i64,
     ) -> Result<Vec<OwnedTempFile>, StateError> {
@@ -111,7 +112,7 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn retire_temp_files(&self, paths: &[PathBuf]) -> Result<u64, StateError> {
+    async fn retire_temp_files(&self, paths: &[PathBuf]) -> Result<u64, StateError> {
         if paths.is_empty() {
             return Ok(0);
         }
@@ -136,24 +137,6 @@ impl SqliteStateDb {
             Ok(retired)
         })
         .await
-    }
-}
-
-#[async_trait]
-impl TempFileOwnershipStore for SqliteStateDb {
-    async fn claim_temp_file(&self, path: &Path) -> Result<(), StateError> {
-        SqliteStateDb::claim_temp_file(self, path).await
-    }
-
-    async fn get_owned_temp_files_before(
-        &self,
-        claimed_before: i64,
-    ) -> Result<Vec<OwnedTempFile>, StateError> {
-        SqliteStateDb::get_owned_temp_files_before(self, claimed_before).await
-    }
-
-    async fn retire_temp_files(&self, paths: &[PathBuf]) -> Result<u64, StateError> {
-        SqliteStateDb::retire_temp_files(self, paths).await
     }
 }
 

@@ -1,7 +1,7 @@
 //! Download controls, outcomes, reporting, and checkpoint reason vocabulary.
 
 use crate::download::pipeline::StreamingResult;
-use crate::download::{filter, recap};
+use crate::download::recap;
 use crate::icloud::photos::ProviderRecordId;
 use crate::icloud::photos::asset::MALFORMED_REQUIRED_ASSET_FIELDS_REASON;
 use crate::icloud::photos::error::ReplayRefusal;
@@ -68,6 +68,10 @@ impl<T> DownloadStore for T where
 pub enum FullEnumerationReason {
     NoStoredToken,
     MetadataBackfill,
+    #[allow(
+        dead_code,
+        reason = "serialized public reason retained for report compatibility"
+    )]
     AlbumRelationHydrationIncomplete,
     EnumConfigHashDrift,
     DownloadConfigHashDrift,
@@ -174,11 +178,6 @@ impl DownloadControls {
 /// Result of a sync cycle, including the optional new syncToken.
 #[derive(Debug)]
 pub struct SyncResult {
-    /// Exact transfer targets already handled by this cycle's bounded retry.
-    /// This is transient scheduling evidence, never checkpoint permission.
-    pub(crate) retry_exclusions: rustc_hash::FxHashSet<crate::download::retry::PendingRetryTarget>,
-    /// Exact running snapshots, completed only with guarded inventory retirement.
-    pub(crate) deferred_album_snapshots: Vec<(String, String, i64)>,
     /// The outcome of the download pass (success, session expired, partial failure).
     pub outcome: DownloadOutcome,
     /// The new zone-level syncToken, if one was captured during this sync.
@@ -215,7 +214,6 @@ pub(crate) struct CheckpointEvidence {
     pub(crate) scanned_generation: Option<(super::config::InventoryScope, String)>,
     pub(crate) selection_inventory:
         Option<crate::state::db::provider_generations::SelectionInventory>,
-    pub(crate) inventory_reconciliation_complete: bool,
     /// Every fresh ordered path-selection query
     /// reached proven EOF with usable unanimous tokens, but the selected work
     /// excluded a tail. This certifies local work only, never a source cursor.
@@ -336,8 +334,6 @@ impl SyncResult {
     ) -> Self {
         let checkpoint = CheckpointEvidence::from_execution_stats(&stats);
         Self {
-            deferred_album_snapshots: Vec::new(),
-            retry_exclusions: Default::default(),
             outcome,
             sync_token,
             stats,
@@ -350,29 +346,12 @@ impl SyncResult {
     /// Compose evidence and reports in one zone. The caller retains ownership
     /// of outcome precedence and source-token selection.
     pub(crate) fn accumulate(&mut self, other: &Self) {
-        self.retry_exclusions
-            .extend(other.retry_exclusions.iter().cloned());
         self.stats.accumulate_report_counters(&other.stats);
         self.checkpoint.accumulate(&other.checkpoint);
         self.checkpoint.project(&mut self.stats);
         self.full_enumeration_ran |= other.full_enumeration_ran;
-        self.deferred_album_snapshots
-            .extend(other.deferred_album_snapshots.iter().cloned());
         // Inventory belongs only to the original query invocation. Do not
         // import a later smart refresh, targeted retry, or bridge measurement.
-    }
-
-    #[must_use]
-    pub(in crate::download) fn with_retry_exclusions(
-        mut self,
-        tasks: &[crate::download::filter::DownloadTask],
-    ) -> Self {
-        self.retry_exclusions.extend(
-            tasks
-                .iter()
-                .map(crate::download::retry::PendingRetryTarget::from_task),
-        );
-        self
     }
 
     pub(crate) fn block_for_metadata_capture(&mut self) {
@@ -393,11 +372,6 @@ impl SyncResult {
         self.checkpoint.bounded_path_selection_complete = false;
         self.checkpoint.sync_token_blocked = true;
         block_sync_token_for_incremental_delta(&mut self.stats, reason);
-    }
-
-    pub(super) fn clear_full_query_token_block(&mut self) {
-        self.checkpoint.sync_token_blocked = false;
-        clear_full_query_token_block_stats(&mut self.stats);
     }
 }
 
@@ -918,16 +892,6 @@ impl SkipBreakdown {
         self.retry_exhausted += other.retry_exhausted;
         self.retry_only += other.retry_only;
     }
-
-    pub(crate) fn record_filter_reason(&mut self, reason: filter::FilterReason) {
-        match reason {
-            filter::FilterReason::MalformedAsset => self.by_filename += 1,
-            filter::FilterReason::ExcludedAlbum => self.by_excluded_album += 1,
-            filter::FilterReason::MediaType => self.by_media_type += 1,
-            filter::FilterReason::LivePhoto => self.by_live_photo += 1,
-            filter::FilterReason::DateRange => self.by_date_range += 1,
-        }
-    }
 }
 
 pub(super) fn merge_download_outcomes(
@@ -1046,12 +1010,6 @@ pub(super) fn merge_token_recovery_result(combined: &mut StreamingResult, result
     combined.enumeration_complete = combined.enumeration_complete && result.enumeration_complete;
 }
 
-pub(super) fn set_full_enumeration_reason(result: &mut SyncResult, reason: FullEnumerationReason) {
-    if result.full_enumeration_ran && result.stats.full_enumeration_reason.is_none() {
-        result.stats.full_enumeration_reason = Some(reason);
-    }
-}
-
 pub(crate) fn block_sync_token_for_metadata_capture(stats: &mut SyncStats) {
     stats.identity_incomplete = true;
     block_sync_token_for_incremental_delta(stats, METADATA_CAPTURE_REPAIR_FAILED_REASON);
@@ -1069,20 +1027,6 @@ pub(super) fn block_sync_token_for_incremental_delta(stats: &mut SyncStats, reas
         stats.sync_token_blocked_explanation = Some(sync_token_blocked_explanation(reason));
     }
     stats.sync_token_blocked = true;
-}
-
-pub(super) fn clear_full_query_token_block_stats(stats: &mut SyncStats) {
-    stats.sync_token_blocked = false;
-    stats.sync_token_blocked_reason = None;
-    stats.sync_token_blocked_source = None;
-    stats.sync_token_blocked_explanation = None;
-    stats.sync_token_blocked_zone = None;
-    stats.sync_token_expected_receivers = None;
-    stats.sync_token_receivers_with_token = None;
-    stats.sync_token_receivers_missing = None;
-    stats.sync_token_receivers_blank = None;
-    stats.sync_token_receivers_dropped = None;
-    stats.sync_token_unique_values = None;
 }
 
 #[cfg(test)]

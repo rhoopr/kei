@@ -7,7 +7,7 @@ use super::error::StateError;
 /// Current application-data schema version. Increment when changing its shape.
 /// The preflight account-owner header has an independent format version and
 /// is validated before this schema can be read or migrated.
-pub(crate) const SCHEMA_VERSION: i32 = 49;
+pub(crate) const SCHEMA_VERSION: i32 = 50;
 const FRESH_START_VERSION: i32 = 38;
 const RETIRED_INBOX: [&str; 3] = [
     "provider_shadow_receipts",
@@ -768,12 +768,6 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), StateError> {
         }
         return result;
     }
-    migrate_steps(conn)
-}
-
-/// Exercise historical migration behavior independently of fresh-start retirement.
-#[cfg(test)]
-pub(crate) fn migrate_historical_fixture(conn: &Connection) -> Result<(), StateError> {
     migrate_steps(conn)
 }
 
@@ -1632,6 +1626,14 @@ pub(crate) fn migrate_to_version(
                 )?;
             }
         }
+        // Carry surviving count-era obligations into the full inventory owner.
+        // Existing indexing holds and retained provider cursors take precedence.
+        50 => conn.execute_batch(
+            "INSERT OR IGNORE INTO metadata(key,value)
+             SELECT 'indexing_reconciliation_required:' || substr(key,length('inventory_reconciliation_required:')+1),'1'
+             FROM metadata WHERE key GLOB 'inventory_reconciliation_required:*';
+             DELETE FROM metadata WHERE key GLOB 'inventory_reconciliation_required:*';",
+        )?,
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -1656,6 +1658,7 @@ pub(crate) fn migrate_genuine_v28(conn: &Connection) -> Result<(), StateError> {
 
 #[cfg(test)]
 mod tests {
+    use crate::state::SyncTokenStore;
     use crate::test_helpers::assert_no_retired_inbox_archive;
 
     #[test]
@@ -2866,6 +2869,71 @@ mod tests {
         migrate(&conn).unwrap();
         assert_retired_checkpoint(&conn, "sync_token:PrimarySync", "old");
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn count_era_upgrade_preserves_cursors_and_transfers_only_outstanding_requests() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("schema49.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for version in 1..=49 {
+                migrate_to_version(&conn, 0, version).unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO metadata(key,value) VALUES
+                 ('inventory_reconciliation_required:PrimarySync','opaque'),
+                 ('inventory_reconciliation_required:Shared','other'),
+                 ('indexing_reconciliation_required:Shared','existing'),
+                 ('recent_selection_recovery:Finished',X'00FF'),
+                 ('sync_token:PrimarySync','retained');
+                 CREATE TRIGGER refuse_retirement BEFORE DELETE ON metadata
+                 WHEN OLD.key='inventory_reconciliation_required:PrimarySync'
+                 BEGIN SELECT RAISE(ABORT,'fault'); END;",
+            )
+            .unwrap();
+            assert!(migrate(&conn).is_err());
+            assert_eq!(get_schema_version(&conn).unwrap(), 49);
+            assert_eq!(conn.query_row::<i64, _, _>(
+                "SELECT COUNT(*) FROM metadata WHERE key='indexing_reconciliation_required:PrimarySync'", [], |r| r.get(0)
+            ).unwrap(), 0);
+        }
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TRIGGER refuse_retirement")
+            .unwrap();
+        migrate(&conn).unwrap();
+        let entries = || {
+            conn.prepare("SELECT key, hex(value) FROM metadata ORDER BY key")
+                .unwrap()
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let upgraded = entries();
+        assert!(upgraded.contains(&(
+            "indexing_reconciliation_required:PrimarySync".into(),
+            "31".into()
+        )));
+        assert!(upgraded.contains(&(
+            "indexing_reconciliation_required:Shared".into(),
+            "6578697374696E67".into()
+        )));
+        assert!(upgraded.contains(&("recent_selection_recovery:Finished".into(), "00FF".into())));
+        assert!(upgraded.contains(&("sync_token:PrimarySync".into(), "72657461696E6564".into())));
+        assert!(
+            !upgraded
+                .iter()
+                .any(|(k, _)| k.starts_with("inventory_reconciliation_required:")
+                    || k == "indexing_reconciliation_required:Finished")
+        );
+        conn.execute_batch(
+            "DELETE FROM metadata WHERE key='indexing_reconciliation_required:PrimarySync'",
+        )
+        .unwrap();
+        let completed = entries();
+        migrate(&conn).unwrap();
+        assert_eq!(entries(), completed);
     }
 
     #[test]

@@ -88,25 +88,6 @@ pub(crate) async fn drain_pending_metadata_rewrites(
     }
 }
 
-pub(super) async fn has_metadata_backfill_work(config: &DownloadConfig) -> bool {
-    let Some(db) = &config.state_db else {
-        return false;
-    };
-    match db
-        .has_downloaded_without_metadata_hash(&config.library)
-        .await
-    {
-        Ok(needs_backfill) => needs_backfill,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "Failed to check metadata backfill state before incremental sync"
-            );
-            false
-        }
-    }
-}
-
 const METADATA_CAPTURE_BATCH: usize = 500;
 
 impl DownloadConfig {

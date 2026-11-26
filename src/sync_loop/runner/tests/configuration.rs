@@ -1,3 +1,5 @@
+use crate::state::SyncTokenStore;
+use crate::state::{DownloadStateStore, ReportStateStore};
 use std::sync::{Arc, Mutex};
 
 use tokio_util::sync::CancellationToken;
@@ -2830,14 +2832,14 @@ async fn inventory_coverage_survives_failed_cursor_commit_and_quiet_reopen() {
             )
             .await
             .unwrap();
-            db.set_metadata("inventory_reconciliation_required:PrimarySync", "1")
+            db.set_metadata("indexing_reconciliation_required:PrimarySync", "1")
                 .await
                 .unwrap();
         }
         let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
-        for cycle in 0..3 {
+        for cycle in 0..4 {
             let db = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
-            if cycle == 0 {
+            if cycle == 1 {
                 db.acquire_lock("recent bridge cursor commit fault")
                     .unwrap()
                     .execute_batch(
@@ -2884,10 +2886,16 @@ async fn inventory_coverage_survives_failed_cursor_commit_and_quiet_reopen() {
             )
             .await;
             if cycle == 0 {
+                let qualified = result.unwrap();
+                assert!(!qualified.db_sync_token_advance_safe);
+                assert!(queries.load(Ordering::SeqCst) > 0);
                 assert!(
-                    queries.load(Ordering::SeqCst) > 0,
-                    "fault case must reach current inventory: {result:#?}"
+                    db.get_metadata("indexing_replay_required:PrimarySync")
+                        .await
+                        .unwrap()
+                        .is_some()
                 );
+            } else if cycle == 1 {
                 assert!(
                     result.is_err()
                         || result
@@ -2912,13 +2920,11 @@ async fn inventory_coverage_survives_failed_cursor_commit_and_quiet_reopen() {
                     .unwrap()
                     .unwrap();
                 assert_eq!(raw, "unparsed completed receipt");
-                assert_eq!(
-                    db.get_metadata("inventory_reconciliation_required:PrimarySync")
+                assert!(
+                    db.get_metadata("indexing_replay_required:PrimarySync")
                         .await
                         .unwrap()
-                        .is_some(),
-                    drift,
-                    "a staged configuration must activate before consuming its inventory request"
+                        .is_some()
                 );
             } else {
                 let result = result.unwrap();
@@ -2937,14 +2943,7 @@ async fn inventory_coverage_survives_failed_cursor_commit_and_quiet_reopen() {
                         .as_deref(),
                     Some(download::compute_config_hash(&config).as_str())
                 );
-                if cycle == 1 {
-                    assert_eq!(
-                        queries.load(Ordering::SeqCst) > 0,
-                        drift,
-                        "only unactivated configuration repeats its guarded inventory"
-                    );
-                }
-                if cycle == 2 {
+                if cycle == 3 {
                     assert_eq!(
                         queries.load(Ordering::SeqCst),
                         0,

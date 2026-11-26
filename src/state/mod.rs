@@ -11,6 +11,8 @@ pub mod db;
 pub mod error;
 pub mod schema;
 pub mod types;
+#[cfg(test)]
+pub(crate) use db::AssetVerificationState;
 pub(crate) use db::{
     SparseAttemptOutcome, SparseDeletionCheckpoint, SparseEvidence, SparseIdentity,
     SparseIdentityProof, SparseIdentityStore, SparseSourceId,
@@ -19,10 +21,10 @@ pub(crate) use db::{
 #[cfg(test)]
 pub use db::ImportedRecord;
 pub(crate) use db::{
-    AssetVerificationState, CheckpointTransition, DownloadContextStateStore, DownloadedFileRecord,
-    LegacyFileEvidence, OwnedTempFile, PendingPublicationRecord, ReconciliationCatalogPath,
-    ReconciliationContent, ReconciliationPathKey, ReconciliationReservation,
-    ReconciliationStateStore, ScopedDbSyncToken, TempFileOwnershipStore,
+    CheckpointTransition, DownloadContextStateStore, DownloadedFileRecord, LegacyFileEvidence,
+    OwnedTempFile, PendingPublicationRecord, ReconciliationCatalogPath, ReconciliationContent,
+    ReconciliationPathKey, ReconciliationReservation, ReconciliationStateStore, ScopedDbSyncToken,
+    TempFileOwnershipStore,
 };
 pub use db::{
     DownloadStateStore, ImportStateStore, MembershipStore, MetadataRewriteStore, ReportStateStore,

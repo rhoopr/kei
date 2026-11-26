@@ -1,5 +1,6 @@
 //! Count-independent generation histories retained from the former recent owner.
 
+use crate::state::SyncTokenStore;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -415,7 +416,6 @@ async fn private_master_metadata_and_relationship_only_invalidation_reseeds_curr
             .sync_token
             .expect("complete current coverage preserves source checkpoint gate");
         db.commit_checkpoint_transition(crate::state::CheckpointTransition {
-            album_snapshots: Vec::new(),
             expected_metadata: Vec::new(),
             sparse_identity_proofs: Vec::new(),
             metadata_updates: vec![("sync_token:PrimarySync".into(), successor)],
@@ -573,7 +573,6 @@ async fn private_filter_expansion_reopens_retained_coverage_and_converges_withou
             "retain the existing full-query and incremental source checkpoint owners"
         );
         db.commit_checkpoint_transition(crate::state::CheckpointTransition {
-            album_snapshots: Vec::new(),
             expected_metadata: Vec::new(),
             sparse_identity_proofs: Vec::new(),
             metadata_updates: vec![("sync_token:PrimarySync".into(), successor)],

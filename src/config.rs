@@ -37,9 +37,9 @@ pub(crate) use persistence::persist_first_run_config;
     reason = "preserve existing config facade paths and visibility"
 )]
 pub(crate) use resolve::{
-    PathDerivationCliArgs, PathDerivationFields, SyncConfigOverrides, resolve_account,
-    resolve_auth, resolve_library_selector, resolve_media_selection, resolve_notify_systemd,
-    resolve_path_derivation_fields, smart_retry_delay, unfiled_default,
+    PathDerivationFields, resolve_account, resolve_auth, resolve_library_selector,
+    resolve_media_selection, resolve_notify_systemd, resolve_path_derivation_fields,
+    smart_retry_delay, unfiled_default,
 };
 #[expect(
     unused_imports,

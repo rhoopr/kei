@@ -4,6 +4,7 @@ use super::{RetryTaskKey, UrlRetrySource, refresh_failed_download_urls};
 use crate::commands::{AlbumPass, PassKind};
 use crate::icloud::photos::{PhotosService, PhotosSession, classify_legacy_inventory_error};
 use crate::retry::RetryConfig;
+use crate::state::SyncTokenStore;
 use crate::state::{SqliteStateDb, VersionSizeKey};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::{Value, json};

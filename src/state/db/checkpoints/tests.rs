@@ -1,80 +1,8 @@
 //! Tests moved from `state::db::tests`, with their original names and assertions.
+use crate::state::ReportStateStore;
+use crate::state::SyncTokenStore;
 use crate::state::db::{CheckpointTransition, ScopedDbSyncToken, SqliteStateDb};
 use crate::state::error::StateError;
-
-#[tokio::test]
-async fn guarded_inventory_retirement_rejects_a_newer_album_snapshot_atomically() {
-    let db = SqliteStateDb::open_in_memory().unwrap();
-    let key = "inventory_reconciliation_required:PrimarySync";
-    db.set_metadata(key, "1").await.unwrap();
-    db.upsert_album_container("PrimarySync", "trip", "Trip", "icloud")
-        .await
-        .unwrap();
-    let saved = db
-        .start_album_membership_snapshot("PrimarySync", "trip", None)
-        .await
-        .unwrap();
-    db.add_album_membership_to_snapshot(
-        "PrimarySync",
-        "trip",
-        saved,
-        "retained",
-        Some("retained"),
-        "icloud",
-    )
-    .await
-    .unwrap();
-    db.complete_album_membership_snapshot("PrimarySync", "trip", saved)
-        .await
-        .unwrap();
-    let stale = db
-        .start_album_membership_snapshot("PrimarySync", "trip", None)
-        .await
-        .unwrap();
-    let latest = db
-        .start_album_membership_snapshot("PrimarySync", "trip", None)
-        .await
-        .unwrap();
-    let retirement = |generation| CheckpointTransition {
-        album_snapshots: vec![("PrimarySync".into(), "trip".into(), generation)],
-        expected_metadata: vec![(key.into(), Some("1".into()))],
-        sparse_identity_proofs: Vec::new(),
-        metadata_updates: Vec::new(),
-        metadata_deletes: vec![key.into()],
-    };
-    assert!(
-        db.commit_checkpoint_transition(retirement(stale))
-            .await
-            .is_err()
-    );
-    assert_eq!(db.get_metadata(key).await.unwrap().as_deref(), Some("1"));
-    assert_eq!(
-        db.acquire_lock("retained membership")
-            .unwrap()
-            .query_row::<i64, _, _>(
-                "SELECT is_deleted FROM asset_album_memberships WHERE asset_record_name='retained'",
-                [],
-                |row| row.get(0)
-            )
-            .unwrap(),
-        0
-    );
-    db.commit_checkpoint_transition(retirement(latest))
-        .await
-        .unwrap();
-    assert!(db.get_metadata(key).await.unwrap().is_none());
-    assert_eq!(
-        db.acquire_lock("qualified membership")
-            .unwrap()
-            .query_row::<i64, _, _>(
-                "SELECT is_deleted FROM asset_album_memberships WHERE asset_record_name='retained'",
-                [],
-                |row| row.get(0)
-            )
-            .unwrap(),
-        1
-    );
-}
 
 // ── enum_in_progress markers ───────────────────────────────────────────
 
@@ -216,7 +144,6 @@ async fn checkpoint_transition_is_atomic() {
 
     let result = db
         .commit_checkpoint_transition(CheckpointTransition {
-            album_snapshots: Vec::new(),
             expected_metadata: Vec::new(),
             sparse_identity_proofs: Vec::new(),
             metadata_updates: vec![
@@ -387,7 +314,6 @@ async fn retained_checkpoint_metadata_fence_rolls_back_stale_plans() {
             .unwrap();
         let result = db
             .commit_checkpoint_transition(CheckpointTransition {
-                album_snapshots: Vec::new(),
                 expected_metadata: vec![("sync_token:zone".into(), Some("planned-cursor".into()))],
                 sparse_identity_proofs: Vec::new(),
                 metadata_updates: vec![

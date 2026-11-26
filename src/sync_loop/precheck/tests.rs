@@ -1,3 +1,5 @@
+use crate::state::SyncTokenStore;
+use crate::state::{DownloadStateStore, MetadataRewriteStore};
 use std::sync::Arc;
 
 use crate::sync_cycle::LibraryState;
@@ -789,54 +791,9 @@ async fn check_changes_database_unselected_zone_token_persist_failure_still_skip
 }
 
 #[tokio::test]
-async fn pending_inventory_request_wakes_only_its_selected_zone_on_unchanged_precheck() {
-    let db = make_state_db();
-    db.set_metadata(
-        "recent_selection_recovery:PrimarySync",
-        "malformed legacy recovery receipt",
-    )
-    .await
-    .unwrap();
-    db.set_metadata(
-        &crate::sync_cycle::inventory_reconciliation_key("PrimarySync"),
-        "1",
-    )
-    .await
-    .unwrap();
-    let selected = make_run_cycle_library_state("PrimarySync", "sync_token:PrimarySync", "prior");
-    let other = make_run_cycle_library_state(
-        "SharedSync-OTHER",
-        "sync_token:SharedSync-OTHER",
-        "other-prior",
-    );
-    let directory = tempfile::tempdir().unwrap();
-    let builder = crate::sync_loop::test_support::make_run_cycle_download_config_builder(
-        directory.path(),
-        db.clone(),
-    );
-    let mut precheck = WatchPrecheck::SkipAll;
-    super::include_pending_provider_work(
-        &mut precheck,
-        &[selected, other],
-        &builder,
-        download::DownloadControls::download_hidden(),
-    )
-    .await;
-    assert!(precheck.should_sync_zone("PrimarySync"));
-    assert!(!precheck.should_sync_zone("SharedSync-OTHER"));
-    assert!(precheck.db_sync_token_after_success().is_none());
-    assert_eq!(
-        db.get_metadata("recent_selection_recovery:PrimarySync")
-            .await
-            .unwrap()
-            .as_deref(),
-        Some("malformed legacy recovery receipt")
-    );
-}
-
-#[tokio::test]
 async fn indexing_qualified_replay_bypasses_quiet_database_shortcut_across_reopen() {
     for replay_key in [
+        crate::sync_cycle::indexing_reconciliation_key("PrimarySync"),
         crate::sync_cycle::indexing_replay_key("PrimarySync"),
         crate::sync_cycle::indexing_materialization_key("PrimarySync"),
     ] {

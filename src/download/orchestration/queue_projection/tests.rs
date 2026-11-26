@@ -1,5 +1,7 @@
 #![cfg(test)]
 
+use crate::state::SyncTokenStore;
+use crate::state::{DownloadStateStore, MetadataRewriteStore};
 mod current_debt;
 #[cfg(all(target_os = "linux", feature = "xmp"))]
 mod sidecar_bench;

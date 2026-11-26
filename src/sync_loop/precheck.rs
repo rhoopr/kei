@@ -216,17 +216,6 @@ pub(super) async fn include_pending_provider_work(
                         .any(|binding| binding.container_id == *container)
                 }));
             }
-            if !library.plan.passes.is_empty()
-                && let Some(db) = &config.state_db
-                && db
-                    .get_metadata(&crate::sync_cycle::inventory_reconciliation_key(
-                        &library.zone_name,
-                    ))
-                    .await?
-                    .is_some()
-            {
-                return Ok(true);
-            }
             Ok::<_, anyhow::Error>(
                 download::has_due_selection_work(&library.plan.passes, &config, controls)
                     .await?

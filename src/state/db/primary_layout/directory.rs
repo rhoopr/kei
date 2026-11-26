@@ -8,7 +8,6 @@ use sha2::{Digest, Sha256};
 
 use super::{LayoutBinding, LayoutFingerprint, decode, encode, invalid, path_key};
 use crate::fs_util::FileIdentity;
-use crate::state::db::rows::decode_asset_date;
 use crate::state::db::{SqliteStateDb, account, provider_selection::SelectionPath};
 use crate::state::error::StateError;
 
@@ -149,42 +148,21 @@ pub(crate) struct AlbumDirectorySource {
     pub(crate) provider_checksum: String,
     pub(crate) path: SelectionPath,
     pub(crate) local_checksum: String,
-    pub(crate) expected_sidecar: Option<Option<LayoutFingerprint>>,
-    pub(crate) created: Option<chrono::DateTime<chrono::FixedOffset>>,
 }
 
 fn sources(
     conn: &Connection,
     binding: &AlbumDirectoryBinding,
-    selected_root: Option<&SelectionPath>,
+    root: &SelectionPath,
 ) -> Result<Vec<AlbumDirectorySource>, StateError> {
-    if selected_root.is_none()
-        && let Some(extra) = &binding.additional_projection
-    {
-        let mut anchor = binding.clone();
-        anchor.additional_projection = None;
-        let mut result = std::collections::BTreeMap::new();
-        for source in sources(conn, &anchor, None)? {
-            result.insert(path_key(&source.path.to_path())?, source);
-        }
-        for source in sources(conn, &anchor, Some(&extra.root))? {
-            if !source.path.to_path().starts_with(binding.path.to_path()) {
-                result.insert(path_key(&source.path.to_path())?, source);
-            }
-        }
-        return Ok(result.into_values().collect());
-    }
-    let prefix = selected_root.unwrap_or(&binding.path).to_path();
-    let exact = selected_root.is_some() || binding.projection.is_some();
+    let prefix = root.to_path();
     let mut result = std::collections::BTreeMap::new();
     for source in super::super::provider_generations::album_directory_native_sources(
         conn,
-        exact.then_some(binding.pass.as_str()),
+        &binding.pass,
         &prefix,
     )? {
-        if (binding.unclaimed || exact)
-            && !container_member(conn, binding, &source.library, &source.child)?
-        {
+        if !container_member(conn, binding, &source.library, &source.child)? {
             continue;
         }
         result.insert(path_key(&source.path.to_path())?, source);
@@ -192,25 +170,8 @@ fn sources(
     let mut statement = conn.prepare("SELECT binding FROM primary_layout_bindings")?;
     for row in statement.query_map([], |row| row.get::<_, Vec<u8>>(0))? {
         let layout: LayoutBinding = decode(&row?)?;
-        if (binding.unclaimed || exact)
-            && !container_member(conn, binding, &layout.library, &layout.child)?
-        {
+        if !container_member(conn, binding, &layout.library, &layout.child)? {
             continue;
-        }
-        if !binding.unclaimed
-            && !exact
-            && layout
-                .files
-                .iter()
-                .any(|file| file.path.to_path().starts_with(&prefix))
-            && layout
-                .files
-                .iter()
-                .any(|file| !file.path.to_path().starts_with(&prefix))
-        {
-            return Err(invalid(
-                "managed family crosses the album directory boundary",
-            ));
         }
         for file in layout.files {
             if !file.path.to_path().starts_with(&prefix) {
@@ -229,10 +190,8 @@ fn sources(
                 provider_checksum: file.provider_checksum,
                 path: file.path,
                 local_checksum: data_encoding::HEXLOWER.encode(&file.fingerprint.sha256),
-                expected_sidecar: Some(file.sidecar),
-                created: None,
             };
-            if exact && !selected_source(conn, binding, &source)? {
+            if !selected_source(conn, binding, &source)? {
                 continue;
             }
             if let Some(old) = result.get(&key)
@@ -248,25 +207,9 @@ fn sources(
         }
     }
     let mut selected = Vec::with_capacity(result.len());
-    for mut source in result.into_values() {
-        if exact {
-            if !selected_source(conn, binding, &source)? {
-                continue;
-            }
-            source.created = conn
-                .query_row(
-                    "SELECT created_at,timezone_offset FROM assets WHERE library=?1 AND id=?2 AND version_size=?3",
-                    params![source.library, source.child, source.version],
-                    |row| {
-                        let date = decode_asset_date(row.get(0)?, 0)?;
-                        Ok(crate::state::AssetMetadata {
-                            timezone_offset: row.get(1)?,
-                            ..Default::default()
-                        }
-                        .capture_local(date))
-                    },
-                )
-                .optional()?;
+    for source in result.into_values() {
+        if !selected_source(conn, binding, &source)? {
+            continue;
         }
         selected.push(source);
     }
@@ -296,80 +239,6 @@ fn other_selected_owner(
     file: &AlbumDirectoryFile,
 ) -> Result<bool, StateError> {
     Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE path=?1 AND pass_key<>?2 AND admitted=1)",params![file.old.key()?,op.old.pass],|row|row.get(0))?)
-}
-
-fn require_quiet(conn: &Connection, binding: &AlbumDirectoryBinding) -> Result<(), StateError> {
-    let owned: std::collections::HashSet<_> =
-        if binding.unclaimed || binding.additional_projection.is_some() {
-            sources(conn, binding, None)?
-                .into_iter()
-                .map(|source| source.path.to_path())
-                .collect()
-        } else {
-            Default::default()
-        };
-    let touches = |path: &std::path::Path| {
-        if binding.unclaimed {
-            owned.contains(path)
-        } else {
-            path.starts_with(binding.path.to_path()) || owned.contains(path)
-        }
-    };
-    let mut pending = conn.prepare("SELECT operation,header FROM primary_layout_operations WHERE phase NOT IN ('committed','cancelled') AND policy<>?1")?;
-    for row in pending.query_map([POLICY], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-    })? {
-        let (operation, header) = row?;
-        let header: super::LayoutOperation = decode(&header)?;
-        if header.pass == binding.pass {
-            return Err(invalid("finish pending album layout before renaming"));
-        }
-        let mut claims =
-            conn.prepare("SELECT native_path FROM primary_layout_claims WHERE operation=?1")?;
-        for claim in claims.query_map([operation], |row| row.get::<_, Vec<u8>>(0))? {
-            let path: SelectionPath = decode(&claim?)?;
-            if touches(&path.to_path()) {
-                return Err(invalid("finish overlapping layout before renaming"));
-            }
-        }
-    }
-    let prefix = binding.path.to_path();
-    let mut owners =
-        conn.prepare("SELECT pass_key,path FROM provider_active_destinations WHERE admitted=1")?;
-    for row in owners.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })? {
-        let (pass, path) = row?;
-        let path: SelectionPath = serde_json::from_str(&path)
-            .map_err(|_error| invalid("invalid album ownership path"))?;
-        if !binding.unclaimed && path.to_path().starts_with(&prefix) && pass != binding.pass {
-            return Err(invalid("another selected pass shares the album directory"));
-        }
-    }
-    drop(owners);
-    // Dormant metadata retry markers are copied unchanged to the successor
-    // receipt below. Actual selected writer obligations must be complete.
-    let mut statement = conn.prepare(
-        "SELECT a.local_path FROM assets a WHERE a.local_path IS NOT NULL AND a.status<>'downloaded' AND NOT EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.library=a.library AND w.asset_id=a.id AND w.version_size=a.version_size AND w.checksum=a.checksum AND w.compat_path=a.local_path AND w.admitted=1 AND w.preserved_local IS NOT NULL)",
-    )?;
-    for row in statement.query_map([], |row| row.get::<_, String>(0))? {
-        if touches(std::path::Path::new(&row?)) {
-            return Err(invalid(
-                "finish pending album file work before renaming its directory",
-            ));
-        }
-    }
-    let mut statement = conn.prepare("SELECT w.path FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.admitted=1 AND ((w.verified_media=0 AND w.preserved_local IS NULL) OR (g.metadata_enabled=1 AND w.verified_metadata=0))")?;
-    for row in statement.query_map([], |row| row.get::<_, String>(0))? {
-        let path: SelectionPath =
-            serde_json::from_str(&row?).map_err(|_error| invalid("invalid selected album path"))?;
-        if touches(&path.to_path()) {
-            return Err(invalid(
-                "finish selected album work before renaming its directory",
-            ));
-        }
-    }
-    Ok(())
 }
 
 pub(crate) fn same_container(left: &Value, right: &Value) -> bool {
@@ -620,60 +489,6 @@ fn path_available(conn: &Connection, path: &SelectionPath) -> Result<bool, State
 }
 
 impl SqliteStateDb {
-    pub(crate) async fn remember_album_additional_projection(
-        &self,
-        owner: account::AccountOwner,
-        mut binding: AlbumDirectoryBinding,
-        root: SelectionPath,
-        template: String,
-    ) -> Result<AlbumDirectoryBinding, StateError> {
-        self.with_conn_mut("remember_album_additional_projection", move |conn| {
-            account::validate_authenticated(conn, &owner)?;
-            let before = encode(&binding)?;
-            let extra = binding.additional_projection.get_or_insert_with(|| AlbumAdditionalProjection {
-                root: root.clone(), templates: Vec::new(),
-            });
-            if extra.root != root { return Err(invalid("album projection root changed")); }
-            if !extra.templates.contains(&template) { extra.templates.push(template); }
-            validate_binding(&binding)?;
-            let after = encode(&binding)?;
-            if after != before {
-                let changed = conn.execute("UPDATE album_containers SET directory_binding=?4 WHERE library=?1 AND container_id=?2 AND directory_binding=?3", params![binding.library,binding.container,before,after])?;
-                if changed != 1 { return Err(invalid("album projection changed during planning")); }
-            }
-            Ok(binding)
-        }).await
-    }
-    pub(crate) async fn remember_album_projection(
-        &self,
-        owner: account::AccountOwner,
-        mut binding: AlbumDirectoryBinding,
-        template: String,
-    ) -> Result<AlbumDirectoryBinding, StateError> {
-        self.with_conn_mut("remember_album_projection", move |conn| {
-            account::validate_authenticated(conn, &owner)?;
-            let before = encode(&binding)?;
-            let templates = binding.projection.as_mut().ok_or_else(|| invalid("missing album projection"))?;
-            if !templates.contains(&template) {
-                templates.push(template);
-                let changed = conn.execute("UPDATE album_containers SET directory_binding=?4 WHERE library=?1 AND container_id=?2 AND directory_binding=?3", params![binding.library,binding.container,before,encode(&binding)?])?;
-                if changed != 1 { return Err(invalid("album projection changed during planning")); }
-            }
-            Ok(binding)
-        }).await
-    }
-
-    pub(crate) async fn album_projection_routes(
-        &self,
-        owner: account::AccountOwner,
-        binding: AlbumDirectoryBinding,
-    ) -> Result<Vec<AlbumDirectoryRoute>, StateError> {
-        self.with_conn("album_projection_routes", move |conn| {
-            account::validate_authenticated(conn, &owner)?;
-            Ok(projection_operation(conn, &binding)?.map_or_else(Vec::new, |op| op.directories))
-        })
-        .await
-    }
     pub(crate) async fn album_projection_files(
         &self,
         owner: account::AccountOwner,
@@ -687,7 +502,7 @@ impl SqliteStateDb {
                 let mut members = conn.prepare("SELECT evidence FROM primary_layout_members WHERE operation=?1 ORDER BY member")?;
                 files = members.query_map([op.operation], |row| row.get::<_,Vec<u8>>(0))?.map(|row| decode(&row?)).collect::<Result<_,_>>()?;
             }
-            for source in sources(conn, &binding, Some(&root))? {
+            for source in sources(conn, &binding, &root)? {
                 if files.iter().any(|file| file.library == source.library && file.child == source.child && file.version == source.version) { continue; }
                 files.push(AlbumDirectoryFile { native: source.native, library: source.library, child: source.child, version: source.version, provider_checksum: source.provider_checksum, old: source.path.clone(), next: source.path, fingerprint: None, sidecar: None, prior_local_checksum: Some(source.local_checksum) });
             }
@@ -695,51 +510,6 @@ impl SqliteStateDb {
         }).await
     }
 
-    pub(crate) async fn album_directory_has_preserved_history(
-        &self,
-        owner: account::AccountOwner,
-        binding: AlbumDirectoryBinding,
-    ) -> Result<bool, StateError> {
-        self.with_conn("album_directory_has_preserved_history", move |conn| {
-            account::validate_authenticated(conn, &owner)?;
-            let mut statement = conn.prepare("SELECT evidence FROM primary_layout_preserved")?;
-            for row in statement.query_map([], |row| row.get::<_, Vec<u8>>(0))? {
-                let file: super::LayoutFile = decode(&row?)?;
-                if file.path.to_path().starts_with(binding.path.to_path()) {
-                    return Ok(true);
-                }
-            }
-            let mut statement = conn.prepare(
-                "SELECT path FROM provider_active_destinations WHERE preserved_local IS NOT NULL",
-            )?;
-            for row in statement.query_map([], |row| row.get::<_, String>(0))? {
-                let path: SelectionPath = serde_json::from_str(&row?)
-                    .map_err(|_error| invalid("invalid preserved album path"))?;
-                if path.to_path().starts_with(binding.path.to_path()) {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        })
-        .await
-    }
-
-    pub(crate) async fn album_directory_has_unsettled_publication(
-        &self,
-        owner: account::AccountOwner,
-        binding: AlbumDirectoryBinding,
-    ) -> Result<bool, StateError> {
-        self.with_conn(
-            "checking unfinished native directory handoff",
-            move |conn| {
-                account::validate_authenticated(conn, &owner)?;
-                super::super::provider_generations::has_unsettled_directory_publication(
-                    conn, &binding,
-                )
-            },
-        )
-        .await
-    }
     /// Legacy per-file ownership does not establish exclusive directory ownership.
     /// Keep its recorded paths under an unclaimed binding until a rename.
     pub(crate) async fn album_directory_has_legacy_paths(
@@ -867,69 +637,6 @@ impl SqliteStateDb {
             }
             tx.execute("UPDATE album_containers SET directory_binding=?3 WHERE library=?1 AND container_id=?2",params![op.next.library,op.next.container,encode(&op.next)?])?;
             tx.execute("UPDATE primary_layout_operations SET phase='committed' WHERE operation=?1",[operation])?;
-            tx.commit()?;
-            Ok(())
-        }).await
-    }
-    pub(crate) async fn album_directory_sources(
-        &self,
-        owner: account::AccountOwner,
-        binding: AlbumDirectoryBinding,
-    ) -> Result<Vec<AlbumDirectorySource>, StateError> {
-        self.with_conn("album_directory_sources", move |conn| {
-            account::validate_authenticated(conn, &owner)?;
-            require_quiet(conn, &binding)?;
-            sources(conn, &binding, None)
-        })
-        .await
-    }
-
-    pub(crate) async fn begin_album_directory_rename(
-        &self,
-        owner: account::AccountOwner,
-        op: AlbumDirectoryOperation,
-        files: Vec<AlbumDirectoryFile>,
-    ) -> Result<(), StateError> {
-        self.with_conn_mut("begin_album_directory_rename", move |conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            account::validate_authenticated(&tx, &owner)?;
-            validate_binding(&op.old)?;
-            validate_binding(&op.next)?;
-            if op.old.projection.is_none() && !path_available(&tx, &op.next.path)? { return Err(invalid("album target has durable historical ownership")); }
-            for route in &op.directories { if !path_available(&tx, &route.next)? { return Err(invalid("album file target has durable historical ownership")); } }
-            require_quiet(&tx, &op.old)?;
-            let stored: Vec<u8> = tx.query_row("SELECT directory_binding FROM album_containers WHERE library=?1 AND container_id=?2", params![op.old.library,op.old.container], |row| row.get(0))?;
-            if stored != encode(&op.old)? { return Err(invalid("album binding changed before rename")); }
-            let expected = sources(&tx, &op.old, None)?;
-            for entry in &op.user_entries {
-                relocated_path(&op, &entry.path)?;
-                if op.fallback.is_none() || op.old.unclaimed || expected.iter().any(|source| {
-                    let source = source.path.to_path();
-                    let mut sidecar = source.as_os_str().to_owned(); sidecar.push(".xmp");
-                    source.starts_with(entry.path.to_path()) || std::path::Path::new(&sidecar).starts_with(entry.path.to_path())
-                }) {
-                    return Err(invalid("user entry overlaps managed album media"));
-                }
-            }
-            if expected.len() != files.len() { return Err(invalid("album file census changed")); }
-            for (source, file) in expected.iter().zip(&files) {
-                if source.path != file.old || file.next != relocated_path(&op, &file.old)?
-                    || source.library != file.library || source.child != file.child
-                    || source.version != file.version || source.provider_checksum != file.provider_checksum
-                    || source.native != file.native
-                    || if op.fallback.is_some() {
-                        file.prior_local_checksum.as_ref() != Some(&source.local_checksum)
-                    } else {
-                        file.prior_local_checksum.is_some() || file.fingerprint.as_ref().is_none_or(|fingerprint| source.local_checksum != data_encoding::HEXLOWER.encode(&fingerprint.sha256))
-                    } {
-                    return Err(invalid("album file receipt does not match rename input"));
-                }
-            }
-            tx.execute("INSERT INTO primary_layout_operations(operation,family,library,source_library,prior_generation,decision,policy,phase,header) VALUES(?1,?2,?3,?3,?4,?5,?6,'publishing',?7)", params![op.operation,family(&op.old)?,op.old.library,op.old.generation,op.next.pass,POLICY,encode(&op)?])?;
-            load_operation(&tx, &op.operation)?;
-            for (index, file) in files.iter().enumerate() {
-                tx.execute("INSERT INTO primary_layout_members(operation,member,evidence) VALUES(?1,?2,?3)", params![op.operation,i64::try_from(index).map_err(|_error| invalid("too many album files"))?,encode(file)?])?;
-            }
             tx.commit()?;
             Ok(())
         }).await

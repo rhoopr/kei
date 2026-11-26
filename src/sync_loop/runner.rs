@@ -1,5 +1,7 @@
 //! Command startup and the top-level sync/watch cycle.
 
+use crate::state::ReportStateStore;
+use crate::state::SyncTokenStore;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -471,7 +473,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
      -> Arc<download::DownloadConfig> {
         Arc::new(download::DownloadConfig {
             post_sync_metadata,
-            inventory_reconciliation: false,
             inventory_checkpoint: Default::default(),
             directory: Arc::clone(&cfg_directory),
             folder_structure: config.download.folder_structure.clone(),

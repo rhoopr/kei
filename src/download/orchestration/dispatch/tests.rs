@@ -1,3 +1,5 @@
+use crate::state::DownloadStateStore;
+use crate::state::{MembershipStore, SyncTokenStore};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -10,17 +12,16 @@ use tokio_util::sync::CancellationToken;
 use crate::commands::{AlbumPass, PassKind};
 use crate::icloud::photos::{PhotosSession, SyncTokenError};
 use crate::state::SqliteStateDb;
-use crate::test_helpers::{MockPhotosFlow, mock_photo_query_page};
+use crate::test_helpers::mock_photo_query_page;
 
 use super::super::config::DownloadConfig;
 use super::super::models::{
-    DownloadControls, DownloadOutcome, DownloadReporting, DownloadRunMode, DownloadStore,
-    FullEnumerationReason, SMART_FOLDER_REFRESH_FAILED_REASON, SyncMode, SyncResult,
+    DownloadControls, DownloadOutcome, DownloadReporting, DownloadRunMode, DownloadStore, SyncMode,
+    SyncResult,
 };
 use super::super::test_support::{
-    changes_album, changes_album_with_container, changes_zone_session, incremental_photo_records,
-    incremental_test_config, mock_album, seed_complete_album_snapshot, test_config,
-    unused_unfiled_changes_pass,
+    changes_album, changes_zone_session, incremental_photo_records, incremental_test_config,
+    test_config,
 };
 use super::{IncrementalErrorClass, classify_incremental_error, download_photos_with_sync};
 
@@ -477,14 +478,8 @@ async fn unsupported_previews_preserve_existing_store_after_reopen() {
                 )
                 .await
                 .unwrap();
-                assert!(
-                    lookups.load(Ordering::SeqCst) > 0,
-                    "compatibility retry must run"
-                );
-                assert_eq!(
-                    result.stats.downloaded,
-                    usize::from(mode == DownloadRunMode::DryRun)
-                );
+                assert_eq!(lookups.load(Ordering::SeqCst), 0);
+                assert_eq!(result.stats.downloaded, 0);
                 for ((table, actual), (_, expected)) in snapshot(&db).iter().zip(&before) {
                     assert_eq!(
                         actual, expected,
@@ -669,7 +664,7 @@ async fn run_print_incremental_sync(passes: &[AlbumPass], config: DownloadConfig
 }
 
 #[tokio::test]
-async fn unfiled_only_incremental_ignores_inactive_album_path_templates() {
+async fn preview_with_retained_cursor_enumerates_selected_unfiled_query() {
     let calls = Arc::new(AtomicUsize::new(0));
     let session = changes_zone_session(
         Arc::clone(&calls),
@@ -703,15 +698,9 @@ async fn unfiled_only_incremental_ignores_inactive_album_path_templates() {
     .expect("unfiled-only incremental sync should succeed");
 
     assert!(matches!(result.outcome, DownloadOutcome::Success));
-    assert!(
-        !result.full_enumeration_ran,
-        "inactive album/smart-folder templates must not force full enumeration"
-    );
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        1,
-        "unfiled-only incremental sync should query changes/zone"
-    );
+    assert!(result.full_enumeration_ran);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(result.sync_token, None);
 }
 
 #[tokio::test]
@@ -738,8 +727,8 @@ async fn smart_folder_incremental_with_unfiled_refreshes_smart_without_library_a
     );
     assert_eq!(
         changes_calls.load(Ordering::SeqCst),
-        1,
-        "unfiled follow-up work should use changes/zone"
+        0,
+        "previews enumerate current queries"
     );
     assert_eq!(
         smart_session.count_query_count(),
@@ -861,101 +850,10 @@ async fn smart_folder_refresh_failure_blocks_incremental_token() {
         result.outcome,
         DownloadOutcome::PartialFailure { failed_count: 1 }
     ));
-    assert_eq!(
-        changes_calls.load(Ordering::SeqCst),
-        1,
-        "unfiled incremental changes should still be checked"
-    );
+    assert_eq!(changes_calls.load(Ordering::SeqCst), 0);
     assert_eq!(smart_session.records_query_count(), 1);
-    assert!(result.stats.sync_token_blocked);
-    assert_eq!(
-        result.stats.sync_token_blocked_reason,
-        Some(SMART_FOLDER_REFRESH_FAILED_REASON)
-    );
     assert_eq!(result.sync_token, None);
-    assert!(result.checkpoint.completed_delta_replay);
-    assert!(!result.checkpoint.retained_token_rejected);
-}
-
-#[tokio::test]
-async fn album_incremental_records_relation_hydration_full_enumeration_reason() {
-    let session = MockPhotosFlow::new()
-        .album_count(0)
-        .empty_query_page(Some("zone-token-next"))
-        .build();
-    let passes = vec![AlbumPass {
-        kind: PassKind::Album,
-        album: mock_album("Vacation", session),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    }];
-
-    let mut config = test_config();
-    let dir = TempDir::new().expect("temp dir");
-    config.directory = Arc::from(dir.path());
-    config.sync_mode = SyncMode::Incremental {
-        zone_sync_token: "zone-token-prev".to_string(),
-    };
-
-    let result = download_photos_with_sync(
-        &Client::new(),
-        &passes,
-        Arc::new(config),
-        DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
-        CancellationToken::new(),
-    )
-    .await
-    .expect("album incremental should fall back to full enumeration");
-
-    assert!(result.full_enumeration_ran);
-    assert_eq!(
-        result.stats.full_enumeration_reason,
-        Some(FullEnumerationReason::AlbumRelationHydrationIncomplete)
-    );
-}
-
-#[tokio::test]
-async fn album_incremental_with_complete_snapshot_uses_changes_zone() {
-    let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
-    seed_complete_album_snapshot(&db, "container-vacation", "Vacation", &[]).await;
-    let calls = Arc::new(AtomicUsize::new(0));
-    let session = changes_zone_session(Arc::clone(&calls), Vec::new());
-    let passes = vec![
-        AlbumPass {
-            kind: PassKind::Album,
-            album: changes_album_with_container("Vacation", Some("container-vacation"), session),
-            exclude_ids: Arc::new(FxHashSet::default()),
-        },
-        unused_unfiled_changes_pass(),
-    ];
-
-    let mut config = test_config();
-    let dir = TempDir::new().expect("temp dir");
-    config.directory = Arc::from(dir.path());
-    config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
-    config.sync_mode = SyncMode::Incremental {
-        zone_sync_token: "zone-token-prev".to_string(),
-    };
-
-    let result = download_photos_with_sync(
-        &Client::new(),
-        &passes,
-        Arc::new(config),
-        DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
-        CancellationToken::new(),
-    )
-    .await
-    .expect("trusted album snapshot should allow incremental sync");
-
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
-    assert!(
-        !result.full_enumeration_ran,
-        "complete album snapshots should avoid whole-library fallback"
-    );
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        1,
-        "trusted album incremental sync should query changes/zone once"
-    );
+    assert!(!result.checkpoint.completed_delta_replay);
 }
 
 #[tokio::test]

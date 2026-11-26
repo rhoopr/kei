@@ -8,6 +8,7 @@ use crate::config;
 use crate::service::status::{render_oneline, service_state};
 use crate::state;
 use crate::state::AssetRecord;
+use crate::state::ReportStateStore;
 
 use super::{LISTING_CAP, print_truncation_tail};
 

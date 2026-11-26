@@ -31,12 +31,12 @@ Use this index for a specific module. Start with the [architecture map](../archi
 | Enumeration completion | `src/icloud/photos/album/completion.rs` | Collects fetcher completion evidence and requires unanimous tokens before returning a checkpoint candidate. |
 | Album hydration | `src/icloud/photos/album/hydration.rs` | Matches named-album members across source zones and hydrates durable asset or master identities. |
 | Provider change streams | `src/icloud/photos/album/changes.rs` | Owns sequential change scans, delta buffering, terminal raw-record presence/completion evidence, and last-good-token delivery. |
-| Download facade and dispatch | `src/download/mod.rs`, `src/download/orchestration/dispatch.rs` | Preserves download entry points and composes full, incremental, targeted-backfill, durable-retry, and guarded inventory work. |
+| Download facade and dispatch | `src/download/mod.rs`, `src/download/orchestration/dispatch.rs` | Routes writable sync through current selection, provisional inventory through full enumeration, and previews through the selected queries. |
 | Download models and configuration | `src/download/orchestration/models.rs`, `src/download/orchestration/config.rs` | Owns controls, results, per-zone checkpoint evidence, reporting projections, checkpoint reasons, coverage fingerprints, and configuration hashes. |
 | Download context and selection | `src/download/orchestration/context.rs`, `src/download/orchestration/selection.rs` | Loads library-scoped state and identity evidence, derives pass configurations, and checks incremental routing eligibility. |
 | Full enumeration | `src/download/orchestration/full.rs` | Owns bounded enumeration, album snapshots, pass counts, and token evidence. |
 | Incremental enumeration | `src/download/orchestration/incremental.rs`, `src/download/orchestration/delta.rs` | Runs separate streaming and collecting strategies with one shared delta-state owner for provider-event bookkeeping and routing facts. |
-| Download recovery | `src/download/orchestration/recovery.rs`, `src/download/orchestration/url_refresh.rs` | Runs durable pending recovery and refreshes exact download tasks with current provider URLs. |
+| Download recovery | `src/download/orchestration/generation.rs`, `src/download/orchestration/url_refresh.rs` | Retries unfinished selected destinations and refreshes the URL for the exact rendition. |
 | Legacy preservation preparation | `src/download/legacy_preservation.rs` | Validates unprepared historical families and files before storing protection evidence. It no longer certifies prepared history or supplies checkpoint permission. |
 | Local catalog maintenance | `src/download/orchestration/reconciliation.rs`, `src/download/orchestration/cleanup.rs`, `src/download/orchestration/maintenance.rs` | Reconciles catalog paths, removes durably owned stale temporary files, and repairs metadata-capture revisions. |
 | Asset planning | `src/download/planner.rs` | Applies filters, derives tasks, records dispatched pending work, and persists membership and identity mappings. |
@@ -98,7 +98,7 @@ Use this index for a specific module. Start with the [architecture map](../archi
 | Asset state transitions | `src/state/db/assets.rs` | Owns asset lifecycle, download finalization, retry eligibility, and provider source-state transitions. |
 | Shared SQLite writes and row decoding | `src/state/db/asset_writes.rs`, `src/state/db/rows.rs` | Shares asset writes within caller-owned transactions, column projections, date codecs, and row decoding. |
 | Metadata capture retries | `src/state/db/metadata_capture_retry.rs` | Stores generation-fenced ambiguity evidence and bounded retry deadlines. The cycle owner retains checkpoint authority. |
-| Durable provider identity | `src/state/db/identity.rs` | Stores library-scoped asset/master mappings and legacy state ownership. Provider record parsing stays in the iCloud adapter. |
+| Durable provider identity | `src/state/db/assets.rs` | Stores library-scoped asset/master mappings and legacy state ownership. Provider record parsing stays in the iCloud adapter. |
 | Durable membership | `src/state/db/membership.rs` | Stores album snapshots, provider relations, and grouping projections. |
 | Membership departure | `src/download/orchestration/primary_layout/membership.rs` | Retires unchanged owned album copies through the existing layout journal after current selected destinations complete and exact photo lookup confirms identity. Native copies require current publication authority; preserved-local copies and unowned sidecars stay in place. |
 | Durable metadata work | `src/state/db/metadata.rs` | Stores capture revisions, path-specific rewrite work, and repair receipts. It does not write media files. |

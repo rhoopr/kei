@@ -1,4 +1,5 @@
 use crate::download;
+use crate::state::ReportStateStore;
 use crate::sync_cycle::CycleResult;
 use crate::sync_loop::reporting::{merge_refresh_tail_outcome, sync_run_stats_from_cycle};
 

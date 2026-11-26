@@ -1,5 +1,7 @@
 //! Two fixed six-cycle histories, observed through equivalent provider encodings.
 //! Replays retain the entire prerequisite/recovery/quiet tail; no unsafe reducer.
+use crate::state::{DownloadStateStore, MetadataRewriteStore, ReportStateStore};
+use crate::state::{MembershipStore, SyncTokenStore};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

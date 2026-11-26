@@ -564,7 +564,8 @@ pub(in crate::download) async fn build_download_result(
 
     let retry_sources = if let Some(context) = &config.selection_context {
         if let Some(run) = &config.selection_run {
-            run.remember_retry_sources(&failed_tasks, passes).await?;
+            run.remember_retry_sources(&failed_tasks, passes, config)
+                .await?;
         }
         Some(context.exact_retry_sources()?)
     } else {
@@ -708,8 +709,7 @@ pub(in crate::download) async fn build_download_result(
             },
             stats,
             checkpoint,
-        )
-        .with_retry_exclusions(&remaining_failed));
+        ));
     }
 
     Ok(finish_download_result(
@@ -727,8 +727,6 @@ fn finish_download_result(
 ) -> SyncResult {
     checkpoint.project(&mut stats);
     SyncResult {
-        deferred_album_snapshots: Vec::new(),
-        retry_exclusions: Default::default(),
         outcome,
         sync_token: None,
         stats,

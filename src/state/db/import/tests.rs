@@ -1,4 +1,5 @@
 //! Tests moved from `state::db::tests`, with their original names and assertions.
+use crate::state::{DownloadStateStore, ReportStateStore};
 use std::path::PathBuf;
 use std::sync::Arc;
 

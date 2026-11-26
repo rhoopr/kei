@@ -7,6 +7,7 @@ use crate::auth;
 use crate::cli;
 use crate::config;
 use crate::state;
+use crate::state::SyncTokenStore;
 
 /// Run the reset-state command.
 pub(crate) async fn run_reset_state(

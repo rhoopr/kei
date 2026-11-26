@@ -1,3 +1,4 @@
+use crate::state::{DownloadStateStore, ReportStateStore};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

@@ -1,4 +1,6 @@
 //! Valid retained deltas composed with current Hidden refreshes retain source provenance.
+use crate::state::SyncTokenStore;
+use crate::state::{DownloadStateStore, ReportStateStore};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 

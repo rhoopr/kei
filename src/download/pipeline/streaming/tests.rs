@@ -1,3 +1,4 @@
+use crate::state::{DownloadStateStore, ReportStateStore};
 use std::fs;
 use std::sync::Arc;
 use std::time::Instant;
@@ -48,7 +49,6 @@ async fn test_producer_panic_propagates_as_error() {
         repair_truncated: false,
         legacy_preservation_allow_hardlinks: false,
         concurrent_downloads: 1,
-        inventory_reconciliation: false,
         inventory_checkpoint: Default::default(),
         post_sync_metadata: false,
         retry: RetryConfig::default(),

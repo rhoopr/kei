@@ -3,6 +3,9 @@ use super::{
     recover_target, recover_tree_blocking,
 };
 use crate::download::file::fingerprint::fingerprint_regular_file_blocking;
+use crate::state::SyncTokenStore;
+#[cfg(feature = "xmp")]
+use crate::state::{DownloadStateStore, MetadataRewriteStore};
 use std::fs;
 use std::os::unix::ffi::OsStringExt;
 use tempfile::TempDir;

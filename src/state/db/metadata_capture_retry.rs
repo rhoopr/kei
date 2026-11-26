@@ -4,6 +4,7 @@ use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
 
+#[cfg(test)]
 use super::SqliteStateDb;
 use super::rows::decode_asset_date;
 use crate::state::error::StateError;
@@ -239,97 +240,88 @@ pub(super) fn retire_completed(conn: &Connection, library: &str) -> Result<(), S
     Ok(())
 }
 
-impl SqliteStateDb {
-    /// Retain ambiguity only while the selected identity, renditions, and retry
-    /// generation still match. Returns false for stale or completed work.
-    /// Database or generation errors leave the transaction unchanged.
-    pub(crate) async fn defer_metadata_capture_ambiguity(
-        &self,
-        candidate: &MetadataCaptureCandidate,
-        revision: i64,
-    ) -> Result<bool, StateError> {
-        let candidate = candidate.clone();
-        self.with_conn_mut("defer_metadata_capture_ambiguity", move |conn| {
-            let tx = conn.transaction()?;
-            let mut current = None;
-            visit(
-                &tx,
-                &candidate.library,
-                revision,
-                Some(&candidate.asset_id),
-                |fresh, retry| {
-                    current = Some((fresh, retry));
-                    false
-                },
-            )?;
-            let Some((fresh, retry)) = current else {
-                return Ok(false);
-            };
-            // A concurrent repair, catalogue mutation, or another attempt must
-            // not inherit this attempt's stale delay.
-            if fresh != candidate {
-                return Ok(false);
-            }
-            let evidence = evidence(&candidate);
-            let previous_attempts = retry
-                .as_ref()
-                .filter(|r| r.target_revision == revision && r.evidence == evidence)
-                .map_or(0, |r| r.attempts);
-            let attempts = previous_attempts.saturating_add(1);
-            let delay = (INITIAL_RETRY_SECONDS
-                * (1_i64 << previous_attempts.min(MAX_BACKOFF_SHIFT)))
-                .min(MAX_RETRY_SECONDS);
-            let previous = tx
-                .query_row(
-                    "SELECT value FROM metadata WHERE key=?1",
-                    [GENERATION_KEY],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?;
-            let generation = previous
-                .as_deref()
-                .unwrap_or("0")
-                .parse::<i64>()
-                .ok()
-                .filter(|v| *v >= 0)
-                .and_then(|v| v.checked_add(1))
-                .ok_or_else(|| StateError::Invariant {
-                    operation: "defer_metadata_capture_ambiguity",
-                    detail: "invalid or exhausted retry generation".into(),
-                })?;
-            tx.execute(
-                "INSERT INTO metadata(key,value) VALUES (?1,?2) \
-                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                params![GENERATION_KEY, generation.to_string()],
-            )?;
-            let now = Utc::now().timestamp();
-            tx.execute(
-                r"INSERT INTO metadata_capture_retries
-                (library,asset_id,target_revision,evidence,generation,attempts,last_attempt_at,next_retry_at)
-                VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
-                ON CONFLICT(library,asset_id,target_revision) DO UPDATE SET
-                evidence=excluded.evidence,generation=excluded.generation,attempts=excluded.attempts,
-                last_attempt_at=excluded.last_attempt_at,next_retry_at=excluded.next_retry_at",
-                params![
-                    candidate.library,
-                    candidate.asset_id,
-                    revision,
-                    evidence,
-                    generation,
-                    attempts,
-                    now,
-                    now + delay,
-                ],
-            )?;
-            tx.commit()?;
-            Ok(true)
-        })
-        .await
+pub(super) fn defer_ambiguity(
+    conn: &mut rusqlite::Connection,
+    candidate: MetadataCaptureCandidate,
+    revision: i64,
+) -> Result<bool, StateError> {
+    let tx = conn.transaction()?;
+    let mut current = None;
+    visit(
+        &tx,
+        &candidate.library,
+        revision,
+        Some(&candidate.asset_id),
+        |fresh, retry| {
+            current = Some((fresh, retry));
+            false
+        },
+    )?;
+    let Some((fresh, retry)) = current else {
+        return Ok(false);
+    };
+    // A concurrent repair, catalogue mutation, or another attempt must
+    // not inherit this attempt's stale delay.
+    if fresh != candidate {
+        return Ok(false);
     }
+    let evidence = evidence(&candidate);
+    let previous_attempts = retry
+        .as_ref()
+        .filter(|r| r.target_revision == revision && r.evidence == evidence)
+        .map_or(0, |r| r.attempts);
+    let attempts = previous_attempts.saturating_add(1);
+    let delay = (INITIAL_RETRY_SECONDS * (1_i64 << previous_attempts.min(MAX_BACKOFF_SHIFT)))
+        .min(MAX_RETRY_SECONDS);
+    let previous = tx
+        .query_row(
+            "SELECT value FROM metadata WHERE key=?1",
+            [GENERATION_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let generation = previous
+        .as_deref()
+        .unwrap_or("0")
+        .parse::<i64>()
+        .ok()
+        .filter(|v| *v >= 0)
+        .and_then(|v| v.checked_add(1))
+        .ok_or_else(|| StateError::Invariant {
+            operation: "defer_metadata_capture_ambiguity",
+            detail: "invalid or exhausted retry generation".into(),
+        })?;
+    tx.execute(
+        "INSERT INTO metadata(key,value) VALUES (?1,?2) \
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![GENERATION_KEY, generation.to_string()],
+    )?;
+    let now = Utc::now().timestamp();
+    tx.execute(
+        r"INSERT INTO metadata_capture_retries
+        (library,asset_id,target_revision,evidence,generation,attempts,last_attempt_at,next_retry_at)
+        VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+        ON CONFLICT(library,asset_id,target_revision) DO UPDATE SET
+        evidence=excluded.evidence,generation=excluded.generation,attempts=excluded.attempts,
+        last_attempt_at=excluded.last_attempt_at,next_retry_at=excluded.next_retry_at",
+        params![
+            candidate.library,
+            candidate.asset_id,
+            revision,
+            evidence,
+            generation,
+            attempts,
+            now,
+            now + delay,
+        ],
+    )?;
+    tx.commit()?;
+    Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::state::{DownloadStateStore, MetadataRewriteStore};
     use std::path::Path;
 
     use super::{SqliteStateDb, candidates, counts};

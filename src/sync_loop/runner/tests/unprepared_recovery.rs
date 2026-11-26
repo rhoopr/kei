@@ -13,6 +13,8 @@
 use crate::download;
 use crate::icloud::photos::{PhotoAsset, PhotosSession};
 use crate::state;
+use crate::state::SyncTokenStore;
+use crate::state::{DownloadStateStore, MetadataRewriteStore, ReportStateStore};
 use crate::sync_loop::test_support::{
     RUN_CYCLE_ASSET_DATE_MS, album_count_response, full_album_page_with_download,
     make_run_cycle_config, make_run_cycle_download_config_builder,

@@ -1,182 +1,28 @@
+use crate::state::{DownloadStateStore, MetadataRewriteStore, ReportStateStore};
 use std::path::Path;
 use std::sync::Arc;
 
 use chrono::{TimeZone, Utc};
 use futures_util::stream;
 use reqwest::Client;
-use rustc_hash::FxHashSet;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
-use crate::commands::{AlbumPass, PassKind};
 use crate::download::pipeline::{StreamRuntime, stream_and_download_from_stream};
-use crate::download::retry::{
-    PendingRetryTarget, build_pending_retry_download_tasks, take_matching_pending_retry_tasks,
-};
 use crate::download::{file, filter};
 use crate::icloud::photos::{PhotoAsset, PhotosSession};
 use crate::retry::RetryConfig;
 use crate::state::VersionSizeKey;
-use crate::test_helpers::{
-    MockPhotosFlow, TestAssetRecord, mock_photo_records_for_zone_with_filename,
-};
-use crate::types::FileMatchPolicy;
+use crate::test_helpers::{MockPhotosFlow, TestAssetRecord};
 
 use super::super::dispatch::download_photos_with_sync;
-use super::super::models::{
-    DownloadControls, DownloadOutcome, DownloadReporting, DownloadRunMode, SyncMode, SyncResult,
-};
+use super::super::models::{DownloadControls, DownloadOutcome, SyncMode, SyncResult};
 use super::super::test_support::{
-    PendingLookupSession, SelectedMediaSession, album_with_session, changes_zone_response,
-    hard_deleted_change_record, incremental_photo_records_with_url, initialize_empty_selection,
-    mock_album, mock_asset_record_for, mock_master_record_with_filename,
-    mock_photo_records_with_filename, open_fixture_db, retry_test_task, selected_pass_with_session,
-    test_config,
+    SelectedMediaSession, changes_zone_response, hard_deleted_change_record,
+    incremental_photo_records_with_url, initialize_empty_selection,
+    mock_photo_records_with_filename, open_fixture_db, selected_pass_with_session, test_config,
 };
-
-#[test]
-fn pending_retry_filter_matches_asset_version_without_path() {
-    let original = retry_test_task("ASSET_A", VersionSizeKey::Original, "old/a.jpg");
-    let refreshed_elsewhere =
-        retry_test_task("ASSET_A", VersionSizeKey::Original, "new/location/a.jpg");
-    let wrong_version = retry_test_task("ASSET_A", VersionSizeKey::Medium, "new/a.jpg");
-    let unrelated = retry_test_task("ASSET_B", VersionSizeKey::Original, "new/b.jpg");
-    let mut pending_targets: FxHashSet<PendingRetryTarget> = std::iter::once(PendingRetryTarget {
-        library: Arc::from("PrimarySync"),
-        asset_id: Arc::clone(&original.asset_id),
-        version_size: original.version_size,
-    })
-    .collect();
-    let mut out = Vec::new();
-
-    take_matching_pending_retry_tasks(
-        vec![wrong_version, unrelated, refreshed_elsewhere.clone()],
-        &mut pending_targets,
-        &mut out,
-    );
-
-    assert!(pending_targets.is_empty());
-    assert_eq!(out.len(), 1);
-    assert_eq!(out[0].asset_id.as_ref(), "ASSET_A");
-    assert_eq!(out[0].version_size, VersionSizeKey::Original);
-    assert_eq!(out[0].download_path, refreshed_elsewhere.download_path);
-}
-
-#[derive(Clone, Debug)]
-struct LegacyPendingHydrationSession {
-    lookup_records: Arc<Vec<Value>>,
-    hydration_records: Arc<Vec<Value>>,
-    hydration_error: Option<Arc<str>>,
-}
-
-#[async_trait::async_trait]
-impl PhotosSession for LegacyPendingHydrationSession {
-    async fn post(
-        &self,
-        url: &str,
-        body: String,
-        _headers: &[(&str, &str)],
-    ) -> anyhow::Result<Value> {
-        if url.contains("/records/lookup?") {
-            return Ok(json!({"records": self.lookup_records.as_ref().clone()}));
-        }
-        if url.contains("/changes/zone?") {
-            let request: Value = serde_json::from_str(&body)?;
-            let has_sync_token = request["zones"]
-                .as_array()
-                .and_then(|zones| zones.first())
-                .and_then(|zone| zone.get("syncToken"))
-                .is_some();
-            let records = if has_sync_token {
-                Vec::new()
-            } else {
-                if let Some(error) = &self.hydration_error {
-                    anyhow::bail!(error.to_string());
-                }
-                self.hydration_records.as_ref().clone()
-            };
-            return Ok(changes_zone_response(records, "zone-token-next"));
-        }
-        Ok(json!({"records": [], "syncToken": "ignored-query-token"}))
-    }
-
-    fn clone_box(&self) -> Box<dyn PhotosSession> {
-        Box::new(self.clone())
-    }
-}
-
-#[tokio::test]
-async fn incremental_with_failed_rows_uses_targeted_retry_not_full_enumeration() {
-    let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
-    let record = crate::test_helpers::TestAssetRecord::new("FAILED_BEFORE_SYNC")
-        .filename("failed-before-sync.jpg")
-        .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
-        .size(1024)
-        .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
-        .build();
-    db.upsert_seen(&record).await.expect("seed pending row");
-    db.mark_failed(
-        "PrimarySync",
-        "FAILED_BEFORE_SYNC",
-        "original",
-        "prior download failure",
-    )
-    .await
-    .expect("mark failed");
-    db.upsert_asset_master_mapping(
-        "PrimarySync",
-        "asset-FAILED_BEFORE_SYNC",
-        "FAILED_BEFORE_SYNC",
-    )
-    .await
-    .expect("seed asset/master mapping");
-
-    let session = PendingLookupSession {
-        records: Arc::new(mock_photo_records_for_zone_with_filename(
-            "FAILED_BEFORE_SYNC",
-            "PrimarySync",
-            "failed-before-sync.jpg",
-        )),
-    };
-    let passes = vec![AlbumPass {
-        kind: PassKind::Unfiled,
-        album: album_with_session("PrimarySync", "", Box::new(session)),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    }];
-
-    let mut config = test_config();
-    let dir = TempDir::new().expect("temp dir");
-    config.directory = Arc::from(dir.path());
-    config.state_db = Some(db.clone());
-    config.sync_mode = SyncMode::Incremental {
-        zone_sync_token: "zone-token-prev".to_string(),
-    };
-
-    let result = download_photos_with_sync(
-        &Client::new(),
-        &passes,
-        Arc::new(config),
-        DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
-        CancellationToken::new(),
-    )
-    .await
-    .expect("failed rows should use targeted retry");
-
-    assert!(
-        !result.full_enumeration_ran,
-        "normal sync with failed rows should not force full enumeration"
-    );
-    assert_eq!(result.stats.full_enumeration_reason, None);
-    assert!(
-        matches!(result.outcome, DownloadOutcome::Success),
-        "result: {result:?}"
-    );
-    assert_eq!(
-        result.sync_token, None,
-        "print-only targeted retry must not advance the zone token"
-    );
-}
 
 #[tokio::test]
 #[tracing_test::traced_test]
@@ -326,84 +172,6 @@ async fn pending_peer_progresses_during_partial_failure_without_extra_same_cycle
                 records: [peer.clone(), failing.clone()].concat(),
             }),
         )];
-        if round == 0 {
-            for (outcome, state_failures, interrupted) in [
-                (
-                    DownloadOutcome::SessionExpired {
-                        auth_error_count: 1,
-                    },
-                    0,
-                    false,
-                ),
-                (
-                    DownloadOutcome::PartialFailure { failed_count: 1 },
-                    1,
-                    false,
-                ),
-                (DownloadOutcome::PartialFailure { failed_count: 1 }, 0, true),
-            ] {
-                let mut blocked = SyncResult::from_execution(outcome, None, Default::default());
-                blocked.retry_exclusions.insert(PendingRetryTarget {
-                    library: "PrimarySync".into(),
-                    asset_id: "asset-failing".into(),
-                    version_size: VersionSizeKey::Original,
-                });
-                blocked.checkpoint.state_write_failures = state_failures;
-                blocked.checkpoint.interrupted = interrupted;
-                let result = super::append_targeted_recovery_to_sync_result(
-                    &Client::new(),
-                    &passes,
-                    &Arc::new(config.clone()),
-                    DownloadControls::download_hidden(),
-                    CancellationToken::new(),
-                    blocked,
-                )
-                .await
-                .unwrap();
-                assert_eq!(result.stats.downloaded, 0);
-                assert_eq!(db.get_pending().await.unwrap().len(), 1);
-                assert!(db.get_downloaded_page(0, 10).await.unwrap().is_empty());
-                assert!(server.received_requests().await.unwrap().is_empty());
-            }
-            for guard in 0..6 {
-                let mut blocked = SyncResult::from_execution(
-                    DownloadOutcome::PartialFailure { failed_count: 1 },
-                    None,
-                    Default::default(),
-                );
-                let mut source =
-                    SyncResult::from_execution(DownloadOutcome::Success, None, Default::default());
-                source.retry_exclusions.insert(PendingRetryTarget {
-                    library: "PrimarySync".into(),
-                    asset_id: "asset-failing".into(),
-                    version_size: VersionSizeKey::Original,
-                });
-                blocked.accumulate(&source);
-                assert_eq!(blocked.retry_exclusions, source.retry_exclusions);
-                match guard {
-                    0 => blocked.checkpoint.sync_token_blocked = true,
-                    1 => blocked.checkpoint.identity_incomplete = true,
-                    2 => blocked.checkpoint.enumeration_incomplete = true,
-                    3 => blocked.checkpoint.enumeration_errors = 1,
-                    4 => blocked.retry_exclusions.clear(),
-                    _ => blocked.outcome = DownloadOutcome::PartialFailure { failed_count: 2 },
-                }
-                let result = super::append_targeted_recovery_to_sync_result(
-                    &Client::new(),
-                    &passes,
-                    &Arc::new(config.clone()),
-                    DownloadControls::download_hidden(),
-                    CancellationToken::new(),
-                    blocked,
-                )
-                .await
-                .unwrap();
-                assert_eq!(result.stats.downloaded, 0, "guard {guard}");
-                assert_eq!(db.get_pending().await.unwrap().len(), 1);
-                assert!(db.get_downloaded_page(0, 10).await.unwrap().is_empty());
-                assert!(server.received_requests().await.unwrap().is_empty());
-            }
-        }
         let result = download_photos_with_sync(
             &Client::new(),
             &passes,
@@ -590,222 +358,6 @@ async fn native_retry_identity_requires_exact_recorded_child_ownership() {
             assert_eq!(owners, i64::from(evidence == "mapped"), "{evidence}");
         }
     }
-}
-
-#[tokio::test]
-async fn pending_retry_reuses_missing_recorded_path_when_it_matches_planned_path() {
-    let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
-    let dir = TempDir::new().expect("temp dir");
-    let mut config = test_config();
-    config.directory = Arc::from(dir.path());
-    config.state_db = Some(db.clone());
-
-    let mut records = incremental_photo_records_with_url(
-        "MISSING_PATH",
-        "missing.jpg",
-        "https://p01.icloud-content.com/missing.jpg",
-        8,
-    );
-    records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!("ck_missing");
-    let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
-    let recorded_path = filter::expected_paths_for(&asset, &config)
-        .into_iter()
-        .next()
-        .expect("asset should derive a path")
-        .path;
-    seed_pending_retry_with_recorded_path(db.as_ref(), &asset, "ck_missing", 8, &recorded_path)
-        .await;
-
-    let passes = vec![AlbumPass {
-        kind: PassKind::Unfiled,
-        album: album_with_session(
-            "PrimarySync",
-            "",
-            Box::new(PendingLookupSession {
-                records: Arc::new(records),
-            }),
-        ),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    }];
-    let plan = build_pending_retry_download_tasks(
-        &passes,
-        &config,
-        DownloadRunMode::Download,
-        CancellationToken::new(),
-    )
-    .await
-    .expect("plan targeted retry");
-
-    assert_eq!(plan.tasks.len(), 1);
-    assert_eq!(plan.tasks[0].download_path, recorded_path);
-}
-
-#[tokio::test]
-async fn name_id7_targeted_retry_adopts_intact_recorded_path_without_planned_task() {
-    let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
-    let dir = TempDir::new().expect("temp dir");
-    let mut config = test_config();
-    config.directory = Arc::from(dir.path());
-    config.state_db = Some(db.clone());
-    config.file_match_policy = FileMatchPolicy::NameId7;
-
-    let mut records = incremental_photo_records_with_url(
-        "ID7_ADOPT",
-        "id7.jpg",
-        "https://p01.icloud-content.com/id7.jpg",
-        8,
-    );
-    records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!("ck_id7");
-    let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
-    let recorded_path = filter::expected_paths_for(&asset, &config)
-        .into_iter()
-        .next()
-        .expect("asset should derive a path")
-        .path;
-    tokio::fs::create_dir_all(recorded_path.parent().expect("recorded path parent"))
-        .await
-        .expect("create recorded path parent");
-    tokio::fs::write(&recorded_path, b"12345678")
-        .await
-        .expect("seed intact recorded file");
-    seed_pending_retry_with_recorded_path(db.as_ref(), &asset, "ck_id7", 8, &recorded_path).await;
-    let passes = vec![AlbumPass {
-        kind: PassKind::Unfiled,
-        album: album_with_session(
-            "PrimarySync",
-            "",
-            Box::new(PendingLookupSession {
-                records: Arc::new(records),
-            }),
-        ),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    }];
-
-    let plan = build_pending_retry_download_tasks(
-        &passes,
-        &config,
-        DownloadRunMode::Download,
-        CancellationToken::new(),
-    )
-    .await
-    .expect("adopt targeted retry");
-
-    assert!(plan.tasks.is_empty());
-    let summary = db.get_summary().await.expect("state summary");
-    assert_eq!(summary.downloaded, 1);
-    assert_eq!(summary.policy_excluded, 0);
-    assert_eq!(summary.pending, 0);
-    assert_eq!(summary.failed, 0);
-    let downloaded = db.get_downloaded_page(0, 10).await.expect("downloaded row");
-    assert_eq!(
-        downloaded[0].local_path.as_deref(),
-        Some(recorded_path.as_path())
-    );
-}
-
-#[tokio::test]
-async fn targeted_retry_adopts_smaller_metadata_rewritten_recorded_file() {
-    let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
-    let dir = TempDir::new().expect("temp dir");
-    let mut config = test_config();
-    config.directory = Arc::from(dir.path());
-    config.state_db = Some(db.clone());
-
-    let mut records = incremental_photo_records_with_url(
-        "METADATA_REWRITTEN_RETRY",
-        "rewritten.jpg",
-        "https://p01.icloud-content.com/rewritten.jpg",
-        8,
-    );
-    records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
-        json!("ck_metadata_rewritten_retry");
-    let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
-    let recorded_path = filter::expected_paths_for(&asset, &config)
-        .into_iter()
-        .next()
-        .expect("asset should derive a path")
-        .path;
-    tokio::fs::create_dir_all(recorded_path.parent().expect("recorded path parent"))
-        .await
-        .expect("create recorded path parent");
-    tokio::fs::write(&recorded_path, b"shorter")
-        .await
-        .expect("seed metadata-rewritten file");
-    let local_checksum = file::compute_sha256(&recorded_path)
-        .await
-        .expect("hash metadata-rewritten file");
-
-    let record = TestAssetRecord::new(asset.state_id())
-        .filename("rewritten.jpg")
-        .checksum("ck_metadata_rewritten_retry")
-        .size(8)
-        .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
-        .build();
-    db.upsert_seen(&record).await.expect("seed state row");
-    db.mark_downloaded(
-        "PrimarySync",
-        asset.state_id(),
-        VersionSizeKey::Original.as_str(),
-        &recorded_path,
-        &local_checksum,
-        Some("download-checksum-before-metadata"),
-    )
-    .await
-    .expect("seed metadata-rewritten state");
-    db.mark_failed(
-        "PrimarySync",
-        asset.state_id(),
-        VersionSizeKey::Original.as_str(),
-        "prior false truncation",
-    )
-    .await
-    .expect("mark row failed");
-    db.prepare_for_retry(
-        Some("PrimarySync"),
-        crate::state::RetryErrorRetention::Clear,
-    )
-    .await
-    .expect("prepare row for retry");
-    db.upsert_asset_master_mapping("PrimarySync", asset.asset_record_name(), asset.state_id())
-        .await
-        .expect("seed asset/master mapping");
-
-    let passes = vec![AlbumPass {
-        kind: PassKind::Unfiled,
-        album: album_with_session(
-            "PrimarySync",
-            "",
-            Box::new(PendingLookupSession {
-                records: Arc::new(records),
-            }),
-        ),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    }];
-    let plan = build_pending_retry_download_tasks(
-        &passes,
-        &config,
-        DownloadRunMode::Download,
-        CancellationToken::new(),
-    )
-    .await
-    .expect("adopt metadata-rewritten retry");
-
-    assert!(plan.tasks.is_empty());
-    assert_eq!(tokio::fs::read(&recorded_path).await.unwrap(), b"shorter");
-    let downloaded = db.get_downloaded_page(0, 10).await.expect("downloaded row");
-    assert_eq!(downloaded.len(), 1);
-    assert_eq!(
-        downloaded[0].local_path.as_deref(),
-        Some(recorded_path.as_path())
-    );
-    assert_eq!(
-        downloaded[0].local_checksum.as_deref(),
-        Some(local_checksum.as_str())
-    );
-    assert_eq!(
-        downloaded[0].download_checksum.as_deref(),
-        Some("download-checksum-before-metadata")
-    );
 }
 
 #[tokio::test]
@@ -1231,68 +783,6 @@ async fn same_size_provider_change_retry_does_not_adopt_stale_recorded_path() {
 }
 
 #[tokio::test]
-async fn incremental_pending_retry_dry_run_counts_planned_retry_without_token() {
-    let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
-    let record = crate::test_helpers::TestAssetRecord::new("DRY_RUN_PENDING")
-        .filename("dry-run-pending.jpg")
-        .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
-        .size(1024)
-        .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
-        .build();
-    db.upsert_seen(&record).await.expect("seed pending row");
-    db.upsert_asset_master_mapping("PrimarySync", "asset-DRY_RUN_PENDING", "DRY_RUN_PENDING")
-        .await
-        .expect("seed asset/master mapping");
-
-    let session = PendingLookupSession {
-        records: Arc::new(mock_photo_records_for_zone_with_filename(
-            "DRY_RUN_PENDING",
-            "PrimarySync",
-            "dry-run-pending.jpg",
-        )),
-    };
-    let passes = vec![AlbumPass {
-        kind: PassKind::Unfiled,
-        album: album_with_session("PrimarySync", "", Box::new(session)),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    }];
-
-    let mut config = test_config();
-    let dir = TempDir::new().expect("temp dir");
-    config.directory = Arc::from(dir.path());
-    config.state_db = Some(db.clone());
-    config.sync_mode = SyncMode::Incremental {
-        zone_sync_token: "zone-token-prev".to_string(),
-    };
-
-    let result = download_photos_with_sync(
-        &Client::new(),
-        &passes,
-        Arc::new(config),
-        DownloadControls::new(DownloadRunMode::DryRun, DownloadReporting::hidden()),
-        CancellationToken::new(),
-    )
-    .await
-    .expect("dry-run pending retry should report planned work");
-
-    assert!(
-        !result.full_enumeration_ran,
-        "dry-run pending retry should not force full enumeration"
-    );
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
-    assert_eq!(result.stats.downloaded, 1);
-    assert_eq!(result.sync_token, None);
-    assert!(
-        db.get_legacy_master_state_owners()
-            .await
-            .unwrap()
-            .is_empty()
-    );
-
-    assert!(!result.stats.sync_token_blocked);
-}
-
-#[tokio::test]
 async fn incremental_with_failed_rows_retries_real_download_after_zone_delta() {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
@@ -1489,58 +979,6 @@ async fn incremental_with_failed_rows_retries_real_download_after_zone_delta() {
 }
 
 #[tokio::test]
-async fn incremental_with_unmatched_pending_rows_does_not_block_source_checkpoint() {
-    let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
-    let record = crate::test_helpers::TestAssetRecord::new("PENDING_BEFORE_SYNC")
-        .filename("pending-before-sync.jpg")
-        .checksum("ck_pending_before_sync")
-        .size(1024)
-        .build();
-    db.upsert_seen(&record).await.expect("seed pending row");
-
-    let session = MockPhotosFlow::new()
-        .changes_zone_page(Vec::new(), "zone-token-next", false)
-        .empty_query_page(Some("ignored-query-token"))
-        .build();
-    let passes = vec![AlbumPass {
-        kind: PassKind::Unfiled,
-        album: mock_album("", session),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    }];
-
-    let mut config = test_config();
-    let dir = TempDir::new().expect("temp dir");
-    config.directory = Arc::from(dir.path());
-    config.state_db = Some(db);
-    config.sync_mode = SyncMode::Incremental {
-        zone_sync_token: "zone-token-prev".to_string(),
-    };
-
-    let result = download_photos_with_sync(
-        &Client::new(),
-        &passes,
-        Arc::new(config),
-        DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
-        CancellationToken::new(),
-    )
-    .await
-    .expect("pending rows should remain durable without forcing provider recovery");
-
-    assert!(
-        !result.full_enumeration_ran,
-        "unmatched pending rows should not force full enumeration"
-    );
-    assert!(matches!(
-        result.outcome,
-        DownloadOutcome::PartialFailure { failed_count: 1 }
-    ));
-    assert_eq!(result.sync_token, None);
-    assert_eq!(result.stats.downloaded, 0);
-    assert!(!result.stats.sync_token_blocked);
-    assert_eq!(result.stats.sync_token_blocked_reason, None);
-}
-
-#[tokio::test]
 async fn incremental_with_unmatched_pending_rows_retains_state_without_deletion_evidence() {
     let dir = TempDir::new().expect("temp dir");
     let database = dir.path().join("state.db");
@@ -1614,7 +1052,7 @@ async fn incremental_with_unmatched_pending_rows_retains_state_without_deletion_
 }
 
 #[tokio::test]
-async fn full_enumeration_query_absence_never_deletes_pending_state() {
+async fn contract_unknown_provider_identity_remains_pending_after_empty_inventory() {
     let dir = TempDir::new().unwrap();
     let database = dir.path().join("state.db");
     let db = open_fixture_db(&database).await;
@@ -1763,7 +1201,6 @@ async fn bounded_full_sync_revalidates_explicit_provider_deletion() {
     config.sync_mode = SyncMode::Incremental {
         zone_sync_token: "source-before".into(),
     };
-    config.inventory_reconciliation = true;
     config.skip_created_before = Some(crate::config::CreatedDateFilter::Instant(
         Utc.timestamp_opt(1_746_994_800, 0).unwrap(),
     ));
@@ -1778,7 +1215,6 @@ async fn bounded_full_sync_revalidates_explicit_provider_deletion() {
     .await
     .expect("bounded full sync should revalidate pending work");
 
-    assert!(result.full_enumeration_ran);
     assert!(matches!(result.outcome, DownloadOutcome::Success));
     let summary = db.get_summary().await.expect("summary");
     assert_eq!(summary.pending, 0);
@@ -2028,7 +1464,7 @@ async fn bounded_full_sync_preserves_filtered_legacy_pending_file() {
 }
 
 #[tokio::test]
-async fn bounded_full_sync_revalidates_policy_excluded_asset_after_later_deletion() {
+async fn contract_policy_excluded_requires_explicit_source_deletion() {
     let dir = TempDir::new().expect("temp dir");
     let database = dir.path().join("state.db");
     let db = open_fixture_db(&database).await;
@@ -2123,7 +1559,6 @@ async fn bounded_full_sync_revalidates_policy_excluded_asset_after_later_deletio
     config.sync_mode = SyncMode::Incremental {
         zone_sync_token: "fixture-token".into(),
     };
-    config.inventory_reconciliation = true;
     let deleted_passes = vec![selected_pass_with_session(
         &db,
         "",
@@ -2149,266 +1584,6 @@ async fn bounded_full_sync_revalidates_policy_excluded_asset_after_later_deletio
     assert_eq!(summary.policy_excluded, 0);
     assert_eq!(summary.failed, 0);
     assert_eq!(summary.source_deleted, 1);
-}
-
-#[tokio::test]
-async fn contract_unknown_provider_identity_remains_pending_without_durable_match() {
-    let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
-    let record = TestAssetRecord::new("LEGACY_AMBIGUOUS")
-        .checksum("no-sibling-matches")
-        .size(999)
-        .build();
-    db.upsert_seen(&record).await.expect("seed pending row");
-
-    let master = mock_master_record_with_filename("LEGACY_AMBIGUOUS", "ambiguous.jpg");
-    let hydration_records = vec![
-        master.clone(),
-        mock_asset_record_for("asset-ambiguous-a", "LEGACY_AMBIGUOUS"),
-        mock_asset_record_for("asset-ambiguous-b", "LEGACY_AMBIGUOUS"),
-    ];
-    let session = LegacyPendingHydrationSession {
-        lookup_records: Arc::new(vec![master]),
-        hydration_records: Arc::new(hydration_records),
-        hydration_error: None,
-    };
-    let passes = vec![AlbumPass {
-        kind: PassKind::Unfiled,
-        album: album_with_session("PrimarySync", "", Box::new(session)),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    }];
-    let mut config = test_config();
-    let dir = TempDir::new().expect("temp dir");
-    config.directory = Arc::from(dir.path());
-    config.state_db = Some(db.clone());
-
-    let plan = build_pending_retry_download_tasks(
-        &passes,
-        &config,
-        DownloadRunMode::Download,
-        CancellationToken::new(),
-    )
-    .await
-    .expect("non-matching siblings should remain safely unresolved");
-
-    assert!(plan.tasks.is_empty());
-    assert_eq!(plan.unmatched_targets.len(), 1);
-    let summary = db.get_summary().await.expect("summary");
-    assert_eq!(summary.pending, 1);
-    assert_eq!(summary.awaiting_provider_verification, 1);
-    assert_eq!(
-        db.get_master_record_name_for_asset("PrimarySync", "asset-ambiguous-a")
-            .await
-            .expect("mapping lookup"),
-        None
-    );
-}
-
-#[tokio::test]
-async fn pending_direct_lookup_requires_rendition_evidence_before_claiming_owner() {
-    let matching_checksum = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
-    for (checksum, size, rejected) in [
-        ("different-checksum", 1024, true),
-        (matching_checksum, 999, true),
-        ("different-checksum", 999, true),
-        (matching_checksum, 1024, false),
-    ] {
-        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
-        let record = TestAssetRecord::new("LEGACY_DIRECT")
-            .checksum(checksum)
-            .size(size)
-            .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
-            .build();
-        db.upsert_seen(&record).await.unwrap();
-        db.upsert_asset_master_mapping("PrimarySync", "asset-direct", "LEGACY_DIRECT")
-            .await
-            .unwrap();
-        let mut child = mock_asset_record_for("asset-direct", "LEGACY_DIRECT");
-        child["fields"]["addedDate"] = json!({"value": 1_700_000_000_123i64, "type": "TIMESTAMP"});
-        let passes = vec![AlbumPass {
-            kind: PassKind::Unfiled,
-            album: album_with_session(
-                "PrimarySync",
-                "",
-                Box::new(PendingLookupSession {
-                    records: Arc::new(vec![
-                        mock_master_record_with_filename("LEGACY_DIRECT", "direct.jpg"),
-                        child,
-                    ]),
-                }),
-            ),
-            exclude_ids: Arc::new(FxHashSet::default()),
-        }];
-        let dir = TempDir::new().unwrap();
-        let mut config = test_config();
-        config.directory = Arc::from(dir.path());
-        config.state_db = Some(db.clone());
-        for _cycle in 0..2 {
-            let plan = build_pending_retry_download_tasks(
-                &passes,
-                &config,
-                DownloadRunMode::Download,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-            assert_eq!(plan.tasks.len(), usize::from(!rejected));
-            assert_eq!(plan.identity_incomplete, rejected);
-            let owners = db.get_legacy_master_state_owners().await.unwrap();
-            assert_eq!(owners.len(), usize::from(!rejected));
-            if rejected {
-                assert_eq!(plan.unmatched_targets.len(), 1);
-                let pending = db.get_pending().await.unwrap();
-                assert_eq!(pending[0].checksum.as_ref(), checksum);
-                assert_eq!(pending[0].size_bytes, size);
-                assert_eq!(pending[0].added_at, record.added_at);
-                assert_eq!(db.get_summary().await.unwrap().source_deleted, 0);
-            }
-            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
-        }
-    }
-}
-
-#[tokio::test]
-async fn pending_retry_uses_legacy_owner_to_resolve_matching_siblings() {
-    let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
-    let record = TestAssetRecord::new("LEGACY_OWNED_RETRY")
-        .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
-        .filename("owned-retry.jpg")
-        .size(1024)
-        .build();
-    db.upsert_seen(&record).await.expect("seed pending row");
-    assert!(
-        db.claim_legacy_master_state_owner("PrimarySync", "LEGACY_OWNED_RETRY", "asset-owned-b",)
-            .await
-            .expect("claim legacy owner")
-    );
-
-    let master = mock_master_record_with_filename("LEGACY_OWNED_RETRY", "owned-retry.jpg");
-    let session = LegacyPendingHydrationSession {
-        lookup_records: Arc::new(vec![
-            master.clone(),
-            mock_asset_record_for("asset-owned-b", "LEGACY_OWNED_RETRY"),
-        ]),
-        hydration_records: Arc::new(vec![
-            master,
-            mock_asset_record_for("asset-owned-a", "LEGACY_OWNED_RETRY"),
-            mock_asset_record_for("asset-owned-b", "LEGACY_OWNED_RETRY"),
-        ]),
-        hydration_error: None,
-    };
-    let passes = vec![AlbumPass {
-        kind: PassKind::Unfiled,
-        album: album_with_session("PrimarySync", "", Box::new(session)),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    }];
-    let mut config = test_config();
-    let dir = TempDir::new().expect("temp dir");
-    config.directory = Arc::from(dir.path());
-    config.state_db = Some(db);
-
-    let plan = build_pending_retry_download_tasks(
-        &passes,
-        &config,
-        DownloadRunMode::Download,
-        CancellationToken::new(),
-    )
-    .await
-    .expect("persisted owner should resolve matching siblings");
-
-    assert_eq!(plan.tasks.len(), 1);
-    assert_eq!(plan.unmatched_targets.len(), 0);
-    assert_eq!(plan.tasks[0].asset_id.as_ref(), "LEGACY_OWNED_RETRY");
-    assert_eq!(plan.tasks[0].asset_record_name.as_ref(), "asset-owned-b");
-}
-
-#[tokio::test]
-async fn pending_retry_retains_transient_legacy_hydration_failure() {
-    let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
-    let record = TestAssetRecord::new("LEGACY_TRANSIENT").build();
-    db.upsert_seen(&record).await.expect("seed pending row");
-    let session = LegacyPendingHydrationSession {
-        lookup_records: Arc::new(vec![mock_master_record_with_filename(
-            "LEGACY_TRANSIENT",
-            "transient.jpg",
-        )]),
-        hydration_records: Arc::new(Vec::new()),
-        hydration_error: Some(Arc::from("temporary changes failure")),
-    };
-    let passes = vec![AlbumPass {
-        kind: PassKind::Unfiled,
-        album: album_with_session("PrimarySync", "", Box::new(session)),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    }];
-    let mut config = test_config();
-    config.state_db = Some(db.clone());
-
-    let plan = build_pending_retry_download_tasks(
-        &passes,
-        &config,
-        DownloadRunMode::Download,
-        CancellationToken::new(),
-    )
-    .await
-    .expect("transient hydration failure should retain durable work");
-
-    assert!(plan.tasks.is_empty());
-    assert!(plan.identity_incomplete);
-    assert_eq!(plan.unmatched_targets.len(), 1);
-    let summary = db.get_summary().await.expect("summary");
-    assert_eq!(summary.pending, 1);
-    assert_eq!(summary.awaiting_provider_verification, 1);
-}
-
-#[tokio::test]
-async fn pending_retry_deleted_sibling_does_not_tombstone_present_master_state() {
-    let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
-    let record = TestAssetRecord::new("MASTER_WITH_SIBLINGS")
-        .filename("master-with-siblings.jpg")
-        .build();
-    db.upsert_seen(&record).await.expect("seed pending row");
-    db.upsert_asset_master_mapping("PrimarySync", "asset-a-deleted", "MASTER_WITH_SIBLINGS")
-        .await
-        .expect("seed deleted sibling mapping");
-    db.upsert_asset_master_mapping("PrimarySync", "asset-b-present", "MASTER_WITH_SIBLINGS")
-        .await
-        .expect("seed present sibling mapping");
-
-    let session = PendingLookupSession {
-        records: Arc::new(vec![
-            json!({
-                "recordName": "asset-a-deleted",
-                "serverErrorCode": "UNKNOWN_ITEM",
-                "reason": "record not found"
-            }),
-            mock_master_record_with_filename("MASTER_WITH_SIBLINGS", "master-with-siblings.jpg"),
-            mock_asset_record_for("asset-b-present", "MASTER_WITH_SIBLINGS"),
-        ]),
-    };
-    let passes = vec![AlbumPass {
-        kind: PassKind::Unfiled,
-        album: album_with_session("PrimarySync", "", Box::new(session)),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    }];
-    let mut config = test_config();
-    let dir = TempDir::new().expect("temp dir");
-    config.directory = Arc::from(dir.path());
-    config.state_db = Some(db.clone());
-
-    let plan = build_pending_retry_download_tasks(
-        &passes,
-        &config,
-        DownloadRunMode::Download,
-        CancellationToken::new(),
-    )
-    .await
-    .expect("build pending retry plan");
-
-    assert!(plan.tasks.is_empty());
-    assert_eq!(plan.unmatched_targets.len(), 1);
-    assert!(plan.identity_incomplete);
-    let summary = db.get_summary().await.expect("summary");
-    assert_eq!(summary.source_deleted, 0);
-    assert_eq!(summary.pending, 1);
 }
 
 async fn run_date_bounded_incremental_sync(

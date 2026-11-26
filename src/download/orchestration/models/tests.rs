@@ -1,6 +1,7 @@
 use crate::commands::PassKind;
 use crate::download::recap;
 use crate::icloud::photos::ProviderRecordId;
+use crate::state::SyncTokenStore;
 
 use super::{
     DownloadOutcome, FullEnumerationReason, PassKey, SkipBreakdown, SyncResult, SyncStats,
@@ -562,7 +563,6 @@ async fn sparse_receipts_survive_report_changes_and_inventory_bridge_composition
             .is_none()
     );
     db.commit_checkpoint_transition(CheckpointTransition {
-        album_snapshots: Vec::new(),
         expected_metadata: Vec::new(),
         sparse_identity_proofs: inventory.checkpoint.sparse_identity_proofs,
         metadata_updates: vec![("sync_token:PrimarySync".into(), "after".into())],

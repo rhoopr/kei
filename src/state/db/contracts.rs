@@ -407,8 +407,6 @@ pub(crate) struct ScopedDbSyncToken {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CheckpointTransition {
-    /// Qualified running album snapshots, completed under the metadata fences.
-    pub(crate) album_snapshots: Vec<(String, String, i64)>,
     /// Rechecked in the same transaction before current-proof retirement or any write.
     pub(crate) expected_metadata: Vec<(String, Option<String>)>,
     pub(crate) sparse_identity_proofs: Vec<SparseIdentityProof>,
@@ -417,11 +415,13 @@ pub(crate) struct CheckpointTransition {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum AssetVerificationState {
     Unknown,
     TransientFailure,
 }
 
+#[cfg(test)]
 impl AssetVerificationState {
     pub(super) const fn as_str(self) -> &'static str {
         match self {
@@ -662,6 +662,7 @@ pub trait DownloadStateStore: Send + Sync {
     ) -> Result<bool, StateError> {
         Ok(false)
     }
+    #[cfg(test)]
     async fn set_asset_verification(
         &self,
         _library: &str,
@@ -1192,6 +1193,7 @@ pub trait MetadataRewriteStore: Send + Sync {
     ///
     /// # Errors
     /// Returns a state error if the catalogue query fails.
+    #[cfg(test)]
     async fn has_downloaded_without_metadata_hash(&self, library: &str)
     -> Result<bool, StateError>;
     async fn begin_metadata_capture_revision(

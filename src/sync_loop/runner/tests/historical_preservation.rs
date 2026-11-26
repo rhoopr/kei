@@ -1,5 +1,7 @@
 //! Historical certificates are evidence, never current-sync authority.
 
+use crate::state::{DownloadStateStore, ReportStateStore};
+use crate::state::{MembershipStore, SyncTokenStore};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 

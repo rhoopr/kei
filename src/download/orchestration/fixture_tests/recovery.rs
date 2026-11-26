@@ -1,3 +1,4 @@
+use crate::state::ReportStateStore;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
 

@@ -86,9 +86,29 @@ fn digest(bytes: &[u8]) -> String {
 }
 
 pub(crate) fn pass_key(pass: &AlbumPass) -> String {
+    pass_key_for_scope(pass, pass.album.selection_scope())
+}
+
+fn pass_key_for_scope(pass: &AlbumPass, scope: Value) -> String {
     let mut excludes: Vec<_> = pass.exclude_ids.iter().collect();
     excludes.sort_unstable();
-    digest(json!({"kind":format!("{:?}",pass.kind),"scope":pass.album.selection_scope(),"excludes":excludes}).to_string().as_bytes())
+    digest(
+        json!({"kind":format!("{:?}",pass.kind),"scope":scope,"excludes":excludes})
+            .to_string()
+            .as_bytes(),
+    )
+}
+
+// Keep existing destination and layout keys across a cloud rename. Query scope,
+// selection filters and current metadata still come from discovery.
+fn bound_pass_key(pass: &AlbumPass, names: &BTreeMap<String, String>) -> String {
+    let mut scope = pass.album.selection_scope();
+    if let Some(name) = pass.album.container_id().and_then(|id| names.get(id))
+        && let Some(field) = scope.get_mut("name")
+    {
+        *field = Value::String(name.clone());
+    }
+    pass_key_for_scope(pass, scope)
 }
 
 type SelectionRetrySources =
@@ -101,11 +121,11 @@ pub(crate) struct SelectionContext {
     zone: Value,
     config_hash: String,
     profile: Value,
+    bound_album_names: BTreeMap<String, String>,
     album_directories: BTreeMap<String, String>,
     album_files:
         BTreeMap<String, Vec<crate::state::db::primary_layout::directory::AlbumDirectoryFile>>,
     retry_sources: Arc<std::sync::Mutex<SelectionRetrySources>>,
-    inventory_membership_delta: Arc<std::sync::Mutex<Option<Box<MembershipDelta>>>>,
 }
 
 /// Begin a synthetic historical generation through the normal admission owner.
@@ -191,6 +211,7 @@ pub(crate) async fn context(
     }
     let mut qualified = None;
     let mut profile = Vec::new();
+    let mut bound_album_names = BTreeMap::new();
     let mut album_directories = BTreeMap::new();
     let mut album_files = BTreeMap::new();
     let mut album_projection_generations = BTreeMap::new();
@@ -222,6 +243,14 @@ pub(crate) async fn context(
                 )
                 .await?
         {
+            anyhow::ensure!(
+                crate::state::db::primary_layout::directory::same_container(
+                    &binding.scope,
+                    &pass.album.selection_scope()
+                ),
+                "Album directory provider identity changed"
+            );
+            bound_album_names.insert(container.to_owned(), binding.applied_name.clone());
             if binding.projection.is_some() || binding.additional_projection.is_some() {
                 album_projection_generations.insert(container.to_owned(), binding.generation);
             }
@@ -250,6 +279,15 @@ pub(crate) async fn context(
                     .replace(std::path::MAIN_SEPARATOR, "/")
                     .replace('%', "%%");
                 album_directories.insert(container.to_owned(), template);
+            } else {
+                // Discovery stores the sanitized hierarchy with '/' between provider
+                // components. Revalidate each persisted component before expansion.
+                let components: Vec<_> =
+                    binding.applied_name.split('/').map(str::to_owned).collect();
+                album_directories.insert(
+                    container.to_owned(),
+                    crate::download::paths::expand_album_components("{album}", &components),
+                );
             }
         }
         if let Some((previous, previous_scope, previous_zone)) = &qualified {
@@ -266,7 +304,7 @@ pub(crate) async fn context(
         }
         let mut excludes: Vec<_> = pass.exclude_ids.iter().collect();
         excludes.sort_unstable();
-        let mut selected = json!({"key":pass_key(pass),"kind":format!("{:?}",pass.kind),"scope":pass.album.selection_scope(),"excludes":excludes});
+        let mut selected = json!({"key":bound_pass_key(pass,&bound_album_names),"kind":format!("{:?}",pass.kind),"scope":pass.album.selection_scope(),"excludes":excludes});
         if pass.kind == PassKind::Album {
             selected
                 .as_object_mut()
@@ -305,6 +343,16 @@ pub(crate) async fn context(
         // Retain the historical fingerprint key; lifetime admission is retired.
         "repair_truncated":config.repair_truncated,"attempt_limit":0,
     });
+    // Returning to suffix naming cannot revive a pre-handover generation:
+    // established managed families still own their recorded primary paths.
+    if config.edited_naming != crate::types::EditedNaming::Primary
+        && capture.db.has_primary_layouts(&config.library).await?
+    {
+        identity
+            .as_object_mut()
+            .context("Invalid selection identity")?
+            .insert("retained_primary_layouts".into(), Value::Bool(true));
+    }
     // Keep historical fingerprints byte-for-byte when there is no exclusive
     // directory binding. A new binding must not replay an older frozen path.
     if !album_directories.is_empty() {
@@ -337,10 +385,10 @@ pub(crate) async fn context(
         zone,
         config_hash,
         profile,
+        bound_album_names,
         album_directories,
         album_files,
         retry_sources: Arc::new(std::sync::Mutex::new(rustc_hash::FxHashMap::default())),
-        inventory_membership_delta: Arc::default(),
     }))
 }
 
@@ -410,7 +458,6 @@ impl SelectionContext {
             SelectionDebt::Blocking(hold) => hold,
             SelectionDebt::IndependentLookup
                 if !membership_removal
-                    && !config.inventory_reconciliation
                     && !config.primary_layout_active
                     && !config.provisional
                     && !config.sparse_membership_due
@@ -472,6 +519,10 @@ impl SelectionContext {
             cancel,
         ))
         .await
+    }
+
+    pub(super) fn pass_key(&self, pass: &AlbumPass) -> String {
+        bound_pass_key(pass, &self.bound_album_names)
     }
 
     pub(super) fn album_directory(&self, container: &str) -> Option<&str> {
@@ -576,7 +627,7 @@ impl SelectionContext {
             },
             albums: passes
                 .iter()
-                .map(|pass| (pass_key(pass), pass.album.clone()))
+                .map(|pass| (self.pass_key(pass), pass.album.clone()))
                 .collect(),
             held: AtomicBool::new(false),
             session_expired: AtomicBool::new(false),
@@ -597,7 +648,7 @@ impl SelectionContext {
             phase: SelectionPhase::Execution,
             albums: passes
                 .iter()
-                .map(|pass| (pass_key(pass), pass.album.clone()))
+                .map(|pass| (self.pass_key(pass), pass.album.clone()))
                 .collect(),
             held: AtomicBool::new(false),
             session_expired: AtomicBool::new(false),
@@ -653,9 +704,9 @@ pub(crate) async fn recover_deleted_album_selection(
         config_hash,
         profile,
         retry_sources: Arc::default(),
+        bound_album_names: BTreeMap::new(),
         album_directories: BTreeMap::new(),
         album_files: BTreeMap::new(),
-        inventory_membership_delta: Arc::default(),
     };
     let mut root = match context.current().await? {
         Some(root) => root,
@@ -790,11 +841,12 @@ impl SelectionRun {
         &self,
         tasks: &[filter::DownloadTask],
         passes: &[AlbumPass],
+        config: &DownloadConfig,
     ) -> Result<()> {
         let mut sources = Vec::new();
         for task in tasks {
             for (pass_index, pass) in passes.iter().enumerate() {
-                let key = pass_key(pass);
+                let key = config.pass_key(pass);
                 let Some(manifest) = self
                     .capture
                     .db
@@ -1525,10 +1577,7 @@ impl SelectionRun {
                     AdmissionChecks {
                         inventory_observation: retry_observation
                             .as_ref()
-                            .filter(|_| {
-                                matches!(config.sync_mode, crate::download::SyncMode::Full)
-                                    && !config.inventory_reconciliation
-                            })
+                            .filter(|_| matches!(config.sync_mode, crate::download::SyncMode::Full))
                             .cloned(),
                         capacity: MAX_GENERATION_BYTES,
                         layouts: layouts.clone(),
@@ -2064,7 +2113,7 @@ pub(super) async fn inventory(
             album: pass
                 .album
                 .clone()
-                .with_rank_capture(&run.root.id, &pass_key(pass)),
+                .with_rank_capture(&run.root.id, &context.pass_key(pass)),
             ..pass.clone()
         })
         .collect();
@@ -2243,12 +2292,7 @@ pub(super) async fn inventory(
             generation: run.root.id.clone(),
         });
     }
-    let mut membership_delta = context
-        .inventory_membership_delta
-        .lock()
-        .map_err(|_poisoned| anyhow::anyhow!("Membership observation lock poisoned"))?
-        .take()
-        .unwrap_or_default();
+    let mut membership_delta = MembershipDelta::default();
     context
         .include_durable_membership_deletions(&mut membership_delta)
         .await?;
@@ -2736,7 +2780,7 @@ async fn recover_retained(
         if cancel.is_cancelled() || run.session_expired.load(Ordering::Relaxed) {
             break;
         }
-        let key = pass_key(pass);
+        let key = config.pass_key(pass);
         let mut assets = Vec::new();
         'decision: for decision in decisions
             .iter()
@@ -2840,7 +2884,8 @@ async fn recover_retained(
             crate::download::pipeline::StreamRuntime::new(None, None).deferring_metadata_drain(),
         )
         .await?;
-        run.remember_retry_sources(&result.failed, passes).await?;
+        run.remember_retry_sources(&result.failed, passes, config)
+            .await?;
         super::models::merge_streaming_result(&mut combined, result);
     }
     context
@@ -2937,7 +2982,7 @@ async fn replay_destinations(
             combined.enumeration_complete = false;
             break;
         }
-        let key = pass_key(pass);
+        let key = config.pass_key(pass);
         let mut after = None;
         loop {
             if cancel.is_cancelled() || combined.provider_auth_errors > 0 || combined.storage_failed
@@ -2990,7 +3035,8 @@ async fn replay_destinations(
                     .deferring_metadata_drain(),
             )
             .await?;
-            run.remember_retry_sources(&result.failed, passes).await?;
+            run.remember_retry_sources(&result.failed, passes, config)
+                .await?;
             super::models::merge_streaming_result(combined, result);
         }
     }
@@ -3008,7 +3054,6 @@ pub(super) fn supports_accepted_replay(
         && config.exclude_asset_ids.is_empty()
         && controls.run_mode.downloads_files()
         && config.inventory_checkpoint != InventoryCheckpointPolicy::RetainedBridge
-        && !config.inventory_reconciliation
         && config.indexing_inventory_cursor.is_none()
         && !config.primary_layout_active
 }
@@ -3129,7 +3174,7 @@ pub(super) async fn publish_accepted_replay(
         {
             break;
         }
-        let key = pass_key(pass);
+        let key = config.pass_key(pass);
         if !accepted_replay_pass(&context.profile, &key) {
             continue;
         }
@@ -3311,7 +3356,8 @@ pub(super) async fn publish_accepted_replay(
             StreamRuntime::new(None, None).deferring_metadata_drain(),
         ))
         .await?;
-        run.remember_retry_sources(&work.failed, passes).await?;
+        run.remember_retry_sources(&work.failed, passes, &config)
+            .await?;
         combined.recap.merge(std::mem::take(&mut work.recap));
         combined.rate_limit_observations += work.rate_limit_observations;
         super::models::merge_streaming_result(&mut combined, work);
@@ -3376,22 +3422,6 @@ pub(super) async fn after_delta(
         && !delta_result.checkpoint.identity_incomplete
         && !delta_result.checkpoint.interrupted
         && delta_result.checkpoint.state_write_failures == 0;
-    if config.inventory_reconciliation {
-        // The dispatcher already owns exactly one current inventory between
-        // these two delta passes. Do not start another implicit generation scan
-        // or replay here. Its durable request and retained source cursor remain
-        // until full selected coverage plus a raw-empty replay qualify; a
-        // changed replay cannot advance past newly observed unadmitted work.
-        if delta_safe {
-            delta_result.sync_token = delta.sync_token.clone();
-            *context
-                .inventory_membership_delta
-                .lock()
-                .map_err(|_poisoned| anyhow::anyhow!("Membership observation lock poisoned"))? =
-                Some(delta.membership);
-        }
-        return Ok(delta_result);
-    }
     let root = context.current().await?;
     if let Some(root) = &root {
         discover_missing_files(context, &root.id, &config.directory, Some(&cancel)).await?;

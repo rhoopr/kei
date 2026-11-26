@@ -8,8 +8,9 @@ use super::sparse_identity;
 use super::{CheckpointTransition, ScopedDbSyncToken, SqliteStateDb, SyncTokenStore};
 use crate::state::error::StateError;
 
-impl SqliteStateDb {
-    pub(crate) async fn begin_enum_progress(&self, zone: &str) -> Result<(), StateError> {
+#[async_trait]
+impl SyncTokenStore for SqliteStateDb {
+    async fn begin_enum_progress(&self, zone: &str) -> Result<(), StateError> {
         let key = format!("enum_in_progress:{zone}");
         let now = Utc::now().timestamp().to_string();
         self.with_conn("begin_enum_progress", move |conn| {
@@ -25,7 +26,7 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn end_enum_progress(&self, zone: &str) -> Result<(), StateError> {
+    async fn end_enum_progress(&self, zone: &str) -> Result<(), StateError> {
         let key = format!("enum_in_progress:{zone}");
         self.with_conn("end_enum_progress", move |conn| {
             conn.execute("DELETE FROM metadata WHERE key = ?1", [key])
@@ -35,7 +36,7 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn list_interrupted_enumerations(&self) -> Result<Vec<String>, StateError> {
+    async fn list_interrupted_enumerations(&self) -> Result<Vec<String>, StateError> {
         self.with_conn("list_interrupted_enumerations", move |conn| {
             let mut stmt = conn
                 .prepare("SELECT key FROM metadata WHERE key LIKE 'enum_in_progress:%'")
@@ -55,7 +56,7 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn get_metadata(&self, key: &str) -> Result<Option<String>, StateError> {
+    async fn get_metadata(&self, key: &str) -> Result<Option<String>, StateError> {
         let key = key.to_owned();
         self.with_conn("get_metadata", move |conn| {
             let value = conn
@@ -70,7 +71,7 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn set_metadata(&self, key: &str, value: &str) -> Result<(), StateError> {
+    async fn set_metadata(&self, key: &str, value: &str) -> Result<(), StateError> {
         let key = key.to_owned();
         let value = value.to_owned();
         self.with_conn("set_metadata", move |conn| {
@@ -85,7 +86,7 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn delete_metadata_by_prefix(&self, prefix: &str) -> Result<u64, StateError> {
+    async fn delete_metadata_by_prefix(&self, prefix: &str) -> Result<u64, StateError> {
         let prefix = prefix.to_owned();
         self.with_conn("delete_metadata_by_prefix", move |conn| {
             let mut stmt = conn
@@ -100,7 +101,7 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn commit_checkpoint_transition(
+    async fn commit_checkpoint_transition(
         &self,
         transition: CheckpointTransition,
     ) -> Result<(), StateError> {
@@ -132,14 +133,6 @@ impl SqliteStateDb {
                     )?;
                 }
             }
-            for (library, container, generation) in &transition.album_snapshots {
-                super::membership::complete_album_membership_snapshot_tx(
-                    &tx,
-                    library,
-                    container,
-                    *generation,
-                )?;
-            }
             for (key, value) in transition.metadata_updates {
                 tx.execute(
                     "INSERT INTO metadata (key, value) VALUES (?1, ?2) \
@@ -159,7 +152,7 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn get_scoped_db_sync_token(
+    async fn get_scoped_db_sync_token(
         &self,
         provider: &str,
         account: &str,
@@ -193,7 +186,7 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn upsert_scoped_db_sync_token(
+    async fn upsert_scoped_db_sync_token(
         &self,
         token: ScopedDbSyncToken,
     ) -> Result<(), StateError> {
@@ -225,7 +218,7 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn delete_scoped_db_sync_tokens(&self) -> Result<u64, StateError> {
+    async fn delete_scoped_db_sync_tokens(&self) -> Result<u64, StateError> {
         self.with_conn("delete_scoped_db_sync_tokens", move |conn| {
             let deleted = conn
                 .execute("DELETE FROM scoped_db_sync_tokens", [])
@@ -233,62 +226,6 @@ impl SqliteStateDb {
             Ok(deleted as u64)
         })
         .await
-    }
-}
-
-#[async_trait]
-impl SyncTokenStore for SqliteStateDb {
-    async fn get_metadata(&self, key: &str) -> Result<Option<String>, StateError> {
-        SqliteStateDb::get_metadata(self, key).await
-    }
-
-    async fn set_metadata(&self, key: &str, value: &str) -> Result<(), StateError> {
-        SqliteStateDb::set_metadata(self, key, value).await
-    }
-
-    async fn delete_metadata_by_prefix(&self, prefix: &str) -> Result<u64, StateError> {
-        SqliteStateDb::delete_metadata_by_prefix(self, prefix).await
-    }
-
-    async fn commit_checkpoint_transition(
-        &self,
-        transition: CheckpointTransition,
-    ) -> Result<(), StateError> {
-        SqliteStateDb::commit_checkpoint_transition(self, transition).await
-    }
-
-    async fn get_scoped_db_sync_token(
-        &self,
-        provider: &str,
-        account: &str,
-        shape_version: i64,
-        scope_hash: &str,
-    ) -> Result<Option<ScopedDbSyncToken>, StateError> {
-        SqliteStateDb::get_scoped_db_sync_token(self, provider, account, shape_version, scope_hash)
-            .await
-    }
-
-    async fn upsert_scoped_db_sync_token(
-        &self,
-        token: ScopedDbSyncToken,
-    ) -> Result<(), StateError> {
-        SqliteStateDb::upsert_scoped_db_sync_token(self, token).await
-    }
-
-    async fn delete_scoped_db_sync_tokens(&self) -> Result<u64, StateError> {
-        SqliteStateDb::delete_scoped_db_sync_tokens(self).await
-    }
-
-    async fn begin_enum_progress(&self, zone: &str) -> Result<(), StateError> {
-        SqliteStateDb::begin_enum_progress(self, zone).await
-    }
-
-    async fn end_enum_progress(&self, zone: &str) -> Result<(), StateError> {
-        SqliteStateDb::end_enum_progress(self, zone).await
-    }
-
-    async fn list_interrupted_enumerations(&self) -> Result<Vec<String>, StateError> {
-        SqliteStateDb::list_interrupted_enumerations(self).await
     }
 }
 

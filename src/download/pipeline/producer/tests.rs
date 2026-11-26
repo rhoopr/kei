@@ -1,3 +1,4 @@
+use crate::state::{DownloadStateStore, MetadataRewriteStore, ReportStateStore};
 use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};

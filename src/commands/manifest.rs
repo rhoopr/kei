@@ -214,6 +214,8 @@ fn push_csv_field(out: &mut String, field: &str) {
 
 #[cfg(test)]
 mod tests {
+    use crate::state::DownloadStateStore;
+    use crate::state::MembershipStore;
     use chrono::{TimeZone, Utc};
 
     use super::*;

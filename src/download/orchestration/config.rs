@@ -480,8 +480,6 @@ pub(crate) struct DownloadConfig {
     /// The runner owns a local writer phase after all selected zones and
     /// their database checkpoint. Standalone dispatch must finish its own work.
     pub(crate) post_sync_metadata: bool,
-    /// One upgrade-requested inventory guarded by retained-cursor replay.
-    pub(crate) inventory_reconciliation: bool,
     pub(crate) inventory_checkpoint: InventoryCheckpointPolicy,
     /// A due sparse source in another selected zone needs a fresh membership scan.
     pub(crate) sparse_membership_due: bool,
@@ -609,6 +607,13 @@ impl DownloadConfig {
             || self.folder_structure_smart_folders.as_ref() != self.folder_structure.as_str()
     }
 
+    pub(super) fn pass_key(&self, pass: &crate::commands::AlbumPass) -> String {
+        self.selection_context.as_ref().map_or_else(
+            || super::generation::pass_key(pass),
+            |context| context.pass_key(pass),
+        )
+    }
+
     /// Clone this config for a single download pass: pick the per-category
     /// template (`folder_structure_albums` for `PassKind::Album`,
     /// `folder_structure_smart_folders` for `PassKind::SmartFolder`,
@@ -642,12 +647,9 @@ impl DownloadConfig {
         }
         Self {
             primary_layout_source: Some(Arc::new(pass.album.clone())),
-            primary_layout_pass: Some(super::generation::pass_key(pass)),
+            primary_layout_pass: Some(self.pass_key(pass)),
             primary_layout_pass_kind: Some(pass.kind),
-            selection_pass: self
-                .selection_run
-                .as_ref()
-                .map(|_| super::generation::pass_key(pass)),
+            selection_pass: self.selection_run.as_ref().map(|_| self.pass_key(pass)),
             album_name: Some(Arc::clone(&pass.album.name)),
             folder_structure,
             exclude_asset_ids: Arc::clone(&pass.exclude_ids),
@@ -722,7 +724,6 @@ impl DownloadConfig {
     pub(crate) fn test_default() -> Self {
         use rustc_hash::FxHashSet;
         Self {
-            inventory_reconciliation: false,
             inventory_checkpoint: InventoryCheckpointPolicy::Ordinary,
             post_sync_metadata: false,
             directory: Arc::from(Path::new("/nonexistent/download_filter_tests")),

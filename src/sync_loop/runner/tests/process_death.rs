@@ -1,6 +1,8 @@
 //! Actual SIGKILL between durable production transitions, followed by reopen,
 //! production recovery, and two quiet cycles. This proves process death only;
 //! it does not model storage caches or power loss.
+use crate::state::SyncTokenStore;
+use crate::state::{DownloadStateStore, ReportStateStore, TempFileOwnershipStore};
 use std::collections::BTreeMap;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::ExitStatusExt;

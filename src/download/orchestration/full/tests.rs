@@ -1,3 +1,5 @@
+use crate::state::MembershipStore;
+use crate::state::{ReportStateStore, TempFileOwnershipStore};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

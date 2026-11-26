@@ -5,6 +5,8 @@ use super::{
 use crate::commands::AlbumPass;
 use crate::download::{DownloadOutcome, SyncMode};
 use crate::icloud::photos::PhotosSession;
+use crate::state::ReportStateStore;
+use crate::state::SyncTokenStore;
 use crate::sync_cycle::{CycleResult, run_cycle};
 use crate::sync_loop::test_support::{
     make_captured_cycle_album, make_run_cycle_config, make_run_cycle_library_state_with_album,

@@ -216,8 +216,9 @@ pub(super) fn complete_album_membership_snapshot_tx(
     refresh_container_groupings_tx(tx, library, container_id, None, None)
 }
 
-impl SqliteStateDb {
-    pub(crate) async fn add_asset_album(
+#[async_trait]
+impl MembershipStore for SqliteStateDb {
+    async fn add_asset_album(
         &self,
         library: &str,
         asset_id: &str,
@@ -250,7 +251,7 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn get_all_asset_albums(
+    async fn get_all_asset_albums(
         &self,
         library: &str,
     ) -> Result<Vec<(String, String)>, StateError> {
@@ -269,7 +270,7 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn get_all_asset_people(
+    async fn get_all_asset_people(
         &self,
         library: &str,
     ) -> Result<Vec<(String, String)>, StateError> {
@@ -288,7 +289,7 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn get_asset_groupings(
+    async fn get_asset_groupings(
         &self,
         library: &str,
         asset_ids: &[&str],
@@ -343,7 +344,7 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn upsert_album_container(
+    async fn upsert_album_container(
         &self,
         library: &str,
         container_id: &str,
@@ -389,7 +390,7 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn mark_album_container_deleted(
+    async fn mark_album_container_deleted(
         &self,
         library: &str,
         container_id: &str,
@@ -426,7 +427,7 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn start_album_membership_snapshot(
+    async fn start_album_membership_snapshot(
         &self,
         library: &str,
         container_id: &str,
@@ -469,7 +470,7 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn add_album_membership_to_snapshot(
+    async fn add_album_membership_to_snapshot(
         &self,
         library: &str,
         container_id: &str,
@@ -539,7 +540,7 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn upsert_album_membership_delta(
+    async fn upsert_album_membership_delta(
         &self,
         library: &str,
         container_id: &str,
@@ -591,7 +592,7 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn mark_album_membership_deleted(
+    async fn mark_album_membership_deleted(
         &self,
         library: &str,
         container_id: &str,
@@ -632,7 +633,7 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn complete_album_membership_snapshot(
+    async fn complete_album_membership_snapshot(
         &self,
         library: &str,
         container_id: &str,
@@ -652,7 +653,7 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn invalidate_album_membership_snapshot(
+    async fn invalidate_album_membership_snapshot(
         &self,
         library: &str,
         container_id: &str,
@@ -674,7 +675,7 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn selected_album_containers_have_complete_snapshots(
+    async fn selected_album_containers_have_complete_snapshots(
         &self,
         library: &str,
         container_ids: &[&str],
@@ -716,7 +717,7 @@ impl SqliteStateDb {
         .await
     }
 
-    pub(crate) async fn get_live_selected_album_memberships_for_asset(
+    async fn get_live_selected_album_memberships_for_asset(
         &self,
         library: &str,
         asset_record_name: &str,
@@ -783,171 +784,6 @@ impl SqliteStateDb {
         let conn = self.acquire_lock("test_allow_asset_album_writes").unwrap();
         conn.execute_batch("DROP TRIGGER fail_asset_album_writes")
             .unwrap();
-    }
-}
-
-#[async_trait]
-impl MembershipStore for SqliteStateDb {
-    async fn add_asset_album(
-        &self,
-        library: &str,
-        asset_id: &str,
-        album_name: &str,
-        source: &str,
-    ) -> Result<(), StateError> {
-        SqliteStateDb::add_asset_album(self, library, asset_id, album_name, source).await
-    }
-
-    async fn get_all_asset_albums(
-        &self,
-        library: &str,
-    ) -> Result<Vec<(String, String)>, StateError> {
-        SqliteStateDb::get_all_asset_albums(self, library).await
-    }
-
-    async fn get_all_asset_people(
-        &self,
-        library: &str,
-    ) -> Result<Vec<(String, String)>, StateError> {
-        SqliteStateDb::get_all_asset_people(self, library).await
-    }
-
-    async fn get_asset_groupings(
-        &self,
-        library: &str,
-        asset_ids: &[&str],
-    ) -> Result<AssetGroupingRows, StateError> {
-        SqliteStateDb::get_asset_groupings(self, library, asset_ids).await
-    }
-
-    async fn upsert_album_container(
-        &self,
-        library: &str,
-        container_id: &str,
-        album_name: &str,
-        pass_kind: &str,
-    ) -> Result<(), StateError> {
-        SqliteStateDb::upsert_album_container(self, library, container_id, album_name, pass_kind)
-            .await
-    }
-
-    async fn mark_album_container_deleted(
-        &self,
-        library: &str,
-        container_id: &str,
-    ) -> Result<(), StateError> {
-        SqliteStateDb::mark_album_container_deleted(self, library, container_id).await
-    }
-
-    async fn start_album_membership_snapshot(
-        &self,
-        library: &str,
-        container_id: &str,
-        enum_config_hash: Option<&str>,
-    ) -> Result<i64, StateError> {
-        SqliteStateDb::start_album_membership_snapshot(
-            self,
-            library,
-            container_id,
-            enum_config_hash,
-        )
-        .await
-    }
-
-    async fn add_album_membership_to_snapshot(
-        &self,
-        library: &str,
-        container_id: &str,
-        generation: i64,
-        asset_record_name: &str,
-        master_record_name: Option<&str>,
-        source: &str,
-    ) -> Result<(), StateError> {
-        SqliteStateDb::add_album_membership_to_snapshot(
-            self,
-            library,
-            container_id,
-            generation,
-            asset_record_name,
-            master_record_name,
-            source,
-        )
-        .await
-    }
-
-    async fn upsert_album_membership_delta(
-        &self,
-        library: &str,
-        container_id: &str,
-        asset_record_name: &str,
-        master_record_name: Option<&str>,
-        source: &str,
-    ) -> Result<bool, StateError> {
-        SqliteStateDb::upsert_album_membership_delta(
-            self,
-            library,
-            container_id,
-            asset_record_name,
-            master_record_name,
-            source,
-        )
-        .await
-    }
-
-    async fn mark_album_membership_deleted(
-        &self,
-        library: &str,
-        container_id: &str,
-        asset_record_name: &str,
-    ) -> Result<bool, StateError> {
-        SqliteStateDb::mark_album_membership_deleted(self, library, container_id, asset_record_name)
-            .await
-    }
-
-    async fn complete_album_membership_snapshot(
-        &self,
-        library: &str,
-        container_id: &str,
-        generation: i64,
-    ) -> Result<(), StateError> {
-        SqliteStateDb::complete_album_membership_snapshot(self, library, container_id, generation)
-            .await
-    }
-
-    async fn invalidate_album_membership_snapshot(
-        &self,
-        library: &str,
-        container_id: &str,
-    ) -> Result<(), StateError> {
-        SqliteStateDb::invalidate_album_membership_snapshot(self, library, container_id).await
-    }
-
-    async fn selected_album_containers_have_complete_snapshots(
-        &self,
-        library: &str,
-        container_ids: &[&str],
-    ) -> Result<bool, StateError> {
-        SqliteStateDb::selected_album_containers_have_complete_snapshots(
-            self,
-            library,
-            container_ids,
-        )
-        .await
-    }
-
-    async fn get_live_selected_album_memberships_for_asset(
-        &self,
-        library: &str,
-        asset_record_name: &str,
-        selected_container_ids: &[&str],
-    ) -> Result<Vec<AlbumMembershipRecord>, StateError> {
-        SqliteStateDb::get_live_selected_album_memberships_for_asset(
-            self,
-            library,
-            asset_record_name,
-            selected_container_ids,
-        )
-        .await
     }
 }
 

@@ -2,6 +2,8 @@
 
 #[cfg(feature = "xmp")]
 use crate::download::filter::MetadataPayload;
+#[cfg(feature = "xmp")]
+use crate::state::{DownloadStateStore, MetadataRewriteStore};
 use chrono::{DateTime, FixedOffset, TimeZone};
 
 /// Capture-local time for an asset whose stored offset is +11:00, which is

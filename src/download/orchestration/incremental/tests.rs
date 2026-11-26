@@ -1,3 +1,5 @@
+use crate::state::{DownloadStateStore, MetadataRewriteStore, ReportStateStore};
+use crate::state::{MembershipStore, SyncTokenStore};
 #[cfg(feature = "xmp")]
 use std::collections::HashMap;
 #[cfg(feature = "xmp")]
@@ -10,18 +12,21 @@ use reqwest::Client;
 use rustc_hash::FxHashSet;
 use serde_json::json;
 use tempfile::TempDir;
-use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::commands::{AlbumPass, PassKind};
+use crate::download::file;
+#[cfg(feature = "xmp")]
+use crate::download::filter;
 #[cfg(feature = "xmp")]
 use crate::download::metadata_rewrite::{self, CaptureTimestampRepair};
 #[cfg(feature = "xmp")]
 use crate::download::pipeline::{MetadataFlags, StreamRuntime, stream_and_download_from_stream};
-use crate::download::{file, filter};
 use crate::icloud::photos::PhotoAsset;
 use crate::state::{SqliteStateDb, VersionSizeKey};
-use crate::test_helpers::{MockPhotosFlow, TestAssetRecord, mock_photo_query_page};
+use crate::test_helpers::MockPhotosFlow;
+#[cfg(feature = "xmp")]
+use crate::test_helpers::TestAssetRecord;
 use crate::types::{FileMatchPolicy, RawPolicy};
 
 use super::super::config::DownloadConfig;
@@ -33,208 +38,15 @@ use super::super::models::{
     DownloadControls, DownloadOutcome, DownloadReporting, DownloadRunMode, DownloadStore,
     PROVIDER_METADATA_STATE_WRITE_FAILED_REASON, SyncMode,
 };
+#[cfg(feature = "xmp")]
+use super::super::test_support::changes_zone_session_with_query_page;
 use super::super::test_support::{
-    changes_album, changes_album_with_container, changes_zone_session,
-    changes_zone_session_with_query_page, incremental_photo_records,
-    incremental_photo_records_with_favorite, incremental_photo_records_with_url,
-    incremental_test_config, mock_album, relation_delete_record, seed_complete_album_snapshot,
-    seed_downloaded_metadata_asset, test_config, unused_unfiled_changes_pass,
+    changes_album, changes_album_with_container, changes_zone_session, incremental_photo_records,
+    incremental_photo_records_with_favorite, incremental_photo_records_with_url, mock_album,
+    relation_delete_record, seed_complete_album_snapshot, seed_downloaded_metadata_asset,
+    test_config, unused_unfiled_changes_pass,
 };
-use super::{
-    coalesce_collecting_assets, download_photos_incremental,
-    download_photos_incremental_collecting, download_photos_incremental_collecting_inner,
-};
-
-#[test]
-fn collecting_duplicate_admission_preserves_distinct_observations() {
-    let records = incremental_photo_records("duplicate");
-    let make =
-        |records: &[serde_json::Value]| PhotoAsset::new(records[0].clone(), records[1].clone());
-    let base = make(&records);
-    let mut renewal = records.clone();
-    renewal[0]["fields"]["resOriginalRes"]["value"]["downloadURL"] =
-        json!("https://p01.icloud-content.com/renewed.jpg");
-    let renewed = make(&renewal);
-    let inputs = vec![(base.clone(), 0), (renewed.clone(), 0)];
-    let admitted = coalesce_collecting_assets(&inputs, "PrimarySync");
-    assert_eq!(admitted.len(), 1);
-    assert_eq!(
-        admitted[0].0.versions()[0].1.url.as_ref(),
-        "https://p01.icloud-content.com/renewed.jpg"
-    );
-
-    for (label, index, pointer, value) in [
-        (
-            "checksum",
-            0,
-            "/fields/resOriginalRes/value/fileChecksum",
-            json!("different"),
-        ),
-        ("size", 0, "/fields/resOriginalRes/value/size", json!(1025)),
-        (
-            "resource type",
-            0,
-            "/fields/resOriginalFileType/value",
-            json!("public.png"),
-        ),
-        (
-            "filename",
-            0,
-            "/fields/filenameEnc/value",
-            json!("other.jpg"),
-        ),
-        ("master", 0, "/recordName", json!("other-master")),
-        ("child", 1, "/recordName", json!("other-child")),
-        (
-            "capture date",
-            1,
-            "/fields/assetDate/value",
-            json!(1700000000001i64),
-        ),
-        (
-            "added date",
-            1,
-            "/fields/addedDate/value",
-            json!(1700000000001i64),
-        ),
-        (
-            "rendition width",
-            0,
-            "/fields/resOriginalWidth/value",
-            json!(101),
-        ),
-        (
-            "malformed resource",
-            0,
-            "/fields/resOriginalRes/value/downloadURL",
-            json!("not-a-url"),
-        ),
-    ] {
-        let mut changed = records.clone();
-        *changed[index].pointer_mut(pointer).unwrap() = value;
-        let inputs = vec![(base.clone(), 0), (make(&changed), 0)];
-        assert_eq!(
-            coalesce_collecting_assets(&inputs, "PrimarySync").len(),
-            2,
-            "{label}"
-        );
-    }
-    let mut changed = records.clone();
-    changed[1]["fields"]["isFavorite"] = json!({"value": 1});
-    let changed = make(&changed);
-    let inputs = vec![(base.clone(), 0), (changed, 0), (base.clone(), 0)];
-    assert_eq!(
-        coalesce_collecting_assets(&inputs, "PrimarySync").len(),
-        3,
-        "A/B/A is not globally deduplicated"
-    );
-    let inputs = vec![
-        (base.clone(), 0),
-        (base.clone(), 1),
-        (base.clone().with_source_zone(Arc::from("SharedSync")), 0),
-        (
-            base.clone()
-                .with_state_record_name(Arc::from("legacy-state")),
-            0,
-        ),
-    ];
-    assert_eq!(
-        coalesce_collecting_assets(&inputs, "PrimarySync").len(),
-        4,
-        "passes, libraries and state identities remain distinct"
-    );
-}
-
-#[test]
-fn collecting_duplicate_admission_preserves_companions_and_url_aliases() {
-    let mut records = incremental_photo_records("live");
-    records[0]["fields"]["resOriginalVidComplRes"] = json!({"value": {"downloadURL":"https://p01.icloud-content.com/motion", "size": 50, "fileChecksum":"motion"}});
-    records[0]["fields"]["resOriginalVidComplFileType"] =
-        json!({"value":"com.apple.quicktime-movie"});
-    let make =
-        |records: &[serde_json::Value]| PhotoAsset::new(records[0].clone(), records[1].clone());
-    let original = make(&records);
-    assert!(original.is_live_photo());
-    let mut renewed = records.clone();
-    renewed[0]["fields"]["resOriginalRes"]["value"]["downloadURL"] =
-        json!("https://p01.icloud-content.com/new-still");
-    renewed[0]["fields"]["resOriginalVidComplRes"]["value"]["downloadURL"] =
-        json!("https://p01.icloud-content.com/new-motion");
-    let renewed = make(&renewed);
-    let inputs = vec![(original.clone(), 0), (renewed, 0)];
-    let admitted = coalesce_collecting_assets(&inputs, "PrimarySync");
-    assert_eq!(admitted.len(), 1);
-    assert!(admitted[0].0.is_live_photo());
-    assert_eq!(admitted[0].0.versions().len(), 2);
-    let mut aliased = records.clone();
-    aliased[0]["fields"]["resOriginalVidComplRes"]["value"]["downloadURL"] =
-        records[0]["fields"]["resOriginalRes"]["value"]["downloadURL"].clone();
-    let inputs = vec![(original.clone(), 0), (make(&aliased), 0)];
-    assert_eq!(
-        coalesce_collecting_assets(&inputs, "PrimarySync").len(),
-        2,
-        "URL alias changes selection"
-    );
-    records[0]["fields"]["resOriginalVidComplRes"]["value"]["fileChecksum"] = json!("new-motion");
-    let inputs = vec![(original, 0), (make(&records), 0)];
-    assert_eq!(
-        coalesce_collecting_assets(&inputs, "PrimarySync").len(),
-        2,
-        "changed companion is new evidence"
-    );
-}
-
-#[test]
-fn collecting_duplicate_admission_tracks_master_and_state_transitions_per_child() {
-    let a_records = incremental_photo_records("master-a");
-    let mut b_records = incremental_photo_records("master-b");
-    b_records[1]["recordName"] = a_records[1]["recordName"].clone();
-    let a = PhotoAsset::new(a_records[0].clone(), a_records[1].clone());
-    let b = PhotoAsset::new(b_records[0].clone(), b_records[1].clone());
-    let other_state = a.clone().with_state_record_name(Arc::from("legacy-state"));
-    for (label, middle) in [
-        ("master", b),
-        ("state", other_state),
-        (
-            "source-zone-evidence",
-            a.clone().with_source_zone(Arc::from("PrimarySync")),
-        ),
-    ] {
-        let inputs = vec![(a.clone(), 0), (middle, 0), (a.clone(), 0)];
-        let admitted = coalesce_collecting_assets(&inputs, "PrimarySync");
-        assert_eq!(admitted.len(), 3, "{label} A/B/A must stay in order");
-        assert!(std::ptr::eq(admitted[0].0, &inputs[0].0));
-        assert!(std::ptr::eq(admitted[1].0, &inputs[1].0));
-        assert!(std::ptr::eq(admitted[2].0, &inputs[2].0));
-    }
-
-    let other_child = PhotoAsset::new(
-        a_records[0].clone(),
-        incremental_photo_records("other")[1].clone(),
-    );
-    for (label, other, pass) in [
-        ("child", other_child, 0),
-        (
-            "zone",
-            a.clone().with_source_zone(Arc::from("SharedSync")),
-            0,
-        ),
-        ("pass", a.clone(), 1),
-    ] {
-        let inputs = vec![(a.clone(), 0), (other, pass), (a.clone(), 0)];
-        let admitted = coalesce_collecting_assets(&inputs, "PrimarySync");
-        assert_eq!(
-            admitted.len(),
-            2,
-            "{label} does not split an independent stream"
-        );
-        assert!(
-            std::ptr::eq(admitted[0].0, &inputs[2].0),
-            "later equivalent URL is retained"
-        );
-        assert!(std::ptr::eq(admitted[1].0, &inputs[1].0));
-    }
-}
+use super::super::test_support::{dispatch_delta, read_delta};
 
 #[tokio::test]
 async fn collecting_master_aba_preserves_final_durable_mapping() {
@@ -284,7 +96,7 @@ async fn collecting_master_aba_preserves_final_durable_mapping() {
     config.directory = Arc::from(root.path().join("media"));
     config.concurrent_downloads = 1;
     config.state_db = Some(db.clone());
-    let result = download_photos_incremental_collecting(
+    let result = read_delta(
         &Client::new(),
         &[pass],
         &Arc::new(config),
@@ -294,15 +106,9 @@ async fn collecting_master_aba_preserves_final_durable_mapping() {
     )
     .await
     .unwrap();
-    assert!(
-        matches!(result.outcome, DownloadOutcome::Success),
-        "{result:?}"
-    );
-    assert_eq!(
-        result.stats.downloaded, 3,
-        "all three distinct observations reach execution"
-    );
-    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    assert!(result.state_transition_failures == 0, "{result:?}");
+    assert_eq!(result.created_count, 3);
+    assert!(server.received_requests().await.unwrap().is_empty());
     assert_eq!(
         db.get_master_record_name_for_asset("PrimarySync", "asset-master-a")
             .await
@@ -321,12 +127,7 @@ async fn collecting_master_aba_preserves_final_durable_mapping() {
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
     };
-    assert_eq!(
-        observations,
-        [
-            "master-a", "master-b", "master-a", "master-a", "master-b", "master-a"
-        ]
-    );
+    assert_eq!(observations, ["master-a", "master-b", "master-a"]);
     drop(db);
     let reopened = SqliteStateDb::open(&database).await.unwrap();
     assert_eq!(
@@ -337,35 +138,6 @@ async fn collecting_master_aba_preserves_final_durable_mapping() {
             .as_deref(),
         Some("master-a")
     );
-}
-
-async fn run_incremental_strategy(
-    collecting: bool,
-    passes: &[AlbumPass],
-    config: &Arc<DownloadConfig>,
-    cursor: &str,
-) -> anyhow::Result<super::super::models::SyncResult> {
-    if collecting {
-        download_photos_incremental_collecting(
-            &Client::new(),
-            passes,
-            config,
-            cursor,
-            DownloadControls::download_hidden(),
-            CancellationToken::new(),
-        )
-        .await
-    } else {
-        download_photos_incremental(
-            &Client::new(),
-            passes,
-            config,
-            cursor,
-            DownloadControls::download_hidden(),
-            CancellationToken::new(),
-        )
-        .await
-    }
 }
 
 async fn relation_removed_metadata_edit_fixture(
@@ -406,7 +178,7 @@ async fn relation_removed_metadata_edit_fixture(
 }
 
 #[tokio::test]
-async fn incremental_multi_page_unfiled_streams_through_bounded_pipeline() {
+async fn delta_reader_consumes_all_pages_before_reporting_the_successor() {
     let session = MockPhotosFlow::new()
         .changes_zone_page(
             incremental_photo_records_with_url(
@@ -442,7 +214,7 @@ async fn incremental_multi_page_unfiled_streams_through_bounded_pipeline() {
     config.state_db = Some(db);
     config.concurrent_downloads = 1;
 
-    let result = download_photos_incremental(
+    let result = read_delta(
         &Client::new(),
         &passes,
         &Arc::new(config),
@@ -453,78 +225,9 @@ async fn incremental_multi_page_unfiled_streams_through_bounded_pipeline() {
     .await
     .expect("multi-page incremental sync should succeed");
 
-    assert!(
-        matches!(result.outcome, DownloadOutcome::Success),
-        "result: {result:?}"
-    );
-    assert_eq!(result.sync_token, None);
-    assert_eq!(result.stats.downloaded, 2);
-}
-
-#[tokio::test]
-async fn issue765_cancel_backpressured_incremental_producer_with_receiver_retained() {
-    const DRAIN_BOUND: Duration = Duration::from_secs(1);
-    const CLEANUP_BOUND: Duration = Duration::from_secs(5);
-    // Progressing pages respect the 200-record request limit.
-    let session = [
-        (0..100, "page-one", true),
-        (100..200, "page-two", true),
-        (200..250, "zone-token-after", false),
-    ]
-    .into_iter()
-    .fold(MockPhotosFlow::new(), |flow, (range, token, more)| {
-        let records = range
-            .flat_map(|index| incremental_photo_records(&format!("BACKPRESSURE_{index}")))
-            .collect();
-        flow.changes_zone_page(records, token, more)
-    })
-    .build();
-    let pass = AlbumPass {
-        kind: PassKind::Unfiled,
-        album: mock_album("Library", session),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    };
-    let directory = TempDir::new().unwrap();
-    let mut config = test_config();
-    config.directory = Arc::from(directory.path());
-    config.concurrent_downloads = 1;
-    let cancel = CancellationToken::new();
-    let pending = Arc::new(tokio::sync::Notify::new());
-    let (assets, mut producer) = super::stream_incremental_assets_for_single_unfiled_pass(
-        pass,
-        Arc::new(config),
-        "zone-token-before".to_owned(),
-        DownloadRunMode::Download,
-        cancel.clone(),
-        Some(pending.clone()),
-    );
-    let blocked = tokio::time::timeout(CLEANUP_BOUND, pending.notified()).await;
-    if blocked.is_err() {
-        producer.abort();
-        let _ = tokio::time::timeout(CLEANUP_BOUND, &mut producer)
-            .await
-            .unwrap();
-    }
-    blocked.expect("production send must first be polled Pending");
-    assert!(!producer.is_finished());
-    cancel.cancel();
-    let result = tokio::time::timeout(DRAIN_BOUND, &mut producer).await;
-    if result.is_err() {
-        producer.abort();
-        let _ = tokio::time::timeout(CLEANUP_BOUND, &mut producer)
-            .await
-            .expect("aborted synthetic producer must join");
-    }
-    drop(assets);
-    let summary = result
-        .expect("shutdown must not wait for retained channel capacity")
-        .expect("producer task joins")
-        .expect("producer returns a partial summary");
-    assert_eq!(
-        summary.total_events, 3,
-        "two queued assets and one blocked send"
-    );
-    assert_eq!(summary.sync_token, None);
+    assert!(result.state_transition_failures == 0, "result: {result:?}");
+    assert_eq!(result.created_count, 2);
+    assert_eq!(result.sync_token.as_deref(), Some("zone-token-after"));
 }
 
 // ── extract_skip_candidates tests ──────────────────────────────
@@ -622,7 +325,7 @@ async fn incremental_sync_queries_zone_changes_once_per_library() {
         },
         AlbumPass {
             kind: PassKind::Album,
-            album: changes_album("album_b", session),
+            album: changes_album("album_b", session.clone()),
             exclude_ids: Arc::new(FxHashSet::default()),
         },
     ];
@@ -631,7 +334,7 @@ async fn incremental_sync_queries_zone_changes_once_per_library() {
     let dir = TempDir::new().expect("temp dir");
     config.directory = Arc::from(dir.path());
 
-    let result = download_photos_incremental(
+    let result = read_delta(
         &Client::new(),
         &passes,
         &Arc::new(config),
@@ -640,13 +343,11 @@ async fn incremental_sync_queries_zone_changes_once_per_library() {
         CancellationToken::new(),
     )
     .await
-    .expect("print-only incremental sync should succeed");
+    .expect("delta reader should succeed");
+    assert_eq!(session.count_query_count(), 0);
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
-    assert_eq!(
-        result.sync_token, None,
-        "print-only mode must not advance the sync token"
-    );
+    assert!(result.state_transition_failures == 0);
+    assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
@@ -824,7 +525,7 @@ async fn album_membership_rewrites_every_finalized_path_after_restart() {
         tokio::fs::write(&sidecars[0], b"not parseable XMP")
             .await
             .unwrap();
-        let failed = download_photos_incremental_collecting(
+        let delta = read_delta(
             &Client::new(),
             std::slice::from_ref(&pass),
             &Arc::new(config.clone()),
@@ -834,11 +535,17 @@ async fn album_membership_rewrites_every_finalized_path_after_restart() {
         )
         .await
         .unwrap();
-        assert!(
-            matches!(failed.outcome, DownloadOutcome::PartialFailure { .. }),
-            "{failed:?}"
-        );
-        assert_eq!(failed.stats.downloaded, 0);
+        assert!(delta.token_unsafe_reason.is_none(), "{delta:?}");
+        let failed = drain_pending_metadata_rewrites(
+            db.as_ref(),
+            &config.metadata,
+            CaptureTimestampRepair::Preserve,
+            &["PrimarySync"],
+            config.temp_suffix.clone(),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(failed.failed, 1);
         assert_eq!(
             tokio::fs::read(&sidecars[0]).await.unwrap(),
             b"not parseable XMP"
@@ -853,7 +560,7 @@ async fn album_membership_rewrites_every_finalized_path_after_restart() {
         tokio::fs::write(&sidecars[0], original_sidecar)
             .await
             .unwrap();
-        let repaired = download_photos_incremental_collecting(
+        let delta = read_delta(
             &Client::new(),
             std::slice::from_ref(&pass),
             &Arc::new(config.clone()),
@@ -863,11 +570,17 @@ async fn album_membership_rewrites_every_finalized_path_after_restart() {
         )
         .await
         .unwrap();
-        assert!(
-            matches!(repaired.outcome, DownloadOutcome::Success),
-            "{repaired:?}"
-        );
-        assert_eq!(repaired.stats.downloaded, 0);
+        assert!(delta.token_unsafe_reason.is_none(), "{delta:?}");
+        let repaired = drain_pending_metadata_rewrites(
+            db.as_ref(),
+            &config.metadata,
+            CaptureTimestampRepair::Preserve,
+            &["PrimarySync"],
+            config.temp_suffix.clone(),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(repaired.failed, 0);
         let mut mtimes = Vec::new();
         for (media, sidecar) in paths.iter().zip(&sidecars) {
             if embed_xmp {
@@ -904,21 +617,27 @@ async fn album_membership_rewrites_every_finalized_path_after_restart() {
                 .unwrap()
                 .is_empty()
         );
-        let steady = download_photos_incremental_collecting(
+        let delta = read_delta(
             &Client::new(),
             &[pass],
-            &Arc::new(config),
+            &Arc::new(config.clone()),
             "token-full",
             DownloadControls::download_hidden(),
             CancellationToken::new(),
         )
         .await
         .unwrap();
-        assert!(
-            matches!(steady.outcome, DownloadOutcome::Success),
-            "{steady:?}"
-        );
-        assert_eq!(steady.stats.downloaded, 0);
+        assert!(delta.token_unsafe_reason.is_none(), "{delta:?}");
+        let steady = drain_pending_metadata_rewrites(
+            db.as_ref(),
+            &config.metadata,
+            CaptureTimestampRepair::Preserve,
+            &["PrimarySync"],
+            config.temp_suffix.clone(),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(steady.failed, 0);
         for (sidecar, before) in sidecars.iter().zip(mtimes) {
             assert_eq!(
                 tokio::fs::metadata(sidecar)
@@ -1061,7 +780,7 @@ async fn album_membership_first_xmp_and_tracked_path_removal() {
         exclude_ids: Arc::new(FxHashSet::default()),
     };
     for _ in 0..2 {
-        let removed = download_photos_incremental_collecting(
+        let delta = read_delta(
             &Client::new(),
             std::slice::from_ref(&pass),
             &Arc::new(config.clone()),
@@ -1071,11 +790,17 @@ async fn album_membership_first_xmp_and_tracked_path_removal() {
         )
         .await
         .unwrap();
-        assert!(
-            matches!(removed.outcome, DownloadOutcome::Success),
-            "{removed:?}"
-        );
-        assert_eq!(removed.stats.downloaded, 0);
+        assert!(delta.token_unsafe_reason.is_none(), "{delta:?}");
+        let removed = drain_pending_metadata_rewrites(
+            db.as_ref(),
+            &config.metadata,
+            CaptureTimestampRepair::Preserve,
+            &["PrimarySync"],
+            config.temp_suffix.clone(),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(removed.failed, 0);
         assert_eq!(
             subjects(&tokio::fs::read_to_string(&sidecar_path).await.unwrap()),
             ["Family"]
@@ -1094,108 +819,13 @@ async fn album_membership_first_xmp_and_tracked_path_removal() {
 }
 
 #[tokio::test]
-async fn collecting_album_membership_failure_replays_without_redownloading() {
-    let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
-    let dir = TempDir::new().expect("temp dir");
-    let records = incremental_photo_records("COLLECTED_GROUPING");
-    let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
-    seed_complete_album_snapshot(
-        db.as_ref(),
-        "container-vacation",
-        "Vacation",
-        &[("asset-COLLECTED_GROUPING", "COLLECTED_GROUPING")],
-    )
-    .await;
-    let change_calls = Arc::new(AtomicUsize::new(0));
-    let pass = AlbumPass {
-        kind: PassKind::Album,
-        album: changes_album_with_container(
-            "Vacation",
-            Some("container-vacation"),
-            changes_zone_session(Arc::clone(&change_calls), records),
-        ),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    };
-    let mut config = test_config();
-    config.directory = Arc::from(dir.path());
-    config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
-    let media_path = seed_downloaded_metadata_asset(db.as_ref(), &config, &pass, &asset).await;
-    let config = Arc::new(config);
-    let media_before = tokio::fs::read(&media_path)
-        .await
-        .expect("read seeded media");
-
-    db.fail_asset_album_writes_for_test();
-    let failed = download_photos_incremental_collecting(
-        &Client::new(),
-        std::slice::from_ref(&pass),
-        &config,
-        "zone-token-prev",
-        DownloadControls::download_hidden(),
-        CancellationToken::new(),
-    )
-    .await
-    .expect("membership failure should return a partial result");
-
-    assert!(matches!(
-        failed.outcome,
-        DownloadOutcome::PartialFailure { failed_count: 1 }
-    ));
-    assert_eq!(failed.stats.state_write_failures, 1);
-    assert_eq!(failed.stats.downloaded, 0);
-    assert!(
-        db.get_all_asset_albums("PrimarySync")
-            .await
-            .expect("read missing album membership")
-            .is_empty(),
-        "the injected failure must leave the compatibility relationship absent"
-    );
-
-    db.allow_asset_album_writes_for_test();
-    for cycle in 2..=3 {
-        let recovered = download_photos_incremental_collecting(
-            &Client::new(),
-            std::slice::from_ref(&pass),
-            &config,
-            "zone-token-prev",
-            DownloadControls::download_hidden(),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap_or_else(|error| panic!("grouping replay cycle {cycle} failed: {error}"));
-
-        assert!(matches!(recovered.outcome, DownloadOutcome::Success));
-        assert_eq!(recovered.stats.state_write_failures, 0);
-        assert_eq!(
-            recovered.stats.downloaded, 0,
-            "cycle {cycle} must not redownload landed media"
-        );
-        assert_eq!(
-            db.get_all_asset_albums("PrimarySync")
-                .await
-                .expect("read recovered album membership"),
-            vec![("COLLECTED_GROUPING".to_string(), "Vacation".to_string())],
-            "cycle {cycle} must leave one idempotent relationship"
-        );
-    }
-    assert_eq!(change_calls.load(Ordering::SeqCst), 3);
-    assert_eq!(
-        tokio::fs::read(&media_path)
-            .await
-            .expect("read stable media"),
-        media_before,
-        "grouping replay must not change landed media"
-    );
-}
-
-#[tokio::test]
 async fn filtered_original_replacement_refreshes_metadata_and_advances_checkpoint() {
     for (item_type, swapped_original_only) in [
         ("public.jpeg", false),
         ("com.apple.quicktime-movie", false),
         ("public.jpeg", true),
     ] {
-        for collecting in [false, true] {
+        {
             let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
             let dir = TempDir::new().unwrap();
             let mut records = incremental_photo_records_with_favorite("REPLACED", false);
@@ -1294,21 +924,22 @@ async fn filtered_original_replacement_refreshes_metadata_and_advances_checkpoin
                     ),
                     exclude_ids: Arc::new(FxHashSet::default()),
                 };
-                let result = run_incremental_strategy(
-                    collecting,
+                let result = read_delta(
+                    &Client::new(),
                     &[pass],
                     &Arc::new(config.clone()),
                     &token,
+                    DownloadControls::download_hidden(),
+                    CancellationToken::new(),
                 )
                 .await
                 .unwrap();
                 assert!(
-                    matches!(result.outcome, DownloadOutcome::Success),
-                    "{item_type}, swapped={swapped_original_only}, collecting={collecting}, cycle={cycle}: {result:?}"
+                    result.state_transition_failures == 0,
+                    "{item_type}, swapped={swapped_original_only}, cycle={cycle}: {result:?}"
                 );
-                assert_eq!(result.stats.downloaded, 0);
-                assert_eq!(result.stats.state_write_failures, 0);
-                assert!(!result.stats.sync_token_blocked);
+                assert_eq!(result.state_transition_failures, 0);
+                assert!(result.token_unsafe_reason.is_none());
                 assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
                 token = result.sync_token.unwrap();
                 let rows = db.get_downloaded_page(0, 10).await.unwrap();
@@ -1421,7 +1052,7 @@ async fn raw_policy_incremental_metadata_refresh_captures_unknown_bytes_without_
                 ),
                 exclude_ids: Arc::new(FxHashSet::default()),
             };
-            let result = download_photos_incremental_collecting(
+            let result = read_delta(
                 &Client::new(),
                 &[pass],
                 &Arc::new(config.clone()),
@@ -1431,13 +1062,9 @@ async fn raw_policy_incremental_metadata_refresh_captures_unknown_bytes_without_
             )
             .await
             .unwrap();
-            assert_eq!(result.stats.downloaded, 0);
-            assert!(
-                matches!(result.outcome, DownloadOutcome::Success),
-                "{result:?}"
-            );
+            assert!(result.state_transition_failures == 0, "{result:?}");
             assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
-            assert_eq!(result.stats.state_write_failures, 0);
+            assert_eq!(result.state_transition_failures, 0);
             let rows = db.get_downloaded_page(0, 10).await.unwrap();
             for row in &rows {
                 let initial = before
@@ -1549,7 +1176,7 @@ async fn collecting_metadata_edit_refreshes_catalogue_without_duplicate_for_both
         assert_eq!(initial.len(), 2);
         let config = Arc::new(config);
         db.fail_provider_metadata_refresh_for_test();
-        let failed = download_photos_incremental_collecting(
+        let failed = read_delta(
             &Client::new(),
             std::slice::from_ref(&pass),
             &config,
@@ -1559,16 +1186,11 @@ async fn collecting_metadata_edit_refreshes_catalogue_without_duplicate_for_both
         )
         .await
         .unwrap();
-        assert!(matches!(
-            failed.outcome,
-            DownloadOutcome::PartialFailure { .. }
-        ));
-        assert_eq!(failed.stats.downloaded, 0);
-        assert_eq!(failed.sync_token, None);
-        assert!(failed.stats.sync_token_blocked);
-        assert!(failed.stats.state_write_failures > 0);
+        assert!(failed.state_transition_failures > 0);
+        assert!(failed.token_unsafe_reason.is_some());
+        assert!(failed.state_transition_failures > 0);
         assert_eq!(
-            failed.stats.sync_token_blocked_reason,
+            failed.token_unsafe_reason,
             Some(PROVIDER_METADATA_STATE_WRITE_FAILED_REASON)
         );
         for row in db.get_downloaded_page(0, 10).await.unwrap() {
@@ -1605,7 +1227,7 @@ async fn collecting_metadata_edit_refreshes_catalogue_without_duplicate_for_both
             if cycle == 1 {
                 db.fail_provider_metadata_refresh_for_test();
             }
-            let result = download_photos_incremental_collecting(
+            let result = read_delta(
                 &Client::new(),
                 std::slice::from_ref(&pass),
                 &config,
@@ -1616,10 +1238,9 @@ async fn collecting_metadata_edit_refreshes_catalogue_without_duplicate_for_both
             .await
             .expect("metadata-only incremental sync should complete");
 
-            assert!(matches!(result.outcome, DownloadOutcome::Success));
-            assert_eq!(result.stats.downloaded, 0, "policy: {policy:?}");
+            assert!(result.state_transition_failures == 0);
             assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
-            assert_eq!(result.stats.state_write_failures, 0);
+            assert_eq!(result.state_transition_failures, 0);
             let refreshed = db
                 .get_downloaded_page(0, 10)
                 .await
@@ -1683,9 +1304,8 @@ async fn collecting_unrouted_metadata_edit_refreshes_catalogue_and_queues_rewrit
     let dir = TempDir::new().expect("temp dir");
     let (passes, mut config, media_path) = relation_removed_metadata_edit_fixture(&db, &dir).await;
     config.metadata.xmp_sidecar = true;
-    db.fail_metadata_marker_clear_for_test();
 
-    let result = download_photos_incremental(
+    let result = read_delta(
         &Client::new(),
         &passes,
         &Arc::new(config),
@@ -1696,11 +1316,7 @@ async fn collecting_unrouted_metadata_edit_refreshes_catalogue_and_queues_rewrit
     .await
     .expect("unrouted metadata edit should remain durable");
 
-    assert!(matches!(
-        result.outcome,
-        DownloadOutcome::PartialFailure { failed_count: 1 }
-    ));
-    assert_eq!(result.stats.downloaded, 0);
+    assert_eq!(result.state_transition_failures, 0);
     assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
     let refreshed = db
         .get_downloaded_page(0, 1)
@@ -1709,14 +1325,6 @@ async fn collecting_unrouted_metadata_edit_refreshes_catalogue_and_queues_rewrit
         .remove(0);
     assert!(refreshed.metadata.is_favorite);
     assert!(media_path.exists());
-    let sidecar_name = format!(
-        "{}.xmp",
-        media_path
-            .file_name()
-            .expect("media path has filename")
-            .to_string_lossy()
-    );
-    assert!(media_path.with_file_name(sidecar_name).exists());
     assert_eq!(
         db.get_pending_metadata_rewrites(10)
             .await
@@ -1746,7 +1354,7 @@ async fn collecting_unrouted_metadata_write_failure_preserves_incremental_checkp
     config.metadata.set_exif_rating = true;
     db.fail_provider_metadata_refresh_for_test();
 
-    let result = download_photos_incremental(
+    let result = read_delta(
         &Client::new(),
         &passes,
         &Arc::new(config),
@@ -1757,15 +1365,10 @@ async fn collecting_unrouted_metadata_write_failure_preserves_incremental_checkp
     .await
     .expect("failed unrouted metadata edit should return a safe partial result");
 
-    assert!(matches!(
-        result.outcome,
-        DownloadOutcome::PartialFailure { failed_count: 2 }
-    ));
-    assert_eq!(result.stats.downloaded, 0);
-    assert_eq!(result.sync_token, None);
-    assert!(result.stats.sync_token_blocked);
+    assert!(result.state_transition_failures > 0);
+    assert!(result.token_unsafe_reason.is_some());
     assert_eq!(
-        result.stats.sync_token_blocked_reason,
+        result.token_unsafe_reason,
         Some(PROVIDER_METADATA_STATE_WRITE_FAILED_REASON)
     );
     let unchanged = db
@@ -1816,7 +1419,7 @@ async fn collecting_unchanged_metadata_is_a_production_path_noop() {
         seed_downloaded_metadata_asset(db.as_ref(), &config, &pass, &stored_asset).await;
     db.fail_provider_metadata_refresh_for_test();
 
-    let result = download_photos_incremental_collecting(
+    let result = read_delta(
         &Client::new(),
         std::slice::from_ref(&pass),
         &Arc::new(config),
@@ -1827,9 +1430,8 @@ async fn collecting_unchanged_metadata_is_a_production_path_noop() {
     .await
     .expect("unchanged metadata should not call the failing refresh operation");
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
-    assert_eq!(result.stats.downloaded, 0);
-    assert_eq!(result.stats.state_write_failures, 0);
+    assert!(result.state_transition_failures == 0);
+    assert_eq!(result.state_transition_failures, 0);
     assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
     assert!(media_path.exists());
     assert!(
@@ -1842,7 +1444,7 @@ async fn collecting_unchanged_metadata_is_a_production_path_noop() {
 
 #[cfg(feature = "xmp")]
 #[tokio::test]
-async fn collecting_zero_download_cycle_drains_metadata_rewrite_batch() {
+async fn metadata_rewrite_batch_drains_without_new_downloads() {
     let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
     let dir = TempDir::new().expect("temp dir");
     let media_path = dir.path().join("rewrite-only.jpg");
@@ -1869,33 +1471,21 @@ async fn collecting_zero_download_cycle_drains_metadata_rewrite_batch() {
         .await
         .expect("queue rewrite");
 
-    let pass = AlbumPass {
-        kind: PassKind::Unfiled,
-        album: changes_album(
-            "",
-            changes_zone_session(Arc::new(AtomicUsize::new(0)), Vec::new()),
-        ),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    };
     let mut config = test_config();
     config.directory = Arc::from(dir.path());
     config.metadata.xmp_sidecar = true;
     config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
 
-    let result = download_photos_incremental_collecting(
-        &Client::new(),
-        std::slice::from_ref(&pass),
-        &Arc::new(config),
-        "zone-token-prev",
-        DownloadControls::download_hidden(),
-        CancellationToken::new(),
+    let result = drain_pending_metadata_rewrites(
+        db.as_ref(),
+        &config.metadata,
+        CaptureTimestampRepair::Preserve,
+        &["PrimarySync"],
+        config.temp_suffix.clone(),
+        &CancellationToken::new(),
     )
-    .await
-    .expect("rewrite-only collecting cycle should complete");
-
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
-    assert_eq!(result.stats.downloaded, 0);
-    assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+    .await;
+    assert_eq!(result.failed, 0);
     assert!(media_path.with_file_name("rewrite-only.jpg.xmp").exists());
     assert!(
         db.get_pending_metadata_rewrites(10)
@@ -1903,133 +1493,6 @@ async fn collecting_zero_download_cycle_drains_metadata_rewrite_batch() {
             .expect("read rewrite queue")
             .is_empty()
     );
-}
-
-#[tokio::test]
-async fn rejected_capture_upserts_never_dispatch_streaming_or_collecting_tasks() {
-    let server = crate::start_wiremock_or_skip!();
-    for collecting in [false, true] {
-        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
-        let dir = TempDir::new().unwrap();
-        let mut records = incremental_photo_records_with_url(
-            "REJECTED",
-            "capture.jpg",
-            &format!("{}/capture.jpg", server.uri()),
-            1024,
-        );
-        records[0]["fields"]["resOriginalVidComplRes"] = json!({"value": {
-            "downloadURL": format!("{}/capture.mov", server.uri()),
-            "fileChecksum": "provider-motion", "size": 1024,
-        }});
-        records[0]["fields"]["resOriginalVidComplFileType"] =
-            json!({"value": "com.apple.quicktime-movie"});
-        let old = PhotoAsset::new(records[0].clone(), records[1].clone());
-        let path = dir.path().join("historical.jpg");
-        tokio::fs::write(&path, b"historical media").await.unwrap();
-        let record = TestAssetRecord::new(old.asset_record_name())
-            .created_at(old.created())
-            .added_at(old.added_date())
-            .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
-            .metadata(old.metadata().clone())
-            .build();
-        db.import_adopt(&record, &path, "local-original", 16, None)
-            .await
-            .unwrap();
-        db.refresh_downloaded_asset_metadata(
-            "PrimarySync",
-            &record.id,
-            (
-                &crate::state::MetadataCapture {
-                    shared: Arc::clone(&record.metadata),
-                    renditions: Arc::from([(
-                        record.version_size,
-                        crate::state::RenditionMetadata {
-                            checksum: Some(Arc::from(record.checksum.as_ref())),
-                            width: record.metadata.width,
-                            height: record.metadata.height,
-                            duration_secs: record.metadata.duration_secs,
-                        },
-                    )]),
-                },
-                record.created_at,
-                record.added_at,
-            ),
-            false,
-            true,
-            crate::state::METADATA_CAPTURE_REVISION,
-        )
-        .await
-        .unwrap();
-        let mut pending = db
-            .get_pending_metadata_rewrites_page_for_queue(
-                crate::state::db::MetadataRewriteQueue::CaptureRepair,
-                None,
-                0,
-                10,
-            )
-            .await
-            .unwrap()
-            .remove(0);
-        pending.capture_repair_receipt = db
-            .record_capture_repair_prepared(&pending, "prepared", 2048)
-            .await
-            .unwrap();
-        records[1]["fields"]["assetDate"]["value"] = json!(1_700_086_400_123_i64);
-        let pass = AlbumPass {
-            kind: PassKind::Unfiled,
-            album: changes_album(
-                "",
-                changes_zone_session(Arc::new(AtomicUsize::new(0)), records),
-            ),
-            exclude_ids: Arc::new(FxHashSet::default()),
-        };
-        let mut config = incremental_test_config(&dir);
-        config.state_db = Some(db.clone());
-        let result =
-            run_incremental_strategy(collecting, &[pass], &Arc::new(config), "zone-token-prev")
-                .await
-                .unwrap();
-        assert_eq!(
-            server.received_requests().await.unwrap().len(),
-            0,
-            "collecting={collecting}"
-        );
-        assert_eq!(result.stats.downloaded, 0);
-        assert_eq!(result.stats.failed, 0);
-        assert_eq!(result.stats.state_write_failures, 2);
-        assert_eq!(result.stats.skipped.on_disk, 0);
-        assert!(matches!(
-            result.outcome,
-            DownloadOutcome::PartialFailure { .. }
-        ));
-        let recovered = db
-            .get_pending_metadata_rewrites_page_for_queue(
-                crate::state::db::MetadataRewriteQueue::CaptureRepair,
-                None,
-                0,
-                10,
-            )
-            .await
-            .unwrap();
-        assert_eq!(recovered.len(), 1);
-        assert_eq!(
-            recovered[0].capture_repair_receipt,
-            pending.capture_repair_receipt
-        );
-        assert_eq!(recovered[0].asset.created_at, record.created_at);
-        assert_eq!(recovered[0].asset.checksum, record.checksum);
-        assert_eq!(
-            recovered[0].asset.local_checksum.as_deref(),
-            Some("local-original")
-        );
-        assert_eq!(
-            recovered[0].asset.local_path.as_deref(),
-            Some(path.as_path())
-        );
-        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"historical media");
-        assert!(db.get_pending().await.unwrap().is_empty());
-        assert!(db.get_failed().await.unwrap().is_empty());
-    }
 }
 
 #[cfg(feature = "xmp")]
@@ -2429,7 +1892,7 @@ async fn explicit_live_photo_refresh_repairs_legacy_dates_and_sidecars_then_stay
 
 #[cfg(feature = "xmp")]
 #[tokio::test]
-async fn collecting_rewrite_failure_retains_marker_and_advances_durable_checkpoint() {
+async fn metadata_rewrite_failure_retains_marker_across_reopen() {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
     use xmp_toolkit::{XmpMeta, xmp_ns};
@@ -2487,39 +1950,20 @@ async fn collecting_rewrite_failure_retains_marker_and_advances_durable_checkpoi
             if cycle == 0 {
                 db.fail_metadata_marker_clear_for_test();
             }
-            let pass = AlbumPass {
-                kind: PassKind::Unfiled,
-                album: changes_album(
-                    "",
-                    changes_zone_session(Arc::new(AtomicUsize::new(0)), Vec::new()),
-                ),
-                exclude_ids: Arc::new(FxHashSet::default()),
-            };
             let mut config = test_config();
             config.directory = Arc::from(media.clone());
             config.metadata.xmp_sidecar = true;
             config.state_db = Some(db.clone());
-            let result = download_photos_incremental_collecting(
-                &Client::new(),
-                std::slice::from_ref(&pass),
-                &Arc::new(config),
-                "zone-token-prev",
-                DownloadControls::download_hidden(),
-                CancellationToken::new(),
+            let result = drain_pending_metadata_rewrites(
+                db.as_ref(),
+                &config.metadata,
+                CaptureTimestampRepair::Preserve,
+                &["PrimarySync"],
+                config.temp_suffix.clone(),
+                &CancellationToken::new(),
             )
-            .await
-            .unwrap();
-            if cycle == 0 {
-                assert!(matches!(
-                    result.outcome,
-                    DownloadOutcome::PartialFailure { failed_count: 1 }
-                ));
-            } else {
-                assert!(matches!(result.outcome, DownloadOutcome::Success));
-            }
-            assert_eq!(result.stats.downloaded, 0, "cycle {cycle}");
-            assert_eq!(result.stats.exif_failures, usize::from(cycle == 0));
-            assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+            .await;
+            assert_eq!(result.failed, usize::from(cycle == 0));
         }
         // Release production handles, including the temporary failure trigger,
         // before checking durable catalogue and publication evidence.
@@ -2634,251 +2078,6 @@ async fn collecting_rewrite_failure_retains_marker_and_advances_durable_checkpoi
 }
 
 #[tokio::test]
-async fn incremental_changed_asset_in_selected_album_routes_to_album_path() {
-    let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
-    seed_complete_album_snapshot(
-        &db,
-        "container-vacation",
-        "Vacation",
-        &[("asset-MASTER_CHANGED", "MASTER_CHANGED")],
-    )
-    .await;
-    let calls = Arc::new(AtomicUsize::new(0));
-    let session = changes_zone_session(
-        Arc::clone(&calls),
-        incremental_photo_records("MASTER_CHANGED"),
-    );
-    let passes = vec![
-        AlbumPass {
-            kind: PassKind::Album,
-            album: changes_album_with_container("Vacation", Some("container-vacation"), session),
-            exclude_ids: Arc::new(FxHashSet::default()),
-        },
-        unused_unfiled_changes_pass(),
-    ];
-
-    let mut config = test_config();
-    let dir = TempDir::new().expect("temp dir");
-    config.directory = Arc::from(dir.path());
-    config.folder_structure = "Unfiled".to_string();
-    config.folder_structure_albums = Arc::from("{album}");
-    config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
-    let result = download_photos_incremental(
-        &Client::new(),
-        &passes,
-        &Arc::new(config),
-        "zone-token-prev",
-        DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
-        CancellationToken::new(),
-    )
-    .await
-    .expect("album-routed incremental sync should succeed");
-
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
-    let album_rows = db.get_all_asset_albums("PrimarySync").await.unwrap();
-    assert_eq!(
-        album_rows,
-        vec![("asset-MASTER_CHANGED".to_string(), "Vacation".to_string())],
-        "selected album asset should route through the album pass"
-    );
-}
-
-#[tokio::test]
-async fn incremental_changed_asset_without_selected_album_routes_to_unfiled() {
-    let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
-    seed_complete_album_snapshot(&db, "container-vacation", "Vacation", &[]).await;
-    let calls = Arc::new(AtomicUsize::new(0));
-    let session = changes_zone_session(
-        Arc::clone(&calls),
-        incremental_photo_records("MASTER_CHANGED"),
-    );
-    let passes = vec![
-        AlbumPass {
-            kind: PassKind::Album,
-            album: changes_album_with_container("Vacation", Some("container-vacation"), session),
-            exclude_ids: Arc::new(FxHashSet::default()),
-        },
-        unused_unfiled_changes_pass(),
-    ];
-
-    let mut config = test_config();
-    let dir = TempDir::new().expect("temp dir");
-    config.directory = Arc::from(dir.path());
-    config.folder_structure = "Unfiled".to_string();
-    config.folder_structure_albums = Arc::from("{album}");
-    config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
-    let result = download_photos_incremental(
-        &Client::new(),
-        &passes,
-        &Arc::new(config),
-        "zone-token-prev",
-        DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
-        CancellationToken::new(),
-    )
-    .await
-    .expect("unfiled-routed incremental sync should succeed");
-
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
-    let album_rows = db.get_all_asset_albums("PrimarySync").await.unwrap();
-    assert!(
-        album_rows.is_empty(),
-        "asset outside selected albums should route only through the unfiled pass"
-    );
-}
-
-#[tokio::test]
-async fn incremental_multi_album_unfiled_uses_membership_without_album_enumeration() {
-    let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
-    seed_complete_album_snapshot(&db, "container-vacation", "Vacation", &[]).await;
-    let changes_calls = Arc::new(AtomicUsize::new(0));
-    let session = changes_zone_session_with_query_page(
-        Arc::clone(&changes_calls),
-        incremental_photo_records("MASTER_CHANGED"),
-        mock_photo_query_page("VACATION_EXISTING", Some("album-token")),
-        1,
-    );
-    let passes = vec![
-        AlbumPass {
-            kind: PassKind::Album,
-            album: changes_album_with_container(
-                "Vacation",
-                Some("container-vacation"),
-                session.clone(),
-            ),
-            exclude_ids: Arc::new(FxHashSet::default()),
-        },
-        unused_unfiled_changes_pass(),
-    ];
-
-    let mut config = test_config();
-    let dir = TempDir::new().expect("temp dir");
-    config.directory = Arc::from(dir.path());
-    config.folder_structure = "Unfiled".to_string();
-    config.folder_structure_albums = Arc::from("{album}");
-    config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
-
-    let result = download_photos_incremental(
-        &Client::new(),
-        &passes,
-        &Arc::new(config),
-        "zone-token-prev",
-        DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
-        CancellationToken::new(),
-    )
-    .await
-    .expect("incremental routing should not enumerate album passes");
-
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
-    assert_eq!(
-        changes_calls.load(Ordering::SeqCst),
-        1,
-        "incremental sync should still read the zone delta once"
-    );
-    assert_eq!(
-        session.count_query_count(),
-        0,
-        "membership-backed incremental routing must not count albums before planning downloads"
-    );
-    assert_eq!(
-        session.records_query_count(),
-        0,
-        "membership-backed incremental routing must not enumerate albums before planning downloads"
-    );
-}
-
-#[tokio::test]
-async fn incremental_sync_skips_smaller_metadata_rewritten_file() {
-    let mut records = incremental_photo_records_with_url(
-        "INCREMENTAL_METADATA_REWRITTEN",
-        "incremental-rewritten.jpg",
-        "https://p01.icloud-content.com/incremental-rewritten.jpg",
-        8,
-    );
-    records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
-        json!("ck_incremental_metadata_rewritten");
-    let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
-
-    let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
-    db.upsert_asset_master_mapping("PrimarySync", asset.asset_record_name(), asset.id())
-        .await
-        .expect("seed asset/master mapping");
-    let dir = TempDir::new().expect("temp dir");
-    let mut config = test_config();
-    config.directory = Arc::from(dir.path());
-    config.state_db = Some(db.clone());
-    let target_path = filter::expected_paths_for(&asset, &config)
-        .into_iter()
-        .next()
-        .expect("asset should derive a path")
-        .path;
-    tokio::fs::create_dir_all(target_path.parent().expect("target parent"))
-        .await
-        .expect("create target parent");
-    tokio::fs::write(&target_path, b"shorter")
-        .await
-        .expect("seed metadata-rewritten file");
-    let local_checksum = file::compute_sha256(&target_path)
-        .await
-        .expect("hash metadata-rewritten file");
-    let state_id = asset.asset_record_name();
-    let state_record = TestAssetRecord::new(state_id)
-        .filename("incremental-rewritten.jpg")
-        .checksum("ck_incremental_metadata_rewritten")
-        .size(8)
-        .build();
-    db.upsert_seen(&state_record)
-        .await
-        .expect("seed downloaded row");
-    db.mark_downloaded(
-        "PrimarySync",
-        state_id,
-        VersionSizeKey::Original.as_str(),
-        &target_path,
-        &local_checksum,
-        Some("download-checksum-before-metadata"),
-    )
-    .await
-    .expect("seed metadata-rewritten state");
-
-    let passes = vec![AlbumPass {
-        kind: PassKind::Unfiled,
-        album: mock_album(
-            "Library",
-            MockPhotosFlow::new()
-                .changes_zone_page(records, "zone-token-next", false)
-                .build(),
-        ),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    }];
-    let result = download_photos_incremental_collecting_inner(
-        &Client::new(),
-        &passes,
-        &Arc::new(config),
-        "zone-token-prev",
-        DownloadControls::download_hidden(),
-        CancellationToken::new(),
-        Duration::ZERO,
-    )
-    .await
-    .expect("incremental sync should skip the verified local file");
-
-    assert!(result.checkpoint.completed_delta_replay);
-    assert!(!result.checkpoint.retained_token_rejected);
-    assert!(!result.full_enumeration_ran);
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
-    assert_eq!(result.stats.downloaded, 0);
-    assert_eq!(result.stats.failed, 0);
-    assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
-    assert_eq!(tokio::fs::read(&target_path).await.unwrap(), b"shorter");
-    assert!(
-        !target_path
-            .with_file_name("incremental-rewritten-8.jpg")
-            .exists(),
-        "incremental sync must not create a size-suffixed duplicate"
-    );
-}
-
-#[tokio::test]
 async fn incremental_collecting_paired_asset_preserves_child_state_identity() {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
@@ -2976,7 +2175,7 @@ async fn incremental_collecting_paired_asset_preserves_child_state_identity() {
         zone_sync_token: "zone-token-full".to_string(),
     };
 
-    let incremental = download_photos_incremental_collecting(
+    let incremental = dispatch_delta(
         &Client::new(),
         &incremental_passes,
         &Arc::new(config),
@@ -2994,355 +2193,15 @@ async fn incremental_collecting_paired_asset_preserves_child_state_identity() {
     let downloaded = db.get_downloaded_page(0, 10).await.expect("downloaded row");
     assert_eq!(downloaded.len(), 1);
     assert_eq!(downloaded[0].id.as_ref(), "asset-COLLECTING_IDENTITY");
-    assert_ne!(
+    assert_eq!(
         downloaded[0].local_path.as_deref(),
         Some(original_path.as_path())
     );
-    assert!(
-        original_path.exists(),
-        "the prior provider bytes must remain on disk"
-    );
-}
-
-#[tokio::test]
-async fn shared_delta_state_streaming_receiver_drop_keeps_completion_uncommitted() {
-    const DRAIN_BOUND: Duration = Duration::from_secs(1);
-    const CLEANUP_BOUND: Duration = Duration::from_secs(5);
-    let dir = TempDir::new().unwrap();
-    let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
-    let mut config = test_config();
-    config.directory = Arc::from(dir.path());
-    config.state_db = Some(db.clone());
-    config.concurrent_downloads = 1;
-    let records = ["UNCONSUMED", "QUEUED", "BLOCKED"]
-        .into_iter()
-        .flat_map(incremental_photo_records)
-        .collect();
-    let pass = AlbumPass {
-        kind: PassKind::Unfiled,
-        album: changes_album(
-            "",
-            changes_zone_session(Arc::new(AtomicUsize::new(0)), records),
-        ),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    };
-    let pending = Arc::new(tokio::sync::Notify::new());
-    let (assets, mut producer) = super::stream_incremental_assets_for_single_unfiled_pass(
-        pass,
-        Arc::new(config),
-        "zone-token-prev".to_string(),
-        DownloadRunMode::Download,
-        CancellationToken::new(),
-        Some(pending.clone()),
-    );
-    // Two assets fill the channel; the third send is actually polled Pending
-    // after all three source mappings have finished their SQLite writes.
-    let blocked = tokio::time::timeout(CLEANUP_BOUND, pending.notified()).await;
-    if blocked.is_err() {
-        producer.abort();
-        let _ = tokio::time::timeout(CLEANUP_BOUND, &mut producer)
-            .await
-            .expect("aborted synthetic producer must join");
-    }
-    blocked.expect("receiver drop must follow actual durable event processing");
-    assert!(!producer.is_finished());
-    drop(assets);
-    let result = tokio::time::timeout(DRAIN_BOUND, &mut producer).await;
-    if result.is_err() {
-        producer.abort();
-        let _ = tokio::time::timeout(CLEANUP_BOUND, &mut producer)
-            .await
-            .expect("aborted synthetic producer must join");
-    }
-    let summary = result
-        .expect("receiver closure must release the blocked asset send")
-        .expect("producer task joins")
-        .expect("producer returns its partial summary");
-    assert_eq!(summary.sync_token, None);
-    assert_eq!(summary.total_events, 3);
-    assert_eq!(summary.created_count, 3);
-    assert_eq!(summary.state_transition_failures, 0);
+    assert_eq!(std::fs::read(&original_path).unwrap(), changed_body);
     assert_eq!(
-        db.get_master_record_name_for_asset("PrimarySync", "asset-UNCONSUMED")
-            .await
-            .unwrap()
-            .as_deref(),
-        Some("UNCONSUMED"),
+        downloaded[0].local_checksum.as_deref(),
+        Some(file::compute_sha256(&original_path).await.unwrap().as_str())
     );
-    for master in ["QUEUED", "BLOCKED"] {
-        assert_eq!(
-            db.get_master_record_name_for_asset("PrimarySync", &format!("asset-{master}"))
-                .await
-                .unwrap()
-                .as_deref(),
-            Some(master),
-        );
-    }
-    assert!(db.get_pending().await.unwrap().is_empty());
-    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
-}
-
-#[tokio::test]
-async fn shared_delta_state_streaming_receiver_drop_before_processing_preserves_empty_state() {
-    const DRAIN_BOUND: Duration = Duration::from_secs(1);
-    const CLEANUP_BOUND: Duration = Duration::from_secs(5);
-    let dir = TempDir::new().unwrap();
-    let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
-    let mut config = test_config();
-    config.directory = Arc::from(dir.path());
-    config.state_db = Some(db.clone());
-    let pass = AlbumPass {
-        kind: PassKind::Unfiled,
-        album: changes_album(
-            "",
-            changes_zone_session(
-                Arc::new(AtomicUsize::new(0)),
-                incremental_photo_records("UNCONSUMED"),
-            ),
-        ),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    };
-    let (assets, mut producer) = super::stream_incremental_assets_for_single_unfiled_pass(
-        pass,
-        Arc::new(config),
-        "zone-token-prev".to_string(),
-        DownloadRunMode::Download,
-        CancellationToken::new(),
-        None,
-    );
-    // This current-thread fixture closes the receiver before yielding to the
-    // spawned incremental consumer. No event has begun durable processing.
-    drop(assets);
-    let result = tokio::time::timeout(DRAIN_BOUND, &mut producer).await;
-    if result.is_err() {
-        producer.abort();
-        let _ = tokio::time::timeout(CLEANUP_BOUND, &mut producer)
-            .await
-            .expect("aborted synthetic producer must join");
-    }
-    let summary = result
-        .expect("pre-work receiver closure must drain")
-        .expect("producer task joins")
-        .expect("producer returns an empty partial summary");
-    assert_eq!(summary.sync_token, None);
-    assert_eq!(summary.total_events, 0);
-    assert_eq!(summary.created_count, 0);
-    assert_eq!(summary.state_transition_failures, 0);
-    assert_eq!(
-        db.get_master_record_name_for_asset("PrimarySync", "asset-UNCONSUMED")
-            .await
-            .unwrap(),
-        None,
-    );
-    assert!(db.get_pending().await.unwrap().is_empty());
-    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
-}
-
-#[tokio::test]
-async fn malformed_delta_page_rejected_by_streaming_and_collecting_consumers() {
-    use base64::Engine as _;
-    use sha2::{Digest, Sha256};
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, ResponseTemplate};
-
-    for collecting in [true, false] {
-        let server = crate::start_wiremock_or_skip!();
-        let bytes = include_bytes!("../../../../tests/data/media/pattern.jpg");
-        Mock::given(method("GET"))
-            .and(path("/earlier.jpg"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
-            .expect(if collecting { 0 } else { 1 })
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/rejected.jpg"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
-            .expect(0)
-            .mount(&server)
-            .await;
-        let mut earlier = incremental_photo_records_with_url(
-            "EARLIER",
-            "earlier.jpg",
-            &format!("{}/earlier.jpg", server.uri()),
-            bytes.len() as u64,
-        );
-        earlier[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
-            json!(base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes)));
-        let dir = TempDir::new().unwrap();
-        let db = Arc::new(
-            SqliteStateDb::open(&dir.path().join("state.db"))
-                .await
-                .unwrap(),
-        );
-        db.set_metadata("sync_token:PrimarySync", "saved")
-            .await
-            .unwrap();
-        let mut rejected = incremental_photo_records_with_url(
-            "REJECTED_PAGE",
-            "rejected.jpg",
-            &format!("{}/rejected.jpg", server.uri()),
-            bytes.len() as u64,
-        );
-        rejected[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
-            earlier[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"].clone();
-        let page = |records: Vec<serde_json::Value>, token: &str, more: bool| {
-            json!({
-                "zones": [{"zoneID": {"zoneName": "PrimarySync"}, "records": records,
-                    "syncToken": token, "moreComing": more}]
-            })
-        };
-        let mut bad = page(rejected, "rejected-successor", false);
-        bad["zones"][0]["records"].as_array_mut().unwrap().push(json!({
-            "recordName": "errored-unknown", "recordType": "FutureType", "serverErrorCode": "UNKNOWN_ITEM"
-        }));
-        let pass = AlbumPass {
-            kind: PassKind::Unfiled,
-            album: changes_album(
-                "",
-                crate::test_helpers::MockPhotosSession::new()
-                    .ok(page(earlier, "accepted-page", true))
-                    .ok(bad),
-            ),
-            exclude_ids: Arc::new(FxHashSet::default()),
-        };
-        let mut config = incremental_test_config(&dir);
-        config.state_db = Some(db.clone());
-        let result =
-            run_incremental_strategy(collecting, &[pass], &Arc::new(config), "saved").await;
-        if collecting {
-            let error = result.expect_err("collecting must refuse the incomplete delta");
-            assert_eq!(
-                crate::icloud::photos::error::bridge_error_reason(&error),
-                "record_error"
-            );
-        } else {
-            let result = result.unwrap();
-            assert!(matches!(
-                result.outcome,
-                DownloadOutcome::PartialFailure { .. }
-            ));
-            assert_eq!(result.sync_token, None);
-            assert!(!result.checkpoint.completed_delta_replay);
-            assert_eq!(result.stats.downloaded, 1);
-            assert_eq!(
-                result.stats.sync_token_blocked_reason,
-                Some("icloud_changes_record_error")
-            );
-        }
-        assert_eq!(
-            db.get_metadata("sync_token:PrimarySync")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("saved")
-        );
-        let rows = db.get_downloaded_page(0, 10).await.unwrap();
-        if collecting {
-            assert!(db.get_all_known_ids().await.unwrap().is_empty());
-        } else {
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].id.as_ref(), "asset-EARLIER");
-            assert_eq!(
-                std::fs::read(rows[0].local_path.as_ref().unwrap()).unwrap(),
-                bytes
-            );
-            assert_eq!(db.get_all_known_ids().await.unwrap().len(), 1);
-        }
-        server.verify().await;
-    }
-}
-
-#[tokio::test]
-async fn streaming_refused_continuation_keeps_publication_and_storage_evidence() {
-    use super::super::test_support::{open_fixture_db, selected_pass_with_session};
-    use base64::Engine as _;
-    use sha2::{Digest, Sha256};
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, ResponseTemplate};
-
-    let refusals = [
-        (None, "icloud_changes_missing_successor"),
-        (Some("BAD_REQUEST"), "icloud_changes_continuation_rejected"),
-        (Some("ZONE_NOT_FOUND"), "icloud_changes_zone_not_found"),
-        (Some("RETRY_LATER"), "icloud_changes_retry_later"),
-        (
-            Some("SERVER_INTERNAL_ERROR"),
-            "icloud_changes_server_internal_error",
-        ),
-        (
-            Some("FUTURE_ZONE_FAILURE"),
-            "icloud_changes_unrecognized_zone_error",
-        ),
-        (Some("THROTTLED"), "icloud_changes_zone_throttled"),
-    ];
-    for (storage_blocked, (code, reason)) in [false, true]
-        .into_iter()
-        .flat_map(|blocked| refusals.map(|refusal| (blocked, refusal)))
-    {
-        let dir = TempDir::new().unwrap();
-        let db = open_fixture_db(&dir.path().join("state.db")).await;
-        let server = crate::start_wiremock_or_skip!();
-        let bytes = include_bytes!("../../../../tests/data/media/pattern.jpg");
-        Mock::given(method("GET"))
-            .and(path("/accepted.jpg"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
-            .expect(u64::from(!storage_blocked))
-            .mount(&server)
-            .await;
-        let mut records = incremental_photo_records_with_url(
-            "EARLIER",
-            "earlier.jpg",
-            &format!("{}/accepted.jpg", server.uri()),
-            bytes.len() as u64,
-        );
-        records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
-            json!(base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes)));
-        let page = |records, token, more| {
-            json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},
-                "records":records,"syncToken":token,"moreComing":more}]})
-        };
-        let mut refused = page(Vec::new(), "", false);
-        if let Some(code) = code {
-            refused["zones"][0]["serverErrorCode"] = json!(code);
-        }
-        let session = crate::test_helpers::MockPhotosSession::new()
-            .ok(page(records, "accepted-page", true))
-            .ok(refused);
-        let pass = selected_pass_with_session(&db, "", Box::new(session));
-        let mut config = incremental_test_config(&dir);
-        config.state_db = Some(db.clone());
-        config.folder_structure = "destination".to_owned();
-        let destination = dir.path().join("destination");
-        if storage_blocked {
-            std::fs::write(&destination, b"unrelated file").unwrap();
-        }
-        let result = run_incremental_strategy(false, &[pass], &Arc::new(config), "saved")
-            .await
-            .unwrap();
-        assert!(matches!(
-            result.outcome,
-            DownloadOutcome::PartialFailure { .. }
-        ));
-        assert_eq!(result.sync_token, None);
-        assert!(!result.checkpoint.completed_delta_replay);
-        assert_eq!(
-            result.checkpoint.storage_failed, storage_blocked,
-            "{result:?}"
-        );
-        assert_eq!(result.stats.downloaded, usize::from(!storage_blocked));
-        let published = db.get_downloaded_page(0, 10).await.unwrap();
-        assert_eq!(published.len(), usize::from(!storage_blocked));
-        if storage_blocked {
-            assert_eq!(std::fs::read(destination).unwrap(), b"unrelated file");
-        } else {
-            assert_eq!(result.stats.enumeration_errors, 1);
-            assert_eq!(result.stats.sync_token_blocked_reason, Some(reason));
-            let path = published[0].local_path.as_ref().unwrap();
-            assert!(path.starts_with(&destination), "{path:?}");
-            assert_eq!(std::fs::read(path).unwrap(), bytes);
-        }
-        server.verify().await;
-    }
 }
 
 #[tokio::test]

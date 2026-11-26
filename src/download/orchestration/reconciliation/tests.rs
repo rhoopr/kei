@@ -1,3 +1,5 @@
+use crate::state::SyncTokenStore;
+use crate::state::{DownloadStateStore, ReportStateStore};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -12,20 +14,16 @@ use crate::commands::{AlbumPass, PassKind};
 use crate::download::{file, filter, paths};
 use crate::icloud::photos::{PhotoAsset, PhotosSession};
 use crate::state::{ReconciliationStateStore, SqliteStateDb, VersionSizeKey};
-use crate::test_helpers::{
-    MockPhotosFlow, TestAssetRecord, mock_photo_records_for_zone_with_filename,
-};
+use crate::test_helpers::{TestAssetRecord, mock_photo_records_for_zone_with_filename};
 use crate::types::AssetVersionSize;
 
 use super::super::config::{DownloadConfig, hash_download_config};
 use super::super::dispatch::download_photos_with_sync;
-use super::super::incremental::download_photos_incremental_collecting;
 use super::super::models::{
     DownloadControls, DownloadOutcome, DownloadReporting, DownloadRunMode, SyncMode, SyncResult,
 };
 use super::super::test_support::{
-    PendingLookupSession, album_with_session, incremental_photo_records_with_url, mock_album,
-    test_config,
+    PendingLookupSession, album_with_session, incremental_photo_records_with_url, test_config,
 };
 use super::reconcile_catalog_paths;
 
@@ -490,7 +488,6 @@ async fn import_refusal_preserves_reserved_retry_across_restart() {
         config.state_db = Some(db.clone());
         let repaired = run_reserved_download_cycle(
             &db,
-            ReservedDownloadPass::Full,
             a.clone(),
             Arc::new(config.clone()),
             DownloadRunMode::Download,
@@ -824,8 +821,7 @@ async fn path_reconciliation_rejects_unsafe_entry_then_recovers(entry: Reconcili
 #[derive(Clone, Copy)]
 enum ReservedDownloadPass {
     Full,
-    IncrementalStreaming,
-    IncrementalCollecting,
+    Incremental,
     Pending,
     PendingRecorded,
 }
@@ -849,16 +845,7 @@ async fn full_download_preserves_rendition_reservations() {
 #[tokio::test]
 async fn incremental_streaming_preserves_rendition_reservations() {
     Box::pin(assert_reserved_download_transition(
-        ReservedDownloadPass::IncrementalStreaming,
-        ReservedDownloadFailure::None,
-    ))
-    .await;
-}
-
-#[tokio::test]
-async fn incremental_collecting_preserves_rendition_reservations() {
-    Box::pin(assert_reserved_download_transition(
-        ReservedDownloadPass::IncrementalCollecting,
+        ReservedDownloadPass::Incremental,
         ReservedDownloadFailure::None,
     ))
     .await;
@@ -894,7 +881,7 @@ async fn full_download_reservation_failure_prevents_publication() {
 #[tokio::test]
 async fn incremental_collecting_reservation_failure_prevents_publication() {
     Box::pin(assert_reserved_download_transition(
-        ReservedDownloadPass::IncrementalCollecting,
+        ReservedDownloadPass::Incremental,
         ReservedDownloadFailure::Reservation,
     ))
     .await;
@@ -922,17 +909,7 @@ async fn reserved_content_update_full() {
 #[tokio::test]
 async fn reserved_content_update_streaming() {
     Box::pin(assert_reserved_content_update(
-        ReservedDownloadPass::IncrementalStreaming,
-        2048,
-        ReservedDownloadFailure::None,
-    ))
-    .await;
-}
-
-#[tokio::test]
-async fn reserved_content_update_collecting() {
-    Box::pin(assert_reserved_content_update(
-        ReservedDownloadPass::IncrementalCollecting,
+        ReservedDownloadPass::Incremental,
         2048,
         ReservedDownloadFailure::None,
     ))
@@ -942,7 +919,7 @@ async fn reserved_content_update_collecting() {
 #[tokio::test]
 async fn reserved_content_update_same_size() {
     Box::pin(assert_reserved_content_update(
-        ReservedDownloadPass::IncrementalStreaming,
+        ReservedDownloadPass::Incremental,
         1024,
         ReservedDownloadFailure::None,
     ))
@@ -1078,12 +1055,11 @@ async fn assert_reserved_content_update(
         db.get_pending().await.unwrap().is_empty(),
         "B must not enter through pending recovery"
     );
-    if matches!(pass, ReservedDownloadPass::IncrementalStreaming) {
+    if matches!(pass, ReservedDownloadPass::Incremental) {
         super::super::test_support::initialize_empty_selection(&db, &config).await;
     }
     let downloaded = run_reserved_download_cycle(
         &db,
-        pass,
         b.clone(),
         Arc::new(config.clone()),
         DownloadRunMode::Download,
@@ -1133,7 +1109,6 @@ async fn assert_reserved_content_update(
     }
     let changed = run_reserved_download_cycle(
         &db,
-        pass,
         b.clone(),
         Arc::new(config.clone()),
         DownloadRunMode::Download,
@@ -1189,7 +1164,6 @@ async fn assert_reserved_content_update(
     // catalog path, after publication succeeded but finalization failed.
     let restarted = run_reserved_download_cycle(
         &db,
-        ReservedDownloadPass::Pending,
         b.clone(),
         Arc::new(config.clone()),
         DownloadRunMode::Download,
@@ -1232,15 +1206,10 @@ async fn assert_reserved_content_update(
     let count = std::fs::read_dir(new_path.parent().unwrap())
         .unwrap()
         .count();
-    let steady = run_reserved_download_cycle(
-        &db,
-        pass,
-        b,
-        Arc::new(config.clone()),
-        DownloadRunMode::Download,
-    )
-    .await
-    .unwrap();
+    let steady =
+        run_reserved_download_cycle(&db, b, Arc::new(config.clone()), DownloadRunMode::Download)
+            .await
+            .unwrap();
     assert!(
         matches!(steady.outcome, DownloadOutcome::Success),
         "{steady:?}"
@@ -1262,7 +1231,6 @@ async fn assert_reserved_content_update(
     // it must not discard the newer generation's reservation or bytes.
     let reverted = run_reserved_download_cycle(
         &db,
-        pass,
         original_b,
         Arc::new(config.clone()),
         DownloadRunMode::Download,
@@ -1273,7 +1241,7 @@ async fn assert_reserved_content_update(
         matches!(reverted.outcome, DownloadOutcome::Success),
         "{reverted:?}"
     );
-    if !matches!(pass, ReservedDownloadPass::IncrementalCollecting) {
+    {
         assert_eq!(
             reverted.stats.downloaded, 0,
             "native provider revert must reuse its original publication"
@@ -1319,82 +1287,31 @@ async fn assert_reserved_content_update(
 
 async fn run_reserved_download_cycle(
     db: &Arc<SqliteStateDb>,
-    pass: ReservedDownloadPass,
     records: Vec<serde_json::Value>,
     config: Arc<DownloadConfig>,
     run_mode: DownloadRunMode,
 ) -> Result<SyncResult> {
-    if !matches!(pass, ReservedDownloadPass::IncrementalCollecting) {
-        let mut records = records;
-        for record in &mut records {
-            if let Some(reference) = record.pointer_mut("/fields/masterRef/value") {
-                reference["zoneID"]["ownerRecordName"] = json!("_defaultOwner");
-            }
+    let mut records = records;
+    for record in &mut records {
+        if let Some(reference) = record.pointer_mut("/fields/masterRef/value") {
+            reference["zoneID"]["ownerRecordName"] = json!("_defaultOwner");
         }
-        let passes = vec![super::super::test_support::selected_pass_with_session(
-            db,
-            "",
-            Box::new(super::super::test_support::SelectedMediaSession(Arc::new(
-                records,
-            ))),
-        )];
-        return download_photos_with_sync(
-            &Client::new(),
-            &passes,
-            config,
-            DownloadControls::new(run_mode, DownloadReporting::hidden()),
-            CancellationToken::new(),
-        )
-        .await;
     }
-    let album = match pass {
-        ReservedDownloadPass::Full => mock_album(
-            "",
-            MockPhotosFlow::new()
-                .query_page(records, Some("after"))
-                .build(),
-        ),
-        ReservedDownloadPass::Pending | ReservedDownloadPass::PendingRecorded => {
-            album_with_session(
-                "PrimarySync",
-                "",
-                Box::new(PendingLookupSession {
-                    records: Arc::new(records),
-                }),
-            )
-        }
-        _ => mock_album(
-            "",
-            MockPhotosFlow::new()
-                .changes_zone_page(records, "after", false)
-                .build(),
-        ),
-    };
-    let passes = vec![AlbumPass {
-        kind: PassKind::Unfiled,
-        album,
-        exclude_ids: Arc::new(FxHashSet::default()),
-    }];
-    if matches!(pass, ReservedDownloadPass::IncrementalCollecting) {
-        download_photos_incremental_collecting(
-            &Client::new(),
-            &passes,
-            &config,
-            "before",
-            DownloadControls::new(run_mode, DownloadReporting::hidden()),
-            CancellationToken::new(),
-        )
-        .await
-    } else {
-        download_photos_with_sync(
-            &Client::new(),
-            &passes,
-            config,
-            DownloadControls::new(run_mode, DownloadReporting::hidden()),
-            CancellationToken::new(),
-        )
-        .await
-    }
+    let passes = vec![super::super::test_support::selected_pass_with_session(
+        db,
+        "",
+        Box::new(super::super::test_support::SelectedMediaSession(Arc::new(
+            records,
+        ))),
+    )];
+    download_photos_with_sync(
+        &Client::new(),
+        &passes,
+        config,
+        DownloadControls::new(run_mode, DownloadReporting::hidden()),
+        CancellationToken::new(),
+    )
+    .await
 }
 
 async fn assert_reserved_download_transition(
@@ -1554,20 +1471,15 @@ async fn assert_reserved_download_transition(
             .iter()
             .all(|reservation| reservation.asset_id.as_ref() == "A")
     );
-    if matches!(pass, ReservedDownloadPass::IncrementalStreaming) {
+    if matches!(pass, ReservedDownloadPass::Incremental) {
         super::super::test_support::initialize_empty_selection(&db, &config).await;
     }
     if matches!(pass, ReservedDownloadPass::Pending) {
         for run_mode in [DownloadRunMode::DryRun, DownloadRunMode::PrintFilenames] {
-            let preview = run_reserved_download_cycle(
-                &db,
-                pass,
-                b.clone(),
-                Arc::new(config.clone()),
-                run_mode,
-            )
-            .await
-            .unwrap();
+            let preview =
+                run_reserved_download_cycle(&db, b.clone(), Arc::new(config.clone()), run_mode)
+                    .await
+                    .unwrap();
             assert_eq!(preview.stats.downloaded, usize::from(run_mode.is_dry_run()));
             assert_eq!(
                 std::fs::read_dir(parent).unwrap().count(),
@@ -1591,7 +1503,6 @@ async fn assert_reserved_download_transition(
     }
     let downloaded = run_reserved_download_cycle(
         &db,
-        pass,
         b.clone(),
         Arc::new(config.clone()),
         DownloadRunMode::Download,
@@ -1673,7 +1584,6 @@ async fn assert_reserved_download_transition(
         {
             let held = run_reserved_download_cycle(
                 &db,
-                pass,
                 b.clone(),
                 Arc::new(config.clone()),
                 DownloadRunMode::Download,
@@ -1704,7 +1614,6 @@ async fn assert_reserved_download_transition(
     if !matches!(failure, ReservedDownloadFailure::None) {
         let recovered = run_reserved_download_cycle(
             &db,
-            pass,
             b.clone(),
             Arc::new(config.clone()),
             DownloadRunMode::Download,
@@ -2011,7 +1920,6 @@ async fn assert_pending_retry_reservations(entry: PendingReservationEntry) {
     config.state_db = Some(db.clone());
     let retry = run_reserved_download_cycle(
         &db,
-        ReservedDownloadPass::Pending,
         b.clone(),
         Arc::new(config.clone()),
         DownloadRunMode::Download,

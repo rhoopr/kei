@@ -420,6 +420,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::SyncTokenStore;
+    use crate::state::{DownloadStateStore, MetadataRewriteStore};
 
     fn run_options() -> RunOptions {
         let download_dir = tempfile::tempdir().unwrap();
@@ -429,18 +431,16 @@ mod tests {
             domain: None,
             data_dir: None,
         };
-        let sync = crate::cli::SyncArgs {
-            config_overrides: crate::config::SyncConfigOverrides {
-                download_dir: Some(download_dir.path().display().to_string()),
-                ..Default::default()
-            },
-            ..crate::cli::SyncArgs::default()
-        };
+        let toml: crate::config::TomlConfig = toml::from_str(&format!(
+            "[download]\ndirectory = {:?}\n",
+            download_dir.path().display().to_string()
+        ))
+        .unwrap();
         let config = crate::config::Config::build(
             &globals,
             &crate::cli::PasswordArgs::default(),
-            sync,
-            None,
+            crate::cli::SyncArgs::default(),
+            Some(&toml),
         )
         .unwrap();
         RunOptions::from_config(&config)

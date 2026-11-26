@@ -381,6 +381,7 @@ impl SqliteStateDb {
 #[cfg(test)]
 mod tests {
     use super::{CapturedPageId, ObservedPage, SourceIdentity, StoredPage, load_page};
+    use crate::state::SyncTokenStore;
     use crate::state::db::account::AccountOwner;
     use crate::test_helpers::{assert_no_retired_inbox_archive, snapshot_database};
     use rusqlite::{Connection, params};

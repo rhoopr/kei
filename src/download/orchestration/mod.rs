@@ -15,7 +15,6 @@ pub(super) mod primary_layout;
 #[cfg(test)]
 pub(super) mod queue_projection;
 pub(super) mod reconciliation;
-pub(super) mod recovery;
 pub(super) mod selection;
 pub(super) mod url_refresh;
 

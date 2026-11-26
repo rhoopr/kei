@@ -1,3 +1,4 @@
+use crate::state::{DownloadContextStateStore, DownloadStateStore};
 use std::fs;
 use std::sync::Arc;
 

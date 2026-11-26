@@ -1,3 +1,5 @@
+use crate::state::SyncTokenStore;
+use crate::state::{DownloadStateStore, MetadataRewriteStore, ReportStateStore};
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;

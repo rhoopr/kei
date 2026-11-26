@@ -1,3 +1,4 @@
+use crate::state::ReportStateStore;
 use little_exif::exif_tag::ExifTag;
 use little_exif::metadata::Metadata;
 use serde_json::{Value, json};

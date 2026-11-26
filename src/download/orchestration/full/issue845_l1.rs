@@ -1,6 +1,7 @@
 //! Preserved L1 failure history through normal full dispatch and DB reopens.
 //! The selected provider basename is synthetic; its compatible family is explicit.
 
+use crate::state::MetadataRewriteStore;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;

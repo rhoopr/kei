@@ -1,4 +1,8 @@
 use crate::download::planner::TaskPlanner;
+use crate::state::SyncTokenStore;
+use crate::state::{
+    DownloadContextStateStore, DownloadStateStore, MetadataRewriteStore, ReportStateStore,
+};
 use futures_util::stream;
 use std::fs;
 use std::path::{Path, PathBuf};

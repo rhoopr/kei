@@ -1,4 +1,6 @@
 //! Tests moved from `state::db::tests`, with their original names and assertions.
+use crate::state::DownloadStateStore;
+use crate::state::MembershipStore;
 use crate::state::db::SqliteStateDb;
 use crate::state::db::membership::ALBUM_GROUPING_STATE_IDS_SQL;
 use crate::test_helpers::TestAssetRecord;
