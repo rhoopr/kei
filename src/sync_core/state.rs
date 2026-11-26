@@ -92,6 +92,16 @@ CREATE TABLE IF NOT EXISTS files (
     UNIQUE (zone, asset, rendition, album)
 ) STRICT;
 CREATE INDEX IF NOT EXISTS files_by_state ON files (state) WHERE wanted = 1;
+CREATE TABLE IF NOT EXISTS imported (
+    path TEXT PRIMARY KEY,
+    zone TEXT NOT NULL,
+    master TEXT NOT NULL,
+    rendition TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    sha256 TEXT,
+    checksum TEXT NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS imported_by_asset ON imported (zone, master, rendition);
 CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY,
     started_at INTEGER NOT NULL,
@@ -169,6 +179,20 @@ pub(crate) struct WantedFile {
     pub(crate) checksum: String,
     /// The path already holds a file of this size that kei does not track.
     pub(crate) adopt: bool,
+    /// A copy recorded by the previous engine that this row takes over.
+    pub(crate) imported: Option<ImportedCopy>,
+}
+
+/// A verified local copy carried over from the previous engine's state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImportedCopy {
+    pub(crate) path: String,
+    pub(crate) zone: String,
+    pub(crate) master: String,
+    pub(crate) rendition: String,
+    pub(crate) size: u64,
+    pub(crate) sha256: Option<String>,
+    pub(crate) checksum: String,
 }
 
 /// An asset whose wanted copies must be recomputed.
@@ -289,6 +313,42 @@ impl State {
             Ok(())
         })
         .await
+    }
+
+    pub(crate) async fn delete_kv(&self, key: &str) -> anyhow::Result<()> {
+        let key = key.to_owned();
+        self.with(move |conn| {
+            conn.execute("DELETE FROM kv WHERE key = ?1", [key])?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Check the database file's integrity.
+    pub(crate) async fn validate(&self) -> anyhow::Result<()> {
+        self.with(|conn| {
+            let result: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+            anyhow::ensure!(
+                result == "ok",
+                "Sync state failed its integrity check: {result}"
+            );
+            Ok(())
+        })
+        .await
+    }
+
+    /// Close the database, folding the write-ahead log into the main file.
+    pub(crate) async fn close(self) -> anyhow::Result<()> {
+        let conn = Arc::try_unwrap(self.conn)
+            .map_err(|_shared| anyhow::anyhow!("Sync state is still in use"))?
+            .into_inner()
+            .map_err(|_poisoned| anyhow::anyhow!("Sync state lock was poisoned"))?;
+        tokio::task::spawn_blocking(move || {
+            conn.pragma_update(None, "journal_mode", "DELETE")?;
+            conn.close().map_err(|(_conn, error)| error)?;
+            Ok(())
+        })
+        .await?
     }
 
     /// Saved position for a zone, or `None` when a full listing is owed.
@@ -626,10 +686,26 @@ impl State {
                         )?;
                     }
                     None => {
-                        let state = if file.adopt { FileState::Adopt } else { FileState::Pending };
+                        // A carried-over copy keeps its recorded hash: it is
+                        // done if iCloud still serves the same version, and
+                        // replaced only while untouched if it does not.
+                        let (state, sha256) = match &file.imported {
+                            Some(copy) => {
+                                tx.execute("DELETE FROM imported WHERE path = ?1", [&copy.path])?;
+                                match &copy.sha256 {
+                                    None => (FileState::Adopt, None),
+                                    Some(_) if copy.checksum == file.checksum => {
+                                        (FileState::Done, copy.sha256.clone())
+                                    }
+                                    Some(_) => (FileState::Pending, copy.sha256.clone()),
+                                }
+                            }
+                            None if file.adopt => (FileState::Adopt, None),
+                            None => (FileState::Pending, None),
+                        };
                         tx.execute(
-                            "INSERT INTO files (zone, asset, rendition, album, path, size, checksum, state)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                            "INSERT INTO files (zone, asset, rendition, album, path, size, checksum, state, sha256)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                             params![
                                 zone,
                                 asset,
@@ -638,7 +714,8 @@ impl State {
                                 file.path,
                                 i64::try_from(file.size)?,
                                 file.checksum,
-                                state.as_str()
+                                state.as_str(),
+                                sha256
                             ],
                         )?;
                     }
@@ -748,6 +825,98 @@ impl State {
             Ok(())
         })
         .await
+    }
+
+    /// Store carried-over copies. Existing rows with the same path are kept.
+    pub(crate) async fn insert_imported(&self, copies: Vec<ImportedCopy>) -> anyhow::Result<u64> {
+        self.with(move |conn| {
+            let tx = conn.transaction()?;
+            let mut inserted = 0u64;
+            for copy in copies {
+                inserted += u64::try_from(tx.execute(
+                    "INSERT OR IGNORE INTO imported (path, zone, master, rendition, size, sha256, checksum)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        copy.path,
+                        copy.zone,
+                        copy.master,
+                        copy.rendition,
+                        i64::try_from(copy.size)?,
+                        copy.sha256,
+                        copy.checksum
+                    ],
+                )?)?;
+            }
+            tx.commit()?;
+            Ok(inserted)
+        })
+        .await
+    }
+
+    /// A carried-over copy for a new row: the one at `path`, or else one of
+    /// the same photo and rendition in the same folder. Paths already owned
+    /// by a file row are never offered.
+    pub(crate) async fn imported_copy(
+        &self,
+        zone: &str,
+        master: &str,
+        rendition: &str,
+        path: &str,
+    ) -> anyhow::Result<Option<ImportedCopy>> {
+        let (zone, master, rendition, path) = (
+            zone.to_owned(),
+            master.to_owned(),
+            rendition.to_owned(),
+            path.to_owned(),
+        );
+        self.with(move |conn| {
+            let parent = path
+                .rsplit_once('/')
+                .map_or("", |(parent, _)| parent)
+                .to_owned();
+            let mut stmt = conn.prepare(
+                "SELECT path, zone, master, rendition, size, sha256, checksum FROM imported i
+                 WHERE NOT EXISTS (SELECT 1 FROM files f WHERE f.path = i.path)
+                   AND (i.path = ?1 OR (i.zone = ?2 AND i.master = ?3 AND i.rendition = ?4))
+                 ORDER BY i.path = ?1 DESC, i.path",
+            )?;
+            let rows = stmt
+                .query_map(params![path, zone, master, rendition], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (candidate, zone, master, rendition, size, sha256, checksum) in rows {
+                let same_folder =
+                    candidate.rsplit_once('/').map_or("", |(parent, _)| parent) == parent;
+                if candidate == path || same_folder {
+                    return Ok(Some(ImportedCopy {
+                        path: candidate,
+                        zone,
+                        master,
+                        rendition,
+                        size: u64::try_from(size)?,
+                        sha256,
+                        checksum,
+                    }));
+                }
+            }
+            Ok(None)
+        })
+        .await
+    }
+
+    /// Drop carried-over copies no row took over. Their files stay on disk.
+    pub(crate) async fn clear_imported(&self) -> anyhow::Result<u64> {
+        self.with(|conn| Ok(u64::try_from(conn.execute("DELETE FROM imported", [])?)?))
+            .await
     }
 
     /// Personal-library stand-ins whose Shared Library photo no selected
@@ -1034,6 +1203,7 @@ mod tests {
             size: 3,
             checksum: checksum.into(),
             adopt: false,
+            imported: None,
         };
         state
             .apply_plan("Z", "A1", vec![wanted("c1", "a.jpg")])

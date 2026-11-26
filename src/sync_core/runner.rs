@@ -15,7 +15,7 @@ use crate::state::db::account::AccountOwner;
 
 use super::{CoreConfig, CycleReport, State, run_cycle};
 
-const ACCOUNT_KEY: &str = "account_provider";
+pub(crate) const ACCOUNT_KEY: &str = "account_provider";
 
 pub(crate) struct Run<'a> {
     pub(crate) config: &'a Config,
@@ -35,7 +35,20 @@ pub(crate) async fn run(run: Run<'_>) -> anyhow::Result<()> {
         config.auth.domain.as_str(),
     )
     .await?;
-    let state = open_owned(&State::path_for(&legacy), run.owner).await?;
+    let target = State::path_for(&legacy);
+    if let Some(import) =
+        super::upgrade::prepare(&legacy, &target, run.owner, &config.download.directory).await?
+    {
+        tracing::info!(
+            recorded = import.recorded,
+            carried_over = import.imported,
+            changed_on_disk = import.changed_on_disk,
+            outside_download_directory = import.outside,
+            duplicates = import.duplicates,
+            "Upgraded sync state; the previous state file is kept until the first full listing completes"
+        );
+    }
+    let state = open_owned(&target, run.owner).await?;
     let core = core_config(config, run.retry);
     let libraries = run.libraries;
     anyhow::ensure!(!libraries.is_empty(), "No library is selected.");
@@ -44,6 +57,17 @@ pub(crate) async fn run(run: Run<'_>) -> anyhow::Result<()> {
         let client = run.session.read().await.download_client().clone();
         let report = run_cycle(&state, &libraries, &core, &client, run.shutdown).await?;
         log_report(&report);
+        let listed_everywhere = !run.shutdown.is_cancelled()
+            && report
+                .zones
+                .iter()
+                .all(|zone| zone.caught_up && zone.error.is_none());
+        if listed_everywhere && let Some(freed) = super::upgrade::finish(&state).await? {
+            tracing::info!(
+                freed_bytes = freed,
+                "Removed the previous state file and its backups"
+            );
+        }
         let Some(interval) = config.watch.interval else {
             if run.shutdown.is_cancelled() {
                 return Ok(());

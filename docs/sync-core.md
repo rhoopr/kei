@@ -71,13 +71,13 @@ The provider inbox and catalog, selection generations and decisions, rank pages,
 
 ## Upgrade
 
-The upgrade establishes the new state, validates it, then removes the old history. Users report oversized state databases, so the upgrade must end with a compact database, not only a new schema.
+The upgrade establishes the new state, validates it, then removes the old history. Users report oversized state databases, so the upgrade must end with a compact database, not only a new schema. It is implemented in `src/sync_core/upgrade.rs` and runs before the first cycle when `<account>.sync.db` does not exist yet but the old `<account>.db` does.
 
-1. **Build.** Create a new database file next to the old one. Read the old database (schema 49 or older) read-only and import, for each verified local copy, its asset, rendition, path, SHA-256 and size into `files` as done, plus account ownership and the config hash. Nothing else is carried over: no inbox, catalog, generations, journals or legacy evidence. The old file is not modified.
-2. **Validate.** Before switching, check the new database: integrity check passes, the account owner matches, every imported copy has a unique path, the imported count matches the old database's verified copies, and each imported file exists with its recorded size. Files are not re-hashed; their recorded SHA-256 is trusted. A failed check discards the new file, keeps the old one in use and reports the reason.
-3. **Switch.** Atomically rename the new file into place and keep the old one under a backup name. This is the rollback point.
-4. **First cycle.** Run a full listing. Imported files are re-adopted by path and size, and anything missing is downloaded. Files the import could not match are left untouched and may coexist with new downloads.
-5. **Clean up.** After the first cycle completes its full listing, delete the old database file and its WAL and backups, and report the space reclaimed. Until then, downgrading to the previous release works by restoring the backup. After cleanup it does not.
+1. **Verify ownership.** The old file is opened read-only and its account owner is checked against the authenticated account. A mismatch refuses the sync with the existing ownership error, and nothing is written.
+2. **Build.** Create `<account>.sync.db.importing`, replacing any earlier unfinished one. Carry over each verified local copy the old state recorded (`assets`, `asset_metadata_paths` and verified `provider_active_destinations` rows): path, size, recorded SHA-256 and iCloud checksum. A copy is dropped from the import, and planned normally, when its file is missing or changed size, its path is outside the download directory, or another copy already claimed its path. Nothing else is carried over: no inbox, catalog, generations, journals or legacy evidence. The old file is never written.
+3. **Validate and switch.** Check the new file's integrity, fold its write-ahead log into it, and rename it to `<account>.sync.db`. The old file stays where it was as the rollback point.
+4. **First cycle.** Run a full listing. When the planner creates a copy, it takes over a carried-over copy of the same photo and rendition at the planned path, or in the same folder under an older name, without hashing or downloading. If iCloud now serves a different version, the copy is replaced only while it still matches its recorded hash. Files nothing takes over stay on disk.
+5. **Clean up.** After a cycle in which every zone finished its listing without an error, delete the old file and its `-wal`, `-shm` and `-journal` companions, and the `.kei-schema-backup-*` bundles whose manifest names that file. Bundles for other databases, or with unexpected contents, stay. The freed bytes are logged. Until then, the previous release can still use the old file. After cleanup it cannot.
 
 Because the new state lives in a fresh file, no `VACUUM` of the old database is needed, and the upgrade never needs more free space than the old file plus the new, smaller one.
 
@@ -104,4 +104,5 @@ Acceptance tests in `src/sync_core/tests.rs` drive whole cycles against a fake z
 - **Reporting.** Health files, metrics, notifications and the JSON report are not yet fed by the core; it logs a per-library summary and backup status.
 - **Missing files.** Normal sync does not yet re-check that done copies still exist.
 - **Session expiry.** A session that expires mid-run is not re-authenticated yet; the next cycle fails until restart.
-- **Old-engine behavioral tests.** Nine `account_ownership` tests drive `kei sync` and assert previous-engine state. Six check retired internals (provider inbox, catalog, rank pages, sparse identity, legacy metadata keys) and go with that engine. Three check old-state ownership refusal, migration backup and reuse of existing files, and are replaced by the upgrade slice.
+- **Old-engine behavioral tests.** Seven `account_ownership` tests drive `kei sync` and assert previous-engine state (provider inbox, catalog, rank pages, sparse identity, legacy metadata keys and retired checkpoint tables). They go with that engine.
+- **Other commands.** `status`, `verify`, `manifest`, `import-existing`, `doctor` and `reset` still read the previous state file. After the upgrade cleanup they find no state until they are moved to the sync core.

@@ -174,6 +174,17 @@ pub(super) fn open(path: &Path, owner: &AccountOwner) -> Result<(Connection, boo
     Ok((conn, created))
 }
 
+/// Open an existing state file read-only after verifying it belongs to the
+/// authenticated account. Nothing in the file is changed.
+pub(crate) fn open_verified_read_only(
+    path: &Path,
+    owner: &AccountOwner,
+) -> Result<Connection, StateError> {
+    let conn = open_read_only(path)?;
+    validate_authenticated(&conn, owner)?;
+    Ok(conn)
+}
+
 pub(super) fn open_read_only(path: &Path) -> Result<Connection, StateError> {
     let conn =
         Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|source| {

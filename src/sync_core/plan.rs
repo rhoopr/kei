@@ -16,7 +16,7 @@ use crate::icloud::photos::smart_folders::{sensitive_smart_folder_names, smart_f
 use crate::selection::{AlbumSelector, SmartFolderSelector};
 
 use super::CoreConfig;
-use super::state::{AlbumRow, DirtyAsset, State, WantedFile};
+use super::state::{AlbumRow, DirtyAsset, ImportedCopy, State, WantedFile};
 
 const BATCH: usize = 256;
 /// `files.album` prefix for smart folder copies.
@@ -158,9 +158,24 @@ async fn plan_asset(
         }
         for file in files {
             let relative = relative_path(&config.directory, &file.path)?;
+            let mut imported = None;
             let (path, adopt) =
                 if existing.contains(&(file.rendition.to_owned(), placement.key.clone())) {
                     (relative, false)
+                } else if let Some(copy) = carried_over(
+                    state,
+                    &config.directory,
+                    zone,
+                    photo.id(),
+                    file.rendition,
+                    &relative,
+                    &taken,
+                )
+                .await?
+                {
+                    let path = copy.path.clone();
+                    imported = Some(copy);
+                    (path, false)
                 } else {
                     choose_path(
                         state,
@@ -180,10 +195,40 @@ async fn plan_asset(
                 size: file.size,
                 checksum: file.checksum,
                 adopt,
+                imported,
             });
         }
     }
     Ok(Some(wanted))
+}
+
+/// A copy the previous engine recorded for this photo and rendition at the
+/// planned path or in the same folder, if its file is still there unchanged
+/// in size.
+async fn carried_over(
+    state: &State,
+    directory: &Path,
+    zone: &str,
+    master: &str,
+    rendition: &str,
+    relative: &str,
+    taken: &HashSet<String>,
+) -> anyhow::Result<Option<ImportedCopy>> {
+    let Some(copy) = state
+        .imported_copy(zone, master, rendition, relative)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if taken.contains(&copy.path) {
+        return Ok(None);
+    }
+    Ok(
+        match tokio::fs::symlink_metadata(directory.join(&copy.path)).await {
+            Ok(meta) if meta.is_file() && meta.len() == copy.size => Some(copy),
+            _ => None,
+        },
+    )
 }
 
 /// Pick a free path for a new copy: the derived path, then the asset's

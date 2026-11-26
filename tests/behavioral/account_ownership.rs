@@ -432,8 +432,10 @@ async fn account_ownership_overlapping_state_isolated_through_every_cli_path() {
         // Genuine owner positive controls through the actual command. A's
         // explicit resets may mutate A, but no route may read or mutate B.
         for (selected, other) in [(&a, &b), (&b, &a)] {
-            let other_state = state(&other.path);
-            let other_bytes = std::fs::read(&other.path).unwrap();
+            // A completed sync replaces an account's previous state file with
+            // its sync-core file, so compare whichever files the other has.
+            let other_files = account_state_files(other);
+            let other_state = other.path.exists().then(|| state(&other.path));
             let out = command(root, selected, args);
             success(&out);
             assert_eq!(
@@ -447,13 +449,13 @@ async fn account_ownership_overlapping_state_isolated_through_every_cli_path() {
                 "{args:?}: B media before fixture restoration"
             );
             assert_eq!(
-                state(&other.path),
+                other.path.exists().then(|| state(&other.path)),
                 other_state,
                 "{args:?}: other account rows"
             );
             assert_eq!(
-                std::fs::read(&other.path).unwrap(),
-                other_bytes,
+                account_state_files(other),
+                other_files,
                 "{args:?}: other account DB bytes"
             );
             if args[0] == "status" || args[0] == "manifest" {
@@ -488,6 +490,14 @@ async fn account_ownership_overlapping_state_isolated_through_every_cli_path() {
             b"known media belonging only to account B"
         );
     }
+}
+
+/// The bytes of an account's previous-engine and sync-core state files.
+fn account_state_files(account: &Account) -> Vec<(PathBuf, Vec<u8>)> {
+    [account.path.clone(), account.path.with_extension("sync.db")]
+        .into_iter()
+        .filter_map(|path| std::fs::read(&path).ok().map(|bytes| (path, bytes)))
+        .collect()
 }
 
 fn seed_restore(root: &Path, account: &Account, server: &str) -> Account {
@@ -634,19 +644,15 @@ async fn migration_backup_every_writable_cli_path_removes_its_own_bundle_and_kee
         .respond_with(OfflinePhotos)
         .mount(&server)
         .await;
+    // `sync` and `service run` read the previous state file read-only to
+    // build sync-core state and never migrate it, so the file itself stays
+    // the rollback point; `sync_core::upgrade` tests cover that path.
     let paths: &[&[&str]] = &[
         &["status", "--downloaded", "--pending"],
         &["verify"],
         &["reconcile"],
         &["doctor", "--json"],
         &["import-existing", "--force-empty"],
-        &[
-            "sync",
-            "--no-progress-bar",
-            "--skip-created-before",
-            "2020-01-01",
-        ],
-        &["service", "run"],
         &["reset", "sync-token", "--yes"],
     ];
     for args in paths {

@@ -752,3 +752,176 @@ async fn stand_ins_for_an_unselected_shared_library_are_counted() {
     let report = h.run().await;
     assert_eq!(report.unselected_shared, 0);
 }
+
+fn account(user: &str) -> crate::state::db::account::AccountOwner {
+    crate::state::db::account::AccountOwner::authenticated(
+        user,
+        "com",
+        &serde_json::from_value(json!({"dsInfo": {"dsid": format!("dsid-{user}")}})).unwrap(),
+    )
+    .unwrap()
+}
+
+/// An owned previous-engine database recording `copies` as downloaded:
+/// `(master, absolute path, size, sha256, iCloud checksum)`.
+async fn legacy_state(
+    path: &Path,
+    owner: &crate::state::db::account::AccountOwner,
+    copies: &[(&str, PathBuf, u64, String, String)],
+) {
+    drop(
+        crate::state::SqliteStateDb::open_owned(path, owner)
+            .await
+            .unwrap(),
+    );
+    let conn = rusqlite::Connection::open(path).unwrap();
+    for (master, local, size, sha256, checksum) in copies {
+        conn.execute(
+            "INSERT INTO assets (library, id, version_size, checksum, filename, created_at, size_bytes,
+                 media_type, status, local_path, last_seen_at, local_checksum)
+             VALUES ('PrimarySync', ?1, 'original', ?2, 'x.jpg', 0, ?3, 'photo', 'downloaded', ?4, 0, ?5)",
+            rusqlite::params![master, checksum, *size as i64, local.to_string_lossy(), sha256],
+        )
+        .unwrap();
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
+fn checksum_of(record: &Value) -> String {
+    record["fields"]["resOriginalRes"]["value"]["fileChecksum"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn an_upgrade_reuses_recorded_copies_then_removes_the_old_state() {
+    let h = Harness::new().await;
+    h.push(album("AL", "Trip"));
+    let m1 = h.master("M1", "IMG_0001.JPG", &jpeg("one")).await;
+    let m2 = h.master("M2", "IMG_0002.JPG", &jpeg("two")).await;
+    let (c1, c2) = (checksum_of(&m1), checksum_of(&m2));
+    h.push(m1);
+    h.push(asset("A1", "M1"));
+    h.push(m2);
+    h.push(asset("A2", "M2"));
+    h.push(member("A2", "AL"));
+
+    let photos = h.photos();
+    std::fs::create_dir_all(photos.join("2023")).unwrap();
+    std::fs::create_dir_all(photos.join("Trip")).unwrap();
+    std::fs::write(photos.join("2023/IMG_0001.JPG"), jpeg("one")).unwrap();
+    // The previous engine named this copy differently, in the same folder.
+    std::fs::write(photos.join("Trip/IMG_0002-old.JPG"), jpeg("two")).unwrap();
+
+    let owner = account("upgrade@example.invalid");
+    let legacy = h.root.path().join("account.db");
+    let size = jpeg("one").len() as u64;
+    legacy_state(
+        &legacy,
+        &owner,
+        &[
+            (
+                "M1",
+                photos.join("2023/IMG_0001.JPG"),
+                size,
+                sha256_hex(&jpeg("one")),
+                c1,
+            ),
+            (
+                "M2",
+                photos.join("Trip/IMG_0002-old.JPG"),
+                size,
+                sha256_hex(&jpeg("two")),
+                c2,
+            ),
+            (
+                "M9",
+                photos.join("2023/GONE.JPG"),
+                size,
+                sha256_hex(b"gone"),
+                "AQID".into(),
+            ),
+        ],
+    )
+    .await;
+    let ours = h.root.path().join(".kei-schema-backup-ours");
+    let theirs = h.root.path().join(".kei-schema-backup-theirs");
+    for (bundle, database) in [
+        (&ours, legacy.clone()),
+        (&theirs, h.root.path().join("other.db")),
+    ] {
+        std::fs::create_dir_all(bundle).unwrap();
+        std::fs::write(bundle.join("state.db"), b"snapshot").unwrap();
+        std::fs::write(
+            bundle.join("manifest.json"),
+            json!({"database_path_display": std::path::absolute(&database).unwrap().display().to_string()})
+                .to_string(),
+        )
+        .unwrap();
+    }
+    let legacy_before = std::fs::read(&legacy).unwrap();
+
+    let target = State::path_for(&legacy);
+    let import = upgrade::prepare(&legacy, &target, &owner, &photos)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(import.recorded, 3);
+    assert_eq!(import.imported, 2);
+    assert_eq!(import.changed_on_disk, 1);
+    assert_eq!(std::fs::read(&legacy).unwrap(), legacy_before);
+    assert!(
+        upgrade::prepare(&legacy, &target, &owner, &photos)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let state = State::open(&target).await.unwrap();
+    let report = run_cycle(
+        &state,
+        &h.libraries(),
+        &h.config(),
+        &reqwest::Client::new(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(report.zones[0].drain.downloaded, 0);
+    assert_eq!(report.completeness.done, 2);
+    assert_eq!(
+        sorted_files(&photos),
+        ["2023/IMG_0001.JPG", "Trip/IMG_0002-old.JPG"]
+    );
+
+    let freed = upgrade::finish(&state).await.unwrap().unwrap();
+    assert!(freed >= legacy_before.len() as u64);
+    assert!(!legacy.exists());
+    assert!(!ours.exists());
+    assert!(theirs.join("state.db").exists());
+    assert!(upgrade::finish(&state).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn an_upgrade_refuses_another_accounts_state() {
+    let root = tempfile::tempdir().unwrap();
+    let legacy = root.path().join("account.db");
+    legacy_state(&legacy, &account("a@example.invalid"), &[]).await;
+    let before = std::fs::read(&legacy).unwrap();
+    let target = State::path_for(&legacy);
+    let error = upgrade::prepare(&legacy, &target, &account("b@example.invalid"), root.path())
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("account ownership does not match"),
+        "{error:#}"
+    );
+    assert_eq!(std::fs::read(&legacy).unwrap(), before);
+    assert!(!target.exists());
+}

@@ -8,6 +8,7 @@ pub(crate) mod drain;
 pub(crate) mod plan;
 pub(crate) mod runner;
 pub(crate) mod state;
+pub(crate) mod upgrade;
 
 use std::path::PathBuf;
 
