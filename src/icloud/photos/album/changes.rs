@@ -54,6 +54,14 @@ fn classify_replay_page_refusal(
     error: &anyhow::Error,
     continuation: bool,
 ) -> Option<ReplayRefusal> {
+    if let Some(rejection) = ChangesBodyRejection::from_shadow_error(error) {
+        return Some(match rejection {
+            ChangesBodyRejection::UnsuccessfulStatus => ReplayRefusal::UnsuccessfulResponse,
+            ChangesBodyRejection::TooLarge => ReplayRefusal::OversizedBody,
+            ChangesBodyRejection::Malformed => ReplayRefusal::MalformedJson,
+            ChangesBodyRejection::DuplicateKeys => ReplayRefusal::DuplicateJsonKeys,
+        });
+    }
     if error.is::<MissingRecordIdentity>() {
         return Some(ReplayRefusal::InvalidRecords);
     }
@@ -550,17 +558,8 @@ impl PhotoAlbum {
                             // Response validation can detect a refusal before
                             // decoding the zone. Preserve the scoped retry
                             // instead of dispatching it as a generic fallback.
-                            if let Some(&refusal) = error.downcast_ref::<ReplayRefusal>() {
-                                break Some(refusal.into_shadow_error());
-                            }
-                            let refusal = match ChangesBodyRejection::from_shadow_error(&error) {
-                                Some(ChangesBodyRejection::UnsuccessfulStatus) => ReplayRefusal::UnsuccessfulResponse,
-                                Some(ChangesBodyRejection::TooLarge) => ReplayRefusal::OversizedBody,
-                                Some(ChangesBodyRejection::Malformed) => ReplayRefusal::MalformedJson,
-                                Some(ChangesBodyRejection::DuplicateKeys) => ReplayRefusal::DuplicateJsonKeys,
-                                None => break Some(error),
-                            };
-                            break Some(refusal.into_shadow_error());
+                            let refusal = classify_replay_page_refusal(&error, visited.len() > 1);
+                            break Some(refusal.map_or(error, ReplayRefusal::into_shadow_error));
                         }
                     },
                 };
