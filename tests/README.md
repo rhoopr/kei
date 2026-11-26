@@ -741,6 +741,38 @@ These requirements do not retire raw-inbox limits, all-generation provider-work 
 
 ## State-transition proof
 
+Changes to durable configuration, filesystem paths, media publication,
+metadata, SQLite state, retry work, or provider checkpoints require a
+state-transition proof through the production call graph. The test must cover
+these stages:
+
+1. **Initial durable state:** Use real SQLite and a `TempDir` where practical.
+   Create the exact state and files that exist before the transition.
+2. **Controlled mutation:** Change one config field, provider fact, local
+   entry, or injected failure.
+3. **Production cycle:** Enter through the normal production owner and its
+   direct callers. Do not duplicate planning or finalization policy in the
+   test.
+4. **Durable outcome:** Assert concrete filesystem, SQLite, metadata, retry,
+   and checkpoint results. An empty destination proves only the empty case.
+5. **Steady-state cycle:** Run the same configuration again. Assert no repeat
+   reconciliation, duplicate file, orphaned state path, or repeated provider
+   work.
+
+Cover each applicable dimension: album, smart-folder, and unfiled passes;
+single and companion media; absent, regular, conflicting, leaf-symlink, and
+parent-symlink entries; metadata disabled and enabled; interruption; and
+state-write failure. Keep the matrix proportional to the changed behavior.
+
+`just gate`, line coverage, fuzzing, and fresh-workspace live tests are
+supporting evidence. They do not prove a multi-cycle transition unless they
+exercise the initial state, mutation, durable outcome, and steady-state cycle.
+Reports must state whether the destination was empty, whether durable state
+was pre-seeded, what changed between cycles, and whether an unchanged cycle
+was checked.
+
+### Regression examples
+
 `cargo test --lib primary_layout::membership` exercises membership departures through `run_cycle` with authenticated synthetic provider pages and reopened SQLite. Initial cycles publish album copies before relation-only departures, a cross-page move, or a container tombstone. Checks cover remaining-album copies, enabled and disabled unfiled placement, interruption, unavailable photo identity, malformed relations, missing discovery, whole-photo deletion, modified media and foreign sidecars. Native copies create no initial layout journals; departure retains source receipts and clears only exact current publication authority. Preserved-local dispositions cannot authorize retirement even with matching bytes. Linux subprocess fixtures kill retirement before publication and after file retirement, reopen non-UTF-8 destinations, and check two quiet cycles. A preservation disposition recorded after journal creation also prevents recovery from retiring that copy. The same tests run with `--no-default-features`.
 
 `cargo test --lib historical_shared_album` retains the historical shared-path controls in the queue-projection fixture. Legacy source reuse alone grants no current authority. A real metadata publication can grant one alias current authority, but another pass's historical claim still prevents exclusive membership retirement. The original receipts, shared file, independent successor copies and two quiet reopens remain checked.
@@ -776,36 +808,6 @@ The behavioral backup matrix is enabled on Unix and Windows and covers eight wri
 Windows stage-substitution regressions replace the populated directory before publication and require identity refusal. The production-opener fixture checks unchanged source schema, database/WAL, configuration and media, preserved backup and foreign evidence, then recovery and two quiet reopens. Helper controls check parent confinement and legitimate publication. Source-bound helper/regression compilation passed; the complete Windows workspace build and native execution remain pending.
 
 The Linux DELETE-mode interruption regression forces migration page spill before killing the production opener. Correct-account and wrong-account reopen attempts must both preserve the database and hot journal when ownership cannot be read safely. The fixture then restores the verified snapshot and checks successful migration and two unchanged reopens. It checks the generated restoration guidance, including preservation of rollback journals. It does not execute an older kei binary or prove power-loss recovery.
-
-Changes to durable configuration, filesystem paths, media publication,
-metadata, SQLite state, retry work, or provider checkpoints require a
-state-transition proof through the production call graph. The test must cover
-these stages:
-
-1. **Initial durable state:** Use real SQLite and a `TempDir` where practical.
-   Create the exact state and files that exist before the transition.
-2. **Controlled mutation:** Change one config field, provider fact, local
-   entry, or injected failure.
-3. **Production cycle:** Enter through the normal production owner and its
-   direct callers. Do not duplicate planning or finalization policy in the
-   test.
-4. **Durable outcome:** Assert concrete filesystem, SQLite, metadata, retry,
-   and checkpoint results. An empty destination proves only the empty case.
-5. **Steady-state cycle:** Run the same configuration again. Assert no repeat
-   reconciliation, duplicate file, orphaned state path, or repeated provider
-   work.
-
-Cover each applicable dimension: album, smart-folder, and unfiled passes;
-single and companion media; absent, regular, conflicting, leaf-symlink, and
-parent-symlink entries; metadata disabled and enabled; interruption; and
-state-write failure. Keep the matrix proportional to the changed behavior.
-
-`just gate`, line coverage, fuzzing, and fresh-workspace live tests are
-supporting evidence. They do not prove a multi-cycle transition unless they
-exercise the initial state, mutation, durable outcome, and steady-state cycle.
-Reports must state whether the destination was empty, whether durable state
-was pre-seeded, what changed between cycles, and whether an unchanged cycle
-was checked.
 
 Account-bound migration qualification uses real file-backed SQLite with a
 live WAL, historical downloaded and pending rows, retained source cursor and

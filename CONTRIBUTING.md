@@ -6,37 +6,13 @@ or a public interface, open an issue first so we can agree on the approach.
 
 ## Before you start
 
-Use the owner table in [the architecture guide](docs/architecture.md) before
-changing code, then read the relevant flow, invariant, and change-impact
-sections.
-
-For a nontrivial change, post a short plan on the issue before implementation:
-
-- What behavior should change, and what are the acceptance criteria?
-- Which module owns the decision, and which direct callers are involved?
-- Can the change affect SQLite state, provider checkpoints, configuration,
-  reports, or local files?
-- What happens after interruption, retry, partial failure, or config drift?
-- Which safety contract or focused scenario slice applies, and which tests
-  will prove the behavior?
-- Which user-facing surfaces need matching changes?
-
-Discuss the approach before deleting production code or tests, changing a
-public CLI/API contract, or adding a dependency or broad configuration option.
+For a nontrivial change, agree on the intended behavior and how to test it in the issue. Get agreement before removing supported behavior, weakening safety coverage, changing a public contract, or adding a dependency. An explicit request from a maintainer covers the change it names.
 
 ## Engineering expectations
 
 ### Work in the owning layer
 
-1. Find the relevant area in [the architecture guide](docs/architecture.md).
-2. Search for the exact symbol, command, flag, SQL name, config key, or error.
-3. Read the owner module and its direct callers before editing.
-4. Trace shared types, traits, schema, serialization, tokens, and paths through
-   all consumers.
-5. Update the architecture guide when ownership or a documented flow changes.
-
-Keep policy in its owner. For example, path formatting must not decide sync
-policy, and the download pipeline must not own CloudKit response parsing.
+The [architecture guide](docs/architecture.md) maps decisions to their owners. Update it when ownership, a documented flow, or an invariant changes. For public interfaces or persisted formats, trace their consumers; for format changes, verify migration from the old representation and round trips of the new one.
 
 ### Protect user data
 
@@ -63,13 +39,8 @@ must cover interruption, retry, partial completion, and stale configuration.
 ## Workflow
 
 1. Fork the repository and create a branch from `main`.
-2. Run `cargo check` before code work.
-3. Make the smallest complete change in the owning module.
-4. Add focused tests for behavior changes.
-5. Run the changed command or user flow when practical.
-6. Review the diff for unrelated changes, unnecessary complexity, missed
-   consumers, and incomplete docs.
-7. Run focused tests for the changed behavior, formatting, and lint checks.
+2. Add focused tests for behavior changes and run the changed command or user flow when practical.
+3. Run focused tests, formatting, and lint checks.
    Every PR runs the Linux baseline. Main pushes run the complete offline suites, platform tests and copies stress.
    Use `just gate` when diagnosing a failure or working without hosted CI.
    The [recipes](justfile) define the commands. See the
@@ -79,7 +50,7 @@ must cover interruption, retry, partial completion, and stale configuration.
    Read [CI qualification](docs/ci.md) for the PR baseline and release prerequisites.
    Tool versions are pinned in [.github/workflows/checks.yml](.github/workflows/checks.yml).
 
-8. Open a pull request against `main`.
+4. Open a pull request against `main`.
 
 All changes go through pull requests. Do not commit directly to `main`.
 
@@ -89,8 +60,7 @@ All changes go through pull requests. Do not commit directly to `main`.
 - Prefer a test that exercises the real production call graph.
 - Put unit tests near the owning module and cross-module behavior in `tests/`.
 - Assert concrete outcomes and edge cases, not only that a call succeeds.
-- For CLI changes, run the changed command and check Docker, systemd, Homebrew,
-  and documentation surfaces where applicable.
+- For CLI changes, run the changed command, check its help and docs, and verify any Docker, systemd, or Homebrew invocation that uses the changed interface.
 - Do not dismiss a failing test as unrelated without investigating it.
 
 Apply the [state-transition proof requirements](tests/README.md#state-transition-proof)
@@ -119,6 +89,8 @@ Describe the end state, not the sequence of edits. Include:
 - Data, state, filesystem, compatibility, or migration risks
 - Tradeoffs or follow-up work that remains
 
+For a readiness review, identify the commit you reviewed and any local edits it excludes. Credit CI only for the commit it tested.
+
 Reviews prioritize:
 
 - Correctness and user-data safety
@@ -140,7 +112,11 @@ Reviews prioritize:
 - Keep internal APIs `pub(crate)` unless a public surface or test-harness
   precedent requires `pub`
 
-## Wiki documentation
+## Documentation
+
+Use direct language and avoid em dashes.
+
+### Wiki documentation
 
 The wiki is a separate repository. Follow the [wiki maintenance checklist](docs/wiki-maintenance.md) for manual version-scoped command/configuration checks, canonical-guide ownership, URL compatibility and publication evidence. Repository tooling changes do not publish wiki content.
 
