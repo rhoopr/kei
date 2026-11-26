@@ -244,7 +244,7 @@ impl State {
         tokio::task::spawn_blocking(move || {
             let mut conn = conn
                 .lock()
-                .map_err(|_| anyhow::anyhow!("Sync state lock was poisoned"))?;
+                .map_err(|_poisoned| anyhow::anyhow!("Sync state lock was poisoned"))?;
             f(&mut conn)
         })
         .await?
@@ -540,11 +540,11 @@ impl State {
                 match existing {
                     Some((id, checksum, state)) => {
                         let state = FileState::parse(&state)?;
+                        // A new version makes a saved or adoptable copy owed again; a
+                        // locally modified copy stays as it is.
                         let next = if checksum == file.checksum || state == FileState::Modified {
                             state
-                        } else if state == FileState::Adopt {
-                            FileState::Pending
-                        } else if state == FileState::Done {
+                        } else if matches!(state, FileState::Adopt | FileState::Done) {
                             FileState::Pending
                         } else {
                             state

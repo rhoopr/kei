@@ -183,7 +183,7 @@ async fn choose_path(
 }
 
 fn relative_path(directory: &Path, path: &Path) -> anyhow::Result<String> {
-    let relative = path.strip_prefix(directory).map_err(|_| {
+    let relative = path.strip_prefix(directory).map_err(|_outside| {
         anyhow::anyhow!(
             "Planned path {} is outside the download directory",
             path.display()

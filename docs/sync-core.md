@@ -94,3 +94,5 @@ Acceptance tests in `src/sync_core/tests.rs` drive whole cycles against a fake z
 - **Previews.** `--dry-run` and `--only-print-filenames` still use the previous engine. They move to the core before that engine is deleted.
 - **Reporting.** Health files, metrics, notifications and the JSON report are not yet fed by the core; it logs a per-library summary and backup status.
 - **Missing files.** Normal sync does not yet re-check that done copies still exist.
+- **Session expiry.** A session that expires mid-run is not re-authenticated yet; the next cycle fails until restart.
+- **Old-engine behavioral tests.** Nine `account_ownership` tests drive `kei sync` and assert previous-engine state. Six check retired internals (provider inbox, catalog, rank pages, sparse identity, legacy metadata keys) and go with that engine. Three check old-state ownership refusal, migration backup and reuse of existing files, and are replaced by the upgrade slice.
