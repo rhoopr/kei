@@ -22,10 +22,11 @@ The state lives in `<account>.sync.db` next to the account's old state file.
 | Table | Holds |
 |---|---|
 | `zones` | One row per library zone: sync position, and whether a full listing has finished since the last reset. |
-| `assets` | One row per `CPLAsset`: its master, the stored record, and the deleted, hidden and purged flags. A mark says it needs planning. |
+| `assets` | One row per `CPLAsset`: its master, the stored record, the deleted, hidden and purged flags, and for a Shared Library stand-in, the photo it links to. A mark says it needs planning. |
 | `masters` | One row per `CPLMaster`: the stored record. |
 | `albums` | Album ID, current name, parent, whether it is a folder, deleted, and the folder fixed at first use. |
 | `memberships` | One row per album relation: album, asset, present or departed. |
+| `smart_members` | Members of the queried smart folders, replaced each cycle. |
 | `files` | One row per local copy: asset, rendition, album or unfiled, relative path, iCloud checksum and size, recorded SHA-256, state (pending, adopt, done, failed, modified), whether it is still wanted, attempts and last error. |
 | `runs` | One row per cycle for status and reports. |
 | `kv` | Small settings: the bound account and the planning config fingerprint. |
@@ -43,6 +44,14 @@ Existing account-owner, temp-file ownership and migration-backup behavior is kep
 5. **Report.** Record the run, completeness and failures.
 
 A missing master, an unknown identity or an absent record keeps the row pending. Absence from a listing never deletes anything, on disk or in the catalog.
+
+## Libraries and folders
+
+**Shared Library.** A `SharedSync-*` zone uses the same feed on the private database. When a photo moves from the personal library to the Shared Library, the personal library keeps a stand-in record that links to it. The stand-in has no copy of its own; its album memberships place the linked photo. Every selected zone is observed before any is planned, so those memberships are known first. If the Shared Library is not selected, photos that live there are not saved.
+
+**Smart folders.** Favorites, Hidden, Recently Deleted, Videos and Live are derived from stored fields, so quiet cycles stay quiet. Screenshots, Panoramas, Slo-mo, Time-lapse and Bursts are read from iCloud's index for each selected folder every cycle, because the subtype fields behind them are not verified. Hidden and recently deleted photos are saved only to their own smart folders when selected. A photo in any regular album or any selected smart folder gets no unfiled copy.
+
+**Date range.** The fixed capture-date range filters planning. Widening it plans the newly included photos from the catalog without a new listing.
 
 ## Invariants
 
@@ -74,7 +83,7 @@ Because the new state lives in a fresh file, no `VACUUM` of the old database is 
 
 ## Budget
 
-The sync core (state, cycle, plan, download driver) stays under 15,000 lines including its tests. One sync path, eight tables.
+The sync core (state, cycle, plan, download driver) stays under 15,000 lines including its tests. One sync path, nine tables.
 
 ## Delivery
 

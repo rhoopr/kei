@@ -20,6 +20,11 @@ use crate::icloud::photos::{PhotoLibrary, PhotosSession};
 #[derive(Default)]
 struct World {
     log: Vec<Value>,
+    /// Change logs of other zones, such as a Shared Library.
+    other_logs: HashMap<String, Vec<Value>>,
+    /// Queried smart folder members, by the folder's `smartAlbum` value or index.
+    smart: HashMap<String, Vec<String>>,
+    smart_queries: usize,
     current: HashMap<String, Value>,
     page_size: usize,
     /// Positions iCloud refuses with `BAD_REQUEST`.
@@ -47,9 +52,31 @@ impl PhotosSession for FakeICloud {
         let body: Value = serde_json::from_str(&body)?;
         let mut world = self.0.lock().unwrap();
         if url.contains("/changes/zone") {
+            let zone = body["zones"][0]["zoneID"]["zoneName"]
+                .as_str()
+                .unwrap()
+                .to_owned();
             let position = body["zones"][0]["syncToken"]
                 .as_str()
                 .map(ToOwned::to_owned);
+            if zone != "PrimarySync" {
+                let log = world.other_logs.get(&zone).cloned().unwrap_or_default();
+                let start = position.as_deref().map_or(0, |position| {
+                    position
+                        .rsplit_once('@')
+                        .unwrap()
+                        .1
+                        .parse::<usize>()
+                        .unwrap()
+                });
+                let end = (start + world.page_size).min(log.len());
+                return Ok(json!({"zones": [{
+                    "zoneID": {"zoneName": zone},
+                    "syncToken": format!("{zone}@{end}"),
+                    "moreComing": end < log.len(),
+                    "records": log.get(start..end).unwrap_or_default(),
+                }]}));
+            }
             world.requested_positions.push(position.clone());
             if let Some(position) = &position
                 && world.rejected.contains(position)
@@ -76,6 +103,24 @@ impl PhotosSession for FakeICloud {
                 "moreComing": end < world.log.len(),
                 "records": records,
             }]}));
+        }
+        if url.contains("/records/query") {
+            world.smart_queries += 1;
+            let filters = body["query"]["filterBy"].as_array().unwrap();
+            let offset = filters[0]["fieldValue"]["value"].as_u64().unwrap() as usize;
+            let key = filters
+                .get(2)
+                .and_then(|filter| filter["fieldValue"]["value"].as_str())
+                .unwrap_or_else(|| body["query"]["recordType"].as_str().unwrap())
+                .to_owned();
+            let members = world.smart.get(&key).cloned().unwrap_or_default();
+            let records: Vec<Value> = members
+                .iter()
+                .skip(offset)
+                .take(2)
+                .map(|name| json!({"recordName": name, "recordType": "CPLAsset", "fields": {}}))
+                .collect();
+            return Ok(json!({"records": records}));
         }
         if url.contains("/records/lookup") {
             let mut records = Vec::new();
@@ -114,6 +159,8 @@ impl PhotosSession for FakeICloud {
 
 struct Harness {
     world: FakeICloud,
+    zones: Mutex<Vec<String>>,
+    tweak: Mutex<Option<fn(&mut CoreConfig)>>,
     server: MockServer,
     root: tempfile::TempDir,
     bytes: Arc<Mutex<HashMap<String, Vec<u8>>>>,
@@ -132,6 +179,8 @@ impl Harness {
         };
         Self {
             world: FakeICloud(Arc::new(Mutex::new(world))),
+            zones: Mutex::new(vec!["PrimarySync".to_owned()]),
+            tweak: Mutex::new(None),
             server,
             root: tempfile::tempdir().unwrap(),
             bytes: Arc::default(),
@@ -142,8 +191,13 @@ impl Harness {
         self.root.path().join("photos")
     }
 
-    fn library(&self) -> PhotoLibrary {
-        PhotoLibrary::new_stub(Box::new(self.world.clone()))
+    fn libraries(&self) -> Vec<PhotoLibrary> {
+        self.zones
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|zone| PhotoLibrary::new_stub_with_zone(Box::new(self.world.clone()), zone))
+            .collect()
     }
 
     fn config(&self) -> CoreConfig {
@@ -156,10 +210,11 @@ impl Harness {
             crate::config::MediaSelection::default(),
         );
         paths.folder_structure = "%Y".into();
-        CoreConfig {
+        let mut config = CoreConfig {
             directory,
             paths,
             albums: AlbumSelector::default(),
+            smart_folders: crate::selection::SmartFolderSelector::None,
             unfiled: true,
             temp_suffix: ".kei-part".into(),
             concurrency: 4,
@@ -168,7 +223,11 @@ impl Harness {
                 base_delay_secs: 0,
                 max_delay_secs: 0,
             },
+        };
+        if let Some(tweak) = *self.tweak.lock().unwrap() {
+            tweak(&mut config);
         }
+        config
     }
 
     async fn state(&self) -> State {
@@ -185,7 +244,7 @@ impl Harness {
         let state = self.state().await;
         run_cycle(
             &state,
-            &[self.library()],
+            &self.libraries(),
             &self.config(),
             &reqwest::Client::new(),
             cancel,
@@ -195,6 +254,10 @@ impl Harness {
     }
 
     fn push(&self, record: Value) {
+        self.push_to("PrimarySync", record);
+    }
+
+    fn push_to(&self, zone: &str, record: Value) {
         let mut world = self.world.0.lock().unwrap();
         let name = record["recordName"].as_str().unwrap().to_owned();
         if record.get("deleted") == Some(&json!(true)) {
@@ -202,7 +265,15 @@ impl Harness {
         } else {
             world.current.insert(name, record.clone());
         }
-        world.log.push(record);
+        if zone == "PrimarySync" {
+            world.log.push(record);
+        } else {
+            world
+                .other_logs
+                .entry(zone.to_owned())
+                .or_default()
+                .push(record);
+        }
     }
 
     /// Serve `bytes` for a master and return its record.
@@ -509,4 +580,161 @@ async fn an_existing_file_with_the_same_size_is_adopted() {
     assert!(report.complete(), "{report:?}");
     assert_eq!(report.zones[0].drain.adopted, 1);
     assert_eq!(report.zones[0].drain.downloaded, 1);
+}
+
+const SHARED: &str = "SharedSync-ABCDEF12-0000";
+
+fn stand_in(name: &str, target: &str) -> Value {
+    json!({
+        "recordName": name, "recordType": "CPLAsset",
+        "fields": {
+            "assetDate": {"value": CAPTURED_MS},
+            "isSparsePrivateRecord": {"value": 1, "type": "INT64"},
+            "linkedShareRecordName": {"value": target, "type": "STRING"},
+            "linkedShareZoneName": {"value": SHARED, "type": "STRING"},
+            "linkedShareZoneOwner": {"value": {"recordName": "_owner"}, "type": "REFERENCE"}
+        }
+    })
+}
+
+fn with_fields(mut record: Value, fields: Value) -> Value {
+    for (key, value) in fields.as_object().unwrap() {
+        record["fields"][key] = value.clone();
+    }
+    record
+}
+
+#[tokio::test]
+async fn shared_library_photos_follow_their_personal_library_albums() {
+    let h = Harness::new().await;
+    h.zones.lock().unwrap().push(SHARED.into());
+    h.push(album("AL", "Trip"));
+    h.push(stand_in("P1", "S1"));
+    h.push(member("P1", "AL"));
+    let s1 = h.master("MS1", "IMG_S1.JPG", &jpeg("shared one")).await;
+    h.push_to(SHARED, s1);
+    h.push_to(SHARED, asset("S1", "MS1"));
+    let s2 = h.master("MS2", "IMG_S2.JPG", &jpeg("shared two")).await;
+    h.push_to(SHARED, s2);
+    h.push_to(SHARED, asset("S2", "MS2"));
+
+    let report = h.run().await;
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(
+        sorted_files(&h.photos()),
+        ["2023/IMG_S2.JPG", "Trip/IMG_S1.JPG"]
+    );
+    assert_eq!(
+        report
+            .zones
+            .iter()
+            .map(|zone| zone.plan.waiting)
+            .sum::<u64>(),
+        0
+    );
+
+    // The stand-in leaves the album: its shared photo becomes unfiled and
+    // the album copy stays.
+    h.push(json!({"recordName": "P1-IN-AL", "deleted": true}));
+    let report = h.run().await;
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(
+        sorted_files(&h.photos()),
+        ["2023/IMG_S1.JPG", "2023/IMG_S2.JPG", "Trip/IMG_S1.JPG"]
+    );
+}
+
+#[tokio::test]
+async fn smart_folders_take_their_photos_out_of_unfiled() {
+    let h = Harness::new().await;
+    *h.tweak.lock().unwrap() = Some(|config| {
+        config.smart_folders = crate::selection::SmartFolderSelector::Named {
+            included: [
+                "Favorites".to_owned(),
+                "Screenshots".to_owned(),
+                "Hidden".to_owned(),
+            ]
+            .into(),
+            excluded: Default::default(),
+        };
+    });
+    for (asset_name, master, file) in [
+        ("A1", "M1", "FAV.JPG"),
+        ("A2", "M2", "SHOT.JPG"),
+        ("A3", "M3", "HIDDEN.JPG"),
+        ("A4", "M4", "PLAIN.JPG"),
+    ] {
+        let record = h.master(master, file, &jpeg(file)).await;
+        h.push(record);
+        let record = match asset_name {
+            "A1" => with_fields(asset("A1", "M1"), json!({"isFavorite": {"value": 1}})),
+            "A3" => with_fields(asset("A3", "M3"), json!({"isHidden": {"value": 1}})),
+            _ => asset(asset_name, master),
+        };
+        h.push(record);
+    }
+    h.world
+        .0
+        .lock()
+        .unwrap()
+        .smart
+        .insert("SCREENSHOT".into(), vec!["A2".into()]);
+
+    let report = h.run().await;
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(
+        sorted_files(&h.photos()),
+        [
+            "2023/PLAIN.JPG",
+            "Favorites/FAV.JPG",
+            "Hidden/HIDDEN.JPG",
+            "Screenshots/SHOT.JPG"
+        ]
+    );
+
+    let report = h.run().await;
+    assert_eq!(report.zones[0].drain.downloaded, 0);
+    assert!(report.complete());
+
+    // Leaving a queried folder makes the photo unfiled; its old copy stays.
+    h.world
+        .0
+        .lock()
+        .unwrap()
+        .smart
+        .insert("SCREENSHOT".into(), Vec::new());
+    let report = h.run().await;
+    assert!(report.complete(), "{report:?}");
+    assert!(sorted_files(&h.photos()).contains(&"2023/SHOT.JPG".to_owned()));
+    assert!(sorted_files(&h.photos()).contains(&"Screenshots/SHOT.JPG".to_owned()));
+}
+
+#[tokio::test]
+async fn the_date_range_limits_which_photos_are_saved() {
+    let h = Harness::new().await;
+    *h.tweak.lock().unwrap() = Some(|config| {
+        config.paths.skip_created_before = Some(crate::config::CreatedDateFilter::CaptureDate(
+            chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+        ));
+    });
+    let old = h.master("M1", "OLD.JPG", &jpeg("old")).await;
+    h.push(old);
+    h.push(asset("A1", "M1"));
+    let new = h.master("M2", "NEW.JPG", &jpeg("new")).await;
+    h.push(new);
+    h.push(with_fields(
+        asset("A2", "M2"),
+        json!({"assetDate": {"value": 1_735_689_600_000.0_f64}}),
+    ));
+
+    let report = h.run().await;
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(sorted_files(&h.photos()), ["2025/NEW.JPG"]);
+
+    // Widening the range plans the earlier photo without a new listing.
+    *h.tweak.lock().unwrap() = None;
+    let report = h.run().await;
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(report.zones[0].pages, 1);
+    assert_eq!(sorted_files(&h.photos()), ["2023/OLD.JPG", "2025/NEW.JPG"]);
 }

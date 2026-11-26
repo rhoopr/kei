@@ -33,10 +33,14 @@ CREATE TABLE IF NOT EXISTS assets (
     deleted INTEGER NOT NULL,
     hidden INTEGER NOT NULL,
     purged INTEGER NOT NULL DEFAULT 0,
+    sparse INTEGER NOT NULL DEFAULT 0,
+    link_zone TEXT,
+    link_name TEXT,
     dirty INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (zone, name)
 ) STRICT;
 CREATE INDEX IF NOT EXISTS assets_by_master ON assets (zone, master);
+CREATE INDEX IF NOT EXISTS assets_by_link ON assets (link_zone, link_name);
 CREATE INDEX IF NOT EXISTS assets_dirty ON assets (zone) WHERE dirty = 1;
 CREATE TABLE IF NOT EXISTS masters (
     zone TEXT NOT NULL,
@@ -65,6 +69,12 @@ CREATE TABLE IF NOT EXISTS memberships (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS memberships_by_asset ON memberships (zone, asset);
 CREATE INDEX IF NOT EXISTS memberships_by_album ON memberships (zone, album);
+CREATE TABLE IF NOT EXISTS smart_members (
+    zone TEXT NOT NULL,
+    folder TEXT NOT NULL,
+    asset TEXT NOT NULL,
+    PRIMARY KEY (zone, folder, asset)
+) STRICT;
 CREATE TABLE IF NOT EXISTS files (
     id INTEGER PRIMARY KEY,
     zone TEXT NOT NULL,
@@ -170,12 +180,18 @@ pub(crate) struct DirtyAsset {
     pub(crate) deleted: bool,
     pub(crate) hidden: bool,
     pub(crate) purged: bool,
-    /// Present memberships in albums that still exist.
-    pub(crate) albums: Vec<String>,
+    /// A personal-library stand-in for a photo in the Shared Library.
+    pub(crate) sparse: bool,
+    /// Present album memberships as `(album zone, album)`, including those of
+    /// personal-library stand-ins that link to this photo.
+    pub(crate) albums: Vec<(String, String)>,
+    /// Queried smart folders that contain this photo.
+    pub(crate) smart: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AlbumRow {
+    pub(crate) zone: String,
     pub(crate) name: String,
     pub(crate) parent: Option<String>,
     pub(crate) title: Option<String>,
@@ -341,27 +357,29 @@ impl State {
         .await
     }
 
-    pub(crate) async fn albums(&self, zone: &str) -> anyhow::Result<Vec<AlbumRow>> {
-        let zone = zone.to_owned();
+    /// Every album the catalog knows, across zones.
+    pub(crate) async fn albums(&self) -> anyhow::Result<Vec<AlbumRow>> {
         self.with(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT name, parent, title, is_folder, deleted, folder FROM albums WHERE zone = ?1",
+                "SELECT zone, name, parent, title, is_folder, deleted, folder FROM albums",
             )?;
             let rows = stmt
-                .query_map([zone], |row| {
+                .query_map([], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(1)?,
                         row.get::<_, Option<String>>(2)?,
-                        row.get::<_, i64>(3)? != 0,
+                        row.get::<_, Option<String>>(3)?,
                         row.get::<_, i64>(4)? != 0,
-                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, i64>(5)? != 0,
+                        row.get::<_, Option<String>>(6)?,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             rows.into_iter()
-                .map(|(name, parent, title, is_folder, deleted, folder)| {
+                .map(|(zone, name, parent, title, is_folder, deleted, folder)| {
                     Ok(AlbumRow {
+                        zone,
                         name,
                         parent,
                         title,
@@ -374,6 +392,43 @@ impl State {
                     })
                 })
                 .collect()
+        })
+        .await
+    }
+
+    /// Replace a queried smart folder's members in a zone, marking photos
+    /// that joined or left it for planning.
+    pub(crate) async fn replace_smart_members(
+        &self,
+        zone: &str,
+        folder: &str,
+        members: std::collections::HashSet<String>,
+    ) -> anyhow::Result<()> {
+        let (zone, folder) = (zone.to_owned(), folder.to_owned());
+        self.with(move |conn| {
+            let tx = conn.transaction()?;
+            let previous: std::collections::HashSet<String> = tx
+                .prepare("SELECT asset FROM smart_members WHERE zone = ?1 AND folder = ?2")?
+                .query_map(params![zone, folder], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            for asset in previous.symmetric_difference(&members) {
+                tx.execute(
+                    "UPDATE assets SET dirty = 1 WHERE zone = ?1 AND name = ?2",
+                    params![zone, asset],
+                )?;
+            }
+            tx.execute(
+                "DELETE FROM smart_members WHERE zone = ?1 AND folder = ?2",
+                params![zone, folder],
+            )?;
+            for asset in &members {
+                tx.execute(
+                    "INSERT INTO smart_members (zone, folder, asset) VALUES (?1, ?2, ?3)",
+                    params![zone, folder, asset],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
         })
         .await
     }
@@ -410,13 +465,21 @@ impl State {
         let (zone, after) = (zone.to_owned(), after.to_owned());
         self.with(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT a.name, a.body, m.body, a.deleted, a.hidden, a.purged OR COALESCE(m.purged, 0)
+                "SELECT a.name, a.body, m.body, a.deleted, a.hidden,
+                        a.purged OR COALESCE(m.purged, 0), a.sparse
                  FROM assets a LEFT JOIN masters m ON m.zone = a.zone AND m.name = a.master
                  WHERE a.zone = ?1 AND a.dirty = 1 AND a.name > ?2 ORDER BY a.name LIMIT ?3",
             )?;
             let mut albums = conn.prepare(
-                "SELECT album FROM memberships WHERE zone = ?1 AND asset = ?2 AND present = 1
-                 ORDER BY album",
+                "SELECT ms.zone, ms.album FROM memberships ms
+                 WHERE ms.present = 1 AND (
+                     (ms.zone = ?1 AND ms.asset = ?2)
+                     OR (ms.zone, ms.asset) IN
+                         (SELECT zone, name FROM assets WHERE link_zone = ?1 AND link_name = ?2))
+                 ORDER BY ms.zone, ms.album",
+            )?;
+            let mut smart = conn.prepare(
+                "SELECT folder FROM smart_members WHERE zone = ?1 AND asset = ?2 ORDER BY folder",
             )?;
             let rows = stmt
                 .query_map(params![zone, after, i64::try_from(limit)?], |row| {
@@ -427,13 +490,20 @@ impl State {
                         deleted: row.get::<_, i64>(3)? != 0,
                         hidden: row.get::<_, i64>(4)? != 0,
                         purged: row.get::<_, i64>(5)? != 0,
+                        sparse: row.get::<_, i64>(6)? != 0,
                         albums: Vec::new(),
+                        smart: Vec::new(),
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             rows.into_iter()
                 .map(|mut asset| {
                     asset.albums = albums
+                        .query_map(params![zone, asset.name], |row| {
+                            Ok((row.get(0)?, row.get(1)?))
+                        })?
+                        .collect::<Result<_, _>>()?;
+                    asset.smart = smart
                         .query_map(params![zone, asset.name], |row| row.get(0))?
                         .collect::<Result<_, _>>()?;
                     Ok(asset)
@@ -766,6 +836,16 @@ fn file_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<anyhow::Result<FileRow>
     })())
 }
 
+/// Mark the photo a stand-in links to for planning.
+fn mark_linked_dirty(tx: &rusqlite::Transaction<'_>, zone: &str, name: &str) -> anyhow::Result<()> {
+    tx.execute(
+        "UPDATE assets SET dirty = 1 WHERE (zone, name) IN
+             (SELECT link_zone, link_name FROM assets WHERE zone = ?1 AND name = ?2)",
+        params![zone, name],
+    )?;
+    Ok(())
+}
+
 fn apply_observation(
     tx: &rusqlite::Transaction<'_>,
     zone: &str,
@@ -778,22 +858,33 @@ fn apply_observation(
             body,
             deleted,
             hidden,
+            sparse,
         } => {
+            // A stand-in's albums belong to its linked photo: re-plan the
+            // photo it linked to before and the one it links to now.
+            mark_linked_dirty(tx, zone, &name)?;
+            let target = sparse.as_ref().and_then(|link| link.target.clone());
             tx.execute(
-                "INSERT INTO assets (zone, name, master, body, deleted, hidden, purged, dirty)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 1)
+                "INSERT INTO assets (zone, name, master, body, deleted, hidden, purged, sparse,
+                     link_zone, link_name, dirty)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, 1)
                  ON CONFLICT (zone, name) DO UPDATE SET master = excluded.master,
                      body = excluded.body, deleted = excluded.deleted,
-                     hidden = excluded.hidden, purged = 0, dirty = 1",
+                     hidden = excluded.hidden, purged = 0, sparse = excluded.sparse,
+                     link_zone = excluded.link_zone, link_name = excluded.link_name, dirty = 1",
                 params![
                     zone,
                     name,
                     master,
                     body,
                     i64::from(deleted),
-                    i64::from(hidden)
+                    i64::from(hidden),
+                    i64::from(sparse.is_some()),
+                    target.as_ref().map(|(zone, _)| zone.as_str()),
+                    target.as_ref().map(|(_, name)| name.as_str()),
                 ],
             )?;
+            mark_linked_dirty(tx, zone, &name)?;
         }
         Observation::Master { name, body } => {
             tx.execute(
@@ -828,6 +919,13 @@ fn apply_observation(
                      (SELECT asset FROM memberships WHERE zone = ?1 AND album = ?2)",
                 params![zone, name],
             )?;
+            tx.execute(
+                "UPDATE assets SET dirty = 1 WHERE (zone, name) IN
+                     (SELECT a.link_zone, a.link_name FROM assets a
+                      JOIN memberships ms ON ms.zone = a.zone AND ms.asset = a.name
+                      WHERE ms.zone = ?1 AND ms.album = ?2)",
+                params![zone, name],
+            )?;
         }
         Observation::Membership {
             relation,
@@ -845,6 +943,7 @@ fn apply_observation(
                 "UPDATE assets SET dirty = 1 WHERE zone = ?1 AND name = ?2",
                 params![zone, asset],
             )?;
+            mark_linked_dirty(tx, zone, &asset)?;
         }
         Observation::Purged { name } => {
             tx.execute(
@@ -875,6 +974,7 @@ mod tests {
             body: "{}".into(),
             deleted: false,
             hidden: false,
+            sparse: None,
         }
     }
 
@@ -968,7 +1068,7 @@ mod tests {
             .await
             .unwrap();
         let dirty = state.dirty_assets("Z", "", 10).await.unwrap();
-        assert_eq!(dirty[0].albums, vec!["AL".to_owned()]);
+        assert_eq!(dirty[0].albums, vec![("Z".to_owned(), "AL".to_owned())]);
         state.apply_plan("Z", "A1", Vec::new()).await.unwrap();
         state
             .commit_page(

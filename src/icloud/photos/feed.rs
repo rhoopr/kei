@@ -13,9 +13,11 @@ use anyhow::Context;
 use serde_json::{Map, Value, json};
 
 use super::PhotoLibrary;
-use super::asset::{PhotoAsset, classify_change_reason};
+use super::asset::{PhotoAsset, SparseShareEvidence, classify_change_reason};
 use super::cloudkit::{ChangesZoneResponse, Record};
-use super::queries::{DESIRED_KEYS, DESIRED_KEYS_VALUES, build_changes_zone_request};
+use super::queries::{
+    DESIRED_KEYS, DESIRED_KEYS_VALUES, IDENTITY_LOOKUP_KEYS_VALUES, build_changes_zone_request,
+};
 use super::session::{check_changes_zone_error, retry_post, retry_post_allowing_record_errors};
 use super::types::ChangeReason;
 
@@ -51,6 +53,9 @@ pub(crate) enum Observation {
         body: String,
         deleted: bool,
         hidden: bool,
+        /// A personal-library stand-in for a photo moved to the Shared
+        /// Library. It has no media of its own here.
+        sparse: Option<SparseLink>,
     },
     /// A `CPLMaster`. `body` is a URL-free stored record.
     Master { name: String, body: String },
@@ -69,6 +74,12 @@ pub(crate) enum Observation {
     },
     /// A purged record whose type iCloud no longer reports.
     Purged { name: String },
+}
+
+/// Where a sparse stand-in's photo lives, when its link is usable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SparseLink {
+    pub(crate) target: Option<(String, String)>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -91,9 +102,10 @@ impl PhotoLibrary {
             .and_then(|zones| zones.get_mut(0))
             .and_then(Value::as_object_mut)
         {
+            // Include the sparse-share fields so stand-ins are recognized.
             zone.insert(
                 "desiredKeys".into(),
-                Value::Array(DESIRED_KEYS_VALUES.clone()),
+                Value::Array(IDENTITY_LOOKUP_KEYS_VALUES.clone()),
             );
         }
         let response = retry_post(
@@ -144,6 +156,64 @@ impl PhotoLibrary {
         })
     }
 
+    /// `CPLAsset` record names in a queried smart folder, from iCloud's index.
+    pub(crate) async fn smart_folder_members(&self, name: &str) -> anyhow::Result<HashSet<String>> {
+        const PAGE: u64 = 200;
+        const MAX_PAGES: usize = 100_000;
+        let folders = super::smart_folders::smart_folders();
+        let (_, folder) = folders
+            .iter()
+            .find(|(known, _)| *known == name)
+            .with_context(|| format!("Unknown smart folder {name}"))?;
+        let mut members = HashSet::new();
+        let mut offset = 0u64;
+        for _ in 0..MAX_PAGES {
+            let mut filter = vec![
+                json!({"fieldName": "startRank", "fieldValue": {"type": "INT64", "value": offset}, "comparator": "EQUALS"}),
+                json!({"fieldName": "direction", "fieldValue": {"type": "STRING", "value": "ASCENDING"}, "comparator": "EQUALS"}),
+            ];
+            if let Some(extra) = folder.query_filter.as_deref().and_then(Value::as_array) {
+                filter.extend(extra.iter().cloned());
+            }
+            let body = json!({
+                "query": {"filterBy": filter, "recordType": folder.list_type},
+                "resultsLimit": PAGE * 2,
+                "desiredKeys": ["recordName", "recordType"],
+                "zoneID": self.zone_id(),
+            });
+            let response = retry_post(
+                self.session(),
+                &self.endpoint_url("records/query"),
+                &body.to_string(),
+                &[("Content-type", "text/plain")],
+                self.retry_config(),
+            )
+            .await?;
+            let records: Vec<Record> = serde_json::from_value(
+                response
+                    .get("records")
+                    .cloned()
+                    .unwrap_or(Value::Array(Vec::new())),
+            )
+            .context("iCloud returned a malformed smart folder page")?;
+            let before = members.len();
+            let assets = records
+                .into_iter()
+                .filter(|record| record.record_type == "CPLAsset" && !record.record_name.is_empty())
+                .map(|record| members.insert(record.record_name))
+                .count();
+            if assets == 0 {
+                return Ok(members);
+            }
+            anyhow::ensure!(
+                members.len() > before,
+                "iCloud repeated a smart folder page"
+            );
+            offset += u64::try_from(assets)?;
+        }
+        anyhow::bail!("Smart folder {name} has more pages than kei reads")
+    }
+
     /// Fetch current records by name, with download URLs. Names iCloud no
     /// longer knows are omitted from the result.
     pub(crate) async fn lookup_records(&self, names: &[String]) -> anyhow::Result<Vec<Record>> {
@@ -178,6 +248,53 @@ impl PhotoLibrary {
             }
         }
         Ok(found)
+    }
+}
+
+/// How the core knows a smart folder's members.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SmartRule {
+    Favorites,
+    Hidden,
+    RecentlyDeleted,
+    Videos,
+    Live,
+    /// Membership comes from iCloud's own index for the folder.
+    Queried,
+}
+
+/// The rule for a smart folder kei recognizes, by its display name.
+pub(crate) fn smart_rule(name: &str) -> Option<SmartRule> {
+    let known = super::smart_folders::smart_folders()
+        .iter()
+        .any(|(known, _)| *known == name);
+    let rule = match name {
+        "Favorites" => SmartRule::Favorites,
+        "Hidden" => SmartRule::Hidden,
+        "Recently Deleted" => SmartRule::RecentlyDeleted,
+        "Videos" => SmartRule::Videos,
+        "Live" => SmartRule::Live,
+        _ => SmartRule::Queried,
+    };
+    known.then_some(rule)
+}
+
+/// Whether a derived smart folder contains a photo. Queried folders answer
+/// `false` here; their members come from [`PhotoLibrary::smart_folder_members`].
+pub(crate) fn in_derived_smart_folder(
+    rule: SmartRule,
+    photo: &PhotoAsset,
+    hidden: bool,
+    deleted: bool,
+) -> bool {
+    match rule {
+        SmartRule::Hidden => hidden && !deleted,
+        SmartRule::RecentlyDeleted => deleted,
+        _ if hidden || deleted => false,
+        SmartRule::Favorites => photo.metadata().is_favorite,
+        SmartRule::Videos => photo.item_type() == Some(super::types::AssetItemType::Movie),
+        SmartRule::Live => photo.is_live_photo(),
+        SmartRule::Queried => false,
     }
 }
 
@@ -229,6 +346,15 @@ fn observe(record: Record) -> anyhow::Result<Option<Observation>> {
             master: reference(&record.fields, "masterRef"),
             deleted: reason == ChangeReason::SoftDeleted,
             hidden: flag(&record.fields, "isHidden"),
+            sparse: SparseShareEvidence::from_fields(&record.fields).map(|evidence| SparseLink {
+                target: match evidence {
+                    SparseShareEvidence::Linked(link) => {
+                        let (zone, record) = link.target();
+                        Some((zone.to_owned(), record.to_owned()))
+                    }
+                    SparseShareEvidence::Malformed => None,
+                },
+            }),
             body: stored_body(&record)?,
             name: record.record_name,
         }),
@@ -388,6 +514,38 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn sparse_stand_ins_keep_their_link() {
+        let linked = observe(record(json!({
+            "recordName": "P1", "recordType": "CPLAsset",
+            "fields": {
+                "isSparsePrivateRecord": {"value": 1, "type": "INT64"},
+                "linkedShareRecordName": {"value": "S1", "type": "STRING"},
+                "linkedShareZoneName": {"value": "SharedSync-ABC", "type": "STRING"},
+                "linkedShareZoneOwner": {"value": {"recordName": "_owner"}, "type": "REFERENCE"}
+            }
+        })))
+        .unwrap()
+        .unwrap();
+        let Observation::Asset {
+            sparse: Some(link), ..
+        } = linked
+        else {
+            panic!("expected a sparse asset");
+        };
+        assert_eq!(link.target, Some(("SharedSync-ABC".into(), "S1".into())));
+    }
+
+    #[test]
+    fn smart_rules_cover_every_known_folder() {
+        for name in super::super::smart_folders::smart_folder_names() {
+            assert!(smart_rule(name).is_some(), "{name}");
+        }
+        assert_eq!(smart_rule("Favorites"), Some(SmartRule::Favorites));
+        assert_eq!(smart_rule("Screenshots"), Some(SmartRule::Queried));
+        assert_eq!(smart_rule("Holiday"), None);
     }
 
     #[test]

@@ -19,7 +19,7 @@ use crate::download::filter::PathDerivationConfig;
 use crate::icloud::photos::PhotoLibrary;
 use crate::icloud::photos::feed::FeedError;
 use crate::retry::RetryConfig;
-use crate::selection::AlbumSelector;
+use crate::selection::{AlbumSelector, SmartFolderSelector};
 
 pub(crate) use state::State;
 
@@ -34,6 +34,7 @@ pub(crate) struct CoreConfig {
     /// Base path rules. Its `folder_structure` is the unfiled template.
     pub(crate) paths: PathDerivationConfig,
     pub(crate) albums: AlbumSelector,
+    pub(crate) smart_folders: SmartFolderSelector,
     pub(crate) unfiled: bool,
     pub(crate) temp_suffix: String,
     pub(crate) concurrency: usize,
@@ -45,9 +46,10 @@ impl CoreConfig {
     /// stay; only which copies are wanted, and where new ones go, changes.
     fn plan_fingerprint(&self) -> String {
         let text = format!(
-            "{:?}|{:?}|{:?}|{}",
+            "{:?}|{:?}|{:?}|{:?}|{}",
             self.paths,
             self.albums,
+            self.smart_folders,
             self.unfiled,
             self.directory.display()
         );
@@ -102,6 +104,8 @@ pub(crate) async fn run_cycle(
         state.set_kv(PLAN_CONFIG_KEY, &fingerprint).await?;
     }
 
+    // Observe every zone before planning any: a photo in one zone can be
+    // placed by albums in another.
     let mut report = CycleReport::default();
     for library in libraries {
         if cancel.is_cancelled() {
@@ -116,19 +120,46 @@ pub(crate) async fn run_cycle(
             tracing::warn!(zone = %zone, error = %format!("{error:#}"), "Could not read iCloud changes; owed downloads continue");
             zone_report.error = Some(format!("{error:#}"));
         }
-        if state.listed(&zone).await? && !cancel.is_cancelled() {
-            zone_report.plan = plan::plan_zone(state, &zone, config).await?;
+        for folder in plan::queried_smart_folders(&config.smart_folders) {
+            if cancel.is_cancelled() {
+                break;
+            }
+            match library.smart_folder_members(&folder).await {
+                Ok(members) => state.replace_smart_members(&zone, &folder, members).await?,
+                Err(error) => {
+                    tracing::warn!(zone = %zone, folder = %folder, error = %format!("{error:#}"), "Could not read a smart folder; its copies wait");
+                    zone_report
+                        .error
+                        .get_or_insert_with(|| format!("{error:#}"));
+                }
+            }
+        }
+        report.zones.push(zone_report);
+    }
+
+    let mut all_listed = true;
+    for library in libraries {
+        all_listed &= state.listed(library.zone_name()).await?;
+    }
+    if all_listed && !cancel.is_cancelled() {
+        for (library, zone_report) in libraries.iter().zip(report.zones.iter_mut()) {
+            zone_report.plan = plan::plan_zone(state, library.zone_name(), config).await?;
+        }
+    }
+
+    for (library, zone_report) in libraries.iter().zip(report.zones.iter_mut()) {
+        if cancel.is_cancelled() {
+            break;
         }
         match drain::drain_zone(state, library, config, client, cancel).await {
             Ok(stats) => zone_report.drain = stats,
             Err(error) => {
-                tracing::warn!(zone = %zone, error = %format!("{error:#}"), "Downloads stopped early; owed copies are retried next cycle");
+                tracing::warn!(zone = %zone_report.zone, error = %format!("{error:#}"), "Downloads stopped early; owed copies are retried next cycle");
                 zone_report
                     .error
                     .get_or_insert_with(|| format!("{error:#}"));
             }
         }
-        report.zones.push(zone_report);
     }
 
     report.completeness = state.completeness().await?;

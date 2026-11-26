@@ -73,6 +73,11 @@ impl std::fmt::Debug for SparseShareLink {
 }
 
 impl SparseShareLink {
+    /// The linked record's zone and record name.
+    pub(crate) fn target(&self) -> (&str, &str) {
+        (&self.zone_name.0, &self.record_name.0)
+    }
+
     /// A link is admissible only in the explicitly selected authenticated scope.
     pub(crate) fn target_in_scope(&self, scope: &Value) -> Option<super::ProviderRecordId> {
         (scope.get("zoneName").and_then(Value::as_str) == Some(self.zone_name.0.as_ref())

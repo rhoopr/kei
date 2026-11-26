@@ -37,11 +37,8 @@ pub(crate) async fn run(run: Run<'_>) -> anyhow::Result<()> {
     .await?;
     let state = open_owned(&State::path_for(&legacy), run.owner).await?;
     let core = core_config(config, run.retry);
-    let libraries = supported_libraries(run.libraries);
-    anyhow::ensure!(
-        !libraries.is_empty(),
-        "No supported library is selected. This build syncs the primary library only."
-    );
+    let libraries = run.libraries;
+    anyhow::ensure!(!libraries.is_empty(), "No library is selected.");
 
     loop {
         let client = run.session.read().await.download_client().clone();
@@ -85,22 +82,6 @@ async fn open_owned(path: &std::path::Path, owner: &AccountOwner) -> anyhow::Res
     Ok(state)
 }
 
-fn supported_libraries(libraries: Vec<PhotoLibrary>) -> Vec<PhotoLibrary> {
-    libraries
-        .into_iter()
-        .filter(|library| {
-            let supported = library.zone_name() == PRIMARY_ZONE_NAME;
-            if !supported {
-                tracing::warn!(
-                    zone = library.zone_name(),
-                    "Shared libraries are not synced by this build yet; skipping"
-                );
-            }
-            supported
-        })
-        .collect()
-}
-
 fn core_config(config: &Config, retry: RetryConfig) -> CoreConfig {
     let directory: PathBuf = config.download.directory.clone();
     let paths = PathDerivationConfig {
@@ -129,6 +110,7 @@ fn core_config(config: &Config, retry: RetryConfig) -> CoreConfig {
         directory,
         paths,
         albums: config.filters.selection.albums.clone(),
+        smart_folders: config.filters.selection.smart_folders.clone(),
         unfiled: config.filters.selection.unfiled,
         temp_suffix: config.download.temp_suffix.clone(),
         concurrency: usize::from(config.download.threads_num.max(1)),
