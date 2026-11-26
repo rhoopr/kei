@@ -57,7 +57,15 @@ The provider inbox and catalog, selection generations and decisions, rank pages,
 
 ## Upgrade
 
-On first run, v0.30 reads a schema-49 or older database once and imports, for each verified local copy, its asset, rendition, path, SHA-256 and size into `files` as done. The old database is kept as a backup. The first cycle runs a full listing, which re-adopts imported files by path and checksum and downloads anything missing. Files the import cannot match are left untouched and may coexist with new downloads.
+The upgrade establishes the new state, validates it, then removes the old history. Users report oversized state databases, so the upgrade must end with a compact database, not only a new schema.
+
+1. **Build.** Create a new database file next to the old one. Read the old database (schema 49 or older) read-only and import, for each verified local copy, its asset, rendition, path, SHA-256 and size into `files` as done, plus account ownership and the config hash. Nothing else is carried over: no inbox, catalog, generations, journals or legacy evidence. The old file is not modified.
+2. **Validate.** Before switching, check the new database: integrity check passes, the account owner matches, every imported copy has a unique path, the imported count matches the old database's verified copies, and each imported file exists with its recorded size. Files are not re-hashed; their recorded SHA-256 is trusted. A failed check discards the new file, keeps the old one in use and reports the reason.
+3. **Switch.** Atomically rename the new file into place and keep the old one under a backup name. This is the rollback point.
+4. **First cycle.** Run a full listing. Imported files are re-adopted by path and size, and anything missing is downloaded. Files the import could not match are left untouched and may coexist with new downloads.
+5. **Clean up.** After the first cycle completes its full listing, delete the old database file and its WAL and backups, and report the space reclaimed. Until then, downgrading to the previous release works by restoring the backup. After cleanup it does not.
+
+Because the new state lives in a fresh file, no `VACUUM` of the old database is needed, and the upgrade never needs more free space than the old file plus the new, smaller one.
 
 ## Budget
 
@@ -68,7 +76,7 @@ The sync core (state, cycle, plan, download driver) stays under 15,000 lines inc
 1. This design.
 2. New state and cycle for the primary library: unfiled and albums, full and incremental, restart after a kill, a rejected sync position, an expired URL.
 3. Shared libraries, smart folders, date range.
-4. Import from schema 49, and adoption of existing files.
+4. Upgrade from schema 49: build, validate, switch, first cycle and history cleanup, plus adoption of existing files.
 5. Metadata pass.
 6. Delete the old engine and its tests, and update `docs/architecture.md`.
 
