@@ -47,7 +47,7 @@ A missing master, an unknown identity or an absent record keeps the row pending.
 
 ## Libraries and folders
 
-**Shared Library.** A `SharedSync-*` zone uses the same feed on the private database. When a photo moves from the personal library to the Shared Library, the personal library keeps a stand-in record that links to it. The stand-in has no copy of its own; its album memberships place the linked photo. Every selected zone is observed before any is planned, so those memberships are known first. If the Shared Library is not selected, photos that live there are not saved.
+**Shared Library.** A `SharedSync-*` zone uses the same feed on the private database. When a photo moves from the personal library to the Shared Library, the personal library keeps a stand-in record that links to it. The stand-in has no copy of its own; its album memberships place the linked photo. Every selected zone is observed before any is planned, so those memberships are known first. If the Shared Library is not selected, photos that live there are not saved, and each cycle warns with their count and the `[filters] libraries` setting that adds it.
 
 **Smart folders.** Favorites, Hidden, Recently Deleted, Videos and Live are derived from stored fields, so quiet cycles stay quiet. Screenshots, Panoramas, Slo-mo, Time-lapse and Bursts are read from iCloud's index for each selected folder every cycle, because the subtype fields behind them are not verified. Hidden and recently deleted photos are saved only to their own smart folders when selected. A photo in any regular album or any selected smart folder gets no unfiled copy.
 

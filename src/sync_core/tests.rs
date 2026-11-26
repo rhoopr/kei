@@ -738,3 +738,17 @@ async fn the_date_range_limits_which_photos_are_saved() {
     assert_eq!(report.zones[0].pages, 1);
     assert_eq!(sorted_files(&h.photos()), ["2023/OLD.JPG", "2025/NEW.JPG"]);
 }
+
+#[tokio::test]
+async fn stand_ins_for_an_unselected_shared_library_are_counted() {
+    let h = Harness::new().await;
+    h.push(stand_in("P1", "S1"));
+    h.push(stand_in("P2", "S2"));
+    let report = h.run().await;
+    assert_eq!(report.unselected_shared, 2);
+    assert!(sorted_files(&h.photos()).is_empty());
+
+    h.zones.lock().unwrap().push(SHARED.into());
+    let report = h.run().await;
+    assert_eq!(report.unselected_shared, 0);
+}

@@ -750,6 +750,31 @@ impl State {
         .await
     }
 
+    /// Personal-library stand-ins whose Shared Library photo no selected
+    /// zone covers. Their photos are not saved.
+    pub(crate) async fn uncovered_stand_ins(&self, zones: Vec<String>) -> anyhow::Result<u64> {
+        self.with(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT link_zone, COUNT(*) FROM assets
+                 WHERE sparse = 1 AND deleted = 0 AND hidden = 0 AND purged = 0
+                 GROUP BY link_zone",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut uncovered = 0u64;
+            for (zone, count) in rows {
+                if zone.is_none_or(|zone| !zones.contains(&zone)) {
+                    uncovered += u64::try_from(count)?;
+                }
+            }
+            Ok(uncovered)
+        })
+        .await
+    }
+
     pub(crate) async fn completeness(&self) -> anyhow::Result<Completeness> {
         self.with(|conn| {
             let mut out = Completeness::default();

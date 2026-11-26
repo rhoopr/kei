@@ -133,6 +133,13 @@ fn log_report(report: &CycleReport) {
             "Library synced"
         );
     }
+    if report.unselected_shared > 0 {
+        tracing::warn!(
+            photos = report.unselected_shared,
+            "Some photos were moved to a Shared Library that is not selected, so they are not \
+             backed up. Add it with [filters] libraries = [\"all\"] in the config file."
+        );
+    }
     let c = report.completeness;
     tracing::info!(
         saved = c.done,

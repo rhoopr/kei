@@ -62,6 +62,9 @@ impl CoreConfig {
 pub(crate) struct CycleReport {
     pub(crate) zones: Vec<ZoneReport>,
     pub(crate) completeness: state::Completeness,
+    /// Photos moved to a Shared Library that is not selected. They are
+    /// not saved; selecting that library saves them.
+    pub(crate) unselected_shared: u64,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -163,6 +166,14 @@ pub(crate) async fn run_cycle(
     }
 
     report.completeness = state.completeness().await?;
+    report.unselected_shared = state
+        .uncovered_stand_ins(
+            libraries
+                .iter()
+                .map(|library| library.zone_name().to_owned())
+                .collect(),
+        )
+        .await?;
     let downloaded = report.zones.iter().map(|zone| zone.drain.downloaded).sum();
     let failed = report.completeness.failed;
     let outcome = if cancel.is_cancelled() {
