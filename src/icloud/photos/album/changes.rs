@@ -547,6 +547,12 @@ impl PhotoAlbum {
                     ) => match result {
                         Ok(body) => body,
                         Err(error) => {
+                            // Response validation can detect a refusal before
+                            // decoding the zone. Preserve the scoped retry
+                            // instead of dispatching it as a generic fallback.
+                            if let Some(&refusal) = error.downcast_ref::<ReplayRefusal>() {
+                                break Some(refusal.into_shadow_error());
+                            }
                             let refusal = match ChangesBodyRejection::from_shadow_error(&error) {
                                 Some(ChangesBodyRejection::UnsuccessfulStatus) => ReplayRefusal::UnsuccessfulResponse,
                                 Some(ChangesBodyRejection::TooLarge) => ReplayRefusal::OversizedBody,
