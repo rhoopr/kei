@@ -6,6 +6,7 @@
 
 pub(crate) mod drain;
 pub(crate) mod plan;
+pub(crate) mod runner;
 pub(crate) mod state;
 
 use std::path::PathBuf;
@@ -118,7 +119,15 @@ pub(crate) async fn run_cycle(
         if state.listed(&zone).await? && !cancel.is_cancelled() {
             zone_report.plan = plan::plan_zone(state, &zone, config).await?;
         }
-        zone_report.drain = drain::drain_zone(state, library, config, client, cancel).await?;
+        match drain::drain_zone(state, library, config, client, cancel).await {
+            Ok(stats) => zone_report.drain = stats,
+            Err(error) => {
+                tracing::warn!(zone = %zone, error = %format!("{error:#}"), "Downloads stopped early; owed copies are retried next cycle");
+                zone_report
+                    .error
+                    .get_or_insert_with(|| format!("{error:#}"));
+            }
+        }
         report.zones.push(zone_report);
     }
 

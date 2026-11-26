@@ -326,6 +326,24 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         libraries.len(),
     );
 
+    // Real syncs run on the sync core. Previews stay on the previous engine
+    // until the core supports them; it is removed with that engine.
+    if !config.runtime.dry_run {
+        let _one_shot_start =
+            (!is_watch_mode).then(|| sd_notifier.start_worker(shutdown_token.clone()));
+        return crate::sync_core::runner::run(crate::sync_core::runner::Run {
+            config: &config,
+            libraries,
+            session: shared_session,
+            owner: account_owner
+                .as_ref()
+                .ok_or(state::error::StateError::AccountIdentityUnavailable)?,
+            retry: api_retry_config,
+            shutdown: &shutdown_token,
+        })
+        .await;
+    }
+
     // Initialize state database.
     // Skip for --dry-run so a preview doesn't create the DB or poison
     // sync tokens, which would cause a subsequent real sync to believe

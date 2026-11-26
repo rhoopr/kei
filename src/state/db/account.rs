@@ -23,6 +23,11 @@ impl AccountOwner {
         }
     }
 
+    /// The authenticated provider fingerprint, if this owner was authenticated.
+    pub(crate) fn provider_key(&self) -> Option<&str> {
+        self.provider.as_deref()
+    }
+
     pub(crate) fn authenticated(
         username: &str,
         realm: &str,

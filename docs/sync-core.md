@@ -17,23 +17,28 @@ A zone's sync position advances in the same SQLite transaction that stores the r
 
 ## State
 
+The state lives in `<account>.sync.db` next to the account's old state file.
+
 | Table | Holds |
 |---|---|
-| `zones` | One row per library zone: sync position, last full listing time, indexing state. |
-| `assets` | One row per photo (CPLAsset with its CPLMaster): identity, capture date, flags (favorite, hidden, deleted, media type), and per-rendition resource fields (checksum, size, filename). |
-| `albums` | Album ID, current name, parent, folder name fixed at first use. |
-| `memberships` | Album ID, asset ID, present or departed. |
-| `files` | One row per wanted local copy: asset, rendition, album or unfiled, relative path, recorded SHA-256 and size, state (pending, done, failed, locally modified), attempts, last error, and metadata-written marker. |
+| `zones` | One row per library zone: sync position, and whether a full listing has finished since the last reset. |
+| `assets` | One row per `CPLAsset`: its master, the stored record, and the deleted, hidden and purged flags. A mark says it needs planning. |
+| `masters` | One row per `CPLMaster`: the stored record. |
+| `albums` | Album ID, current name, parent, whether it is a folder, deleted, and the folder fixed at first use. |
+| `memberships` | One row per album relation: album, asset, present or departed. |
+| `files` | One row per local copy: asset, rendition, album or unfiled, relative path, iCloud checksum and size, recorded SHA-256, state (pending, adopt, done, failed, modified), whether it is still wanted, attempts and last error. |
 | `runs` | One row per cycle for status and reports. |
-| `kv` | Small settings such as the account owner and the config hash. |
+| `kv` | Small settings: the bound account and the planning config fingerprint. |
+
+Stored records keep only the fields kei reads. Download URLs and wrapping keys are dropped; they expire, and the download step fetches current records instead.
 
 Existing account-owner, temp-file ownership and migration-backup behavior is kept.
 
 ## Cycle
 
-1. **Observe.** With a sync position, read `changes/zone` pages. Without one, or when iCloud rejects it, run a full listing. Each page is parsed in `src/icloud/`, then its records and the new sync position are committed together. A page that fails validation stops that zone's cycle and leaves the old position.
-2. **Plan.** Compute the wanted copies from `assets`, `memberships`, the selection and the date range, and upsert `files`. A path is chosen once, with a stable collision suffix, and stored. A config change only changes this step; it never purges the sync position.
-3. **Download.** Drain pending `files` with bounded concurrency through the existing publication path: `.part`, SHA-256 verification, no-overwrite publish, parent-directory fsync, then mark done. Expired download URLs are refreshed by record lookup. Failures stay pending.
+1. **Observe.** Read `changes/zone` pages from the saved position. Without one, `changes/zone` enumerates the whole zone, so a full listing uses the same path. When iCloud rejects the saved position, the zone forgets it and lists again in the same cycle. Each page is parsed in `src/icloud/photos/feed.rs`, then its records and the position after it are committed together. A page that fails validation stops that zone's observation and leaves the old position; owed downloads still run.
+2. **Plan.** Once a zone has finished a full listing, compute the wanted copies of each marked asset from `assets`, `memberships`, the selection and the date range, and upsert `files`. A path is chosen once, with a stable collision suffix, and stored. A file already at a new copy's path with the expected size is adopted after hashing; anything else there is left alone. An asset whose master or album is not known yet stays marked. A config change marks every asset; it never forgets the sync position.
+3. **Download.** Drain owed `files` in batches. Each batch looks up its current records for download URLs, then downloads with bounded concurrency through the existing publication path: `.part`, size and content checks, no-overwrite publish, parent-directory fsync, then the SHA-256 is recorded. A URL iCloud refuses gets one fresh lookup in the same cycle. Failures stay owed.
 4. **Metadata.** If enabled, write metadata for done files whose metadata marker is stale.
 5. **Report.** Record the run, completeness and failures.
 
@@ -69,7 +74,7 @@ Because the new state lives in a fresh file, no `VACUUM` of the old database is 
 
 ## Budget
 
-The sync core (state, cycle, plan, download driver) stays under 15,000 lines including its tests. One sync path, seven tables.
+The sync core (state, cycle, plan, download driver) stays under 15,000 lines including its tests. One sync path, eight tables.
 
 ## Delivery
 
@@ -80,9 +85,12 @@ The sync core (state, cycle, plan, download driver) stays under 15,000 lines inc
 5. Metadata pass.
 6. Delete the old engine and its tests, and update `docs/architecture.md`.
 
-Acceptance tests drive the real binary against a fake CloudKit server and check files on disk, catalog rows and a quiet second run.
+Acceptance tests in `src/sync_core/tests.rs` drive whole cycles against a fake zone feed and a local HTTP server, reopen the state file between runs, and check files on disk, catalog rows and quiet later cycles. Process-level kill tests are still to come.
 
 ## Open items
 
 - **Smart folders.** Derive each from asset flags where the fields allow it (Favorites from `isFavorite`, Videos from media type). Any folder that can't be derived is re-queried on its own each cycle. Each one needs checking.
 - **Live verification.** A run against a real library needs the owner's machine and credentials.
+- **Previews.** `--dry-run` and `--only-print-filenames` still use the previous engine. They move to the core before that engine is deleted.
+- **Reporting.** Health files, metrics, notifications and the JSON report are not yet fed by the core; it logs a per-library summary and backup status.
+- **Missing files.** Normal sync does not yet re-check that done copies still exist.
