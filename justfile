@@ -663,7 +663,7 @@ service-smoke:
     esac
 
 # Disabled: not part of the active workflow.
-# Create branch NAME off a freshly fetched origin/main (AGENTS.md branch-from-fresh-main rule).
+# Create branch NAME off a freshly fetched origin/main.
 # branch NAME:
 #     #!/usr/bin/env bash
 #     set -euo pipefail

@@ -1,4 +1,0 @@
-interface:
-  display_name: "Prepare kei PR"
-  short_description: "Validate a kei branch before review"
-  default_prompt: "Use $kei-pr-ready to validate this kei branch for review readiness."

@@ -9,10 +9,8 @@ run record.
 Metrics:
 - binary_mb           Release binary size, MB (1dp). Bloat detector.
 - docker_image_mb     Docker image size, MB. Layer / dep bloat.
-- src_unwrap_expect   Count of .unwrap()/.expect() calls in src/. Per
-                      AGENTS.md, must stay near zero.
-- src_allow_attrs     Count of #[allow(...)] attrs in src/. Per AGENTS.md,
-                      must stay near zero (fix warnings, don't suppress).
+- src_unwrap_expect   Estimated count of non-test .unwrap()/.expect() calls in src/.
+- src_allow_attrs     Count of #[allow(...)] attrs in src/.
 - deps_count          Crate count in Cargo.lock. Dependency-creep proxy.
 - fuzz_target_count   Number of fuzz targets under fuzz/fuzz_targets/.
 """
@@ -87,8 +85,7 @@ def src_unwrap_expect(repo: Path) -> int:
 
     Heuristic: kei convention puts test modules at the bottom of each file
     behind `#[cfg(test)]`. Stop counting once we hit that line. This
-    approximates the "no .unwrap() in prod" rule from AGENTS.md without
-    needing an AST. False negative if a file has scattered cfg(test)
+    avoids needing an AST. False negative if a file has scattered cfg(test)
     items above prod code -- rare in this repo.
     """
     pat = re.compile(r"\.(?:unwrap|expect)\(")

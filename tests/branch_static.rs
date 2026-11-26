@@ -695,14 +695,6 @@ fn state_transition_policy_links_resolve() {
             ".github/pull_request_template.md",
             "https://github.com/rhoopr/kei/blob/HEAD/CONTRIBUTING.md#pull-requests-and-review",
         ),
-        (
-            ".agents/skills/kei-pr-ready/SKILL.md",
-            "../../../tests/README.md#state-transition-proof",
-        ),
-        (
-            ".agents/skills/kei-pr-ready/SKILL.md",
-            "../../../CONTRIBUTING.md#tests",
-        ),
     ] {
         let path = repo_path(source);
         // Template links also work after GitHub copies them into a PR body.
@@ -1871,39 +1863,6 @@ fn contributor_docs_match_current_gate() {
         "https://github.com/rhoopr/kei/blob/HEAD/CONTRIBUTING.md#workflow",
         &contributing,
     ));
-}
-
-#[test]
-fn repo_pr_ready_skill_uses_current_validation_workflow() {
-    let gitignore = repo_file(".gitignore");
-    assert!(
-        !gitignore.lines().any(|line| line.trim() == ".agents/"),
-        "repository skills must remain available for version control"
-    );
-
-    let skill = repo_file(".agents/skills/kei-pr-ready/SKILL.md");
-    for expected in [
-        "name: kei-pr-ready",
-        "just agent-status",
-        "just review-scope BASE=<resolved-base>",
-        "STALE",
-        "OTHER BRANCH",
-        "docs/architecture.md",
-        "tests/README.md",
-        "just test scenario NAME",
-        "just gate",
-    ] {
-        assert!(
-            skill.contains(expected),
-            "kei-pr-ready skill missing validation contract: {expected}"
-        );
-    }
-
-    let metadata = repo_file(".agents/skills/kei-pr-ready/agents/openai.yaml");
-    assert!(
-        metadata.contains("Use $kei-pr-ready"),
-        "skill metadata must keep its default invocation aligned with SKILL.md"
-    );
 }
 
 #[cfg(target_os = "linux")]
