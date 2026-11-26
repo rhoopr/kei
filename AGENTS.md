@@ -6,7 +6,7 @@ kei syncs iCloud Photos media and metadata to local storage.
 
 - For changes to sync, state, or file writes, use the [owner map](docs/architecture.md#owners) and [safety contracts](docs/architecture.md#safety-contract-catalog).
 - Verify media before publication, preserve existing files, and sync the parent directory before finalizing durable state. Replacing media or metadata requires authorization under the applicable contract.
-- Unknown provider identity keeps work pending. A verified local file alone cannot authorize advancing a provider checkpoint.
+- Unknown provider identity keeps work pending, and absence from a scan is not deletion. Advance a provider checkpoint only after the observations it covers are durably recorded and any unfinished work can be retried after restart.
 - Keep credentials, Apple IDs, and unredacted provider identifiers out of logs and reports.
 - When changing unsafe code, document the `SAFETY` invariant and update [UNSAFE.md](UNSAFE.md).
 
