@@ -181,25 +181,45 @@ mod tests {
     async fn state_opens_only_for_its_own_account() {
         let root = tempfile::tempdir().unwrap();
         let mine = location(root.path(), "me@example.invalid").await;
-        assert!(open(&mine, &signed_in("me@example.invalid", "1"), None).await.unwrap().is_none());
-        create(&mine, &signed_in("me@example.invalid", "1")).await.unwrap();
+        assert!(
+            open(&mine, &signed_in("me@example.invalid", "1"), None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        create(&mine, &signed_in("me@example.invalid", "1"))
+            .await
+            .unwrap();
 
         // The configured account can read it offline.
         let offline = AccountOwner::configured("me@example.invalid", "com");
         assert!(open(&mine, &offline, None).await.unwrap().is_some());
 
         // A different provider identity for the same name is refused.
-        let error = open(&mine, &signed_in("me@example.invalid", "2"), None).await.unwrap_err();
+        let error = open(&mine, &signed_in("me@example.invalid", "2"), None)
+            .await
+            .unwrap_err();
         assert!(format!("{error:#}").contains("account ownership does not match"));
 
         // Another account's file placed at this account's path is refused.
         let theirs = location(root.path(), "them@example.invalid").await;
         std::fs::copy(&mine.current, &theirs.current).unwrap();
-        let error = open(&theirs, &AccountOwner::configured("them@example.invalid", "com"), None)
-            .await
-            .unwrap_err();
+        let error = open(
+            &theirs,
+            &AccountOwner::configured("them@example.invalid", "com"),
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(format!("{error:#}").contains("account ownership does not match"));
-        assert!(delete(&theirs, &AccountOwner::configured("them@example.invalid", "com")).await.is_err());
+        assert!(
+            delete(
+                &theirs,
+                &AccountOwner::configured("them@example.invalid", "com")
+            )
+            .await
+            .is_err()
+        );
         assert!(theirs.current.exists());
     }
 
@@ -208,11 +228,23 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let owner = signed_in("me@example.invalid", "1");
         let mine = location(root.path(), "me@example.invalid").await;
-        drop(crate::state::SqliteStateDb::open_owned(&mine.legacy, &owner).await.unwrap());
-        let upgraded = open(&mine, &owner, Some(root.path())).await.unwrap().unwrap();
+        drop(
+            crate::state::SqliteStateDb::open_owned(&mine.legacy, &owner)
+                .await
+                .unwrap(),
+        );
+        let upgraded = open(&mine, &owner, Some(root.path()))
+            .await
+            .unwrap()
+            .unwrap();
         upgraded.close().await.unwrap();
         assert!(mine.current.exists() && mine.legacy.exists());
-        let removed = delete(&mine, &AccountOwner::configured("me@example.invalid", "com")).await.unwrap();
+        let removed = delete(
+            &mine,
+            &AccountOwner::configured("me@example.invalid", "com"),
+        )
+        .await
+        .unwrap();
         assert!(removed.contains(&mine.current) && removed.contains(&mine.legacy));
         assert!(!mine.exists());
     }

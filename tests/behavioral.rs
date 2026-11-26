@@ -32,6 +32,8 @@ mod account_ownership;
 mod authentication;
 #[path = "behavioral/configuration.rs"]
 mod configuration;
+#[path = "behavioral/core_commands.rs"]
+mod core_commands;
 #[path = "behavioral/output.rs"]
 mod output;
 #[path = "behavioral/released_upgrade.rs"]
@@ -46,7 +48,7 @@ mod support_export;
 mod validation;
 
 use support::{
-    HELPER_SCHEMA_VERSION, clean_cmd, create_state_db, insert_asset, sanitize_username,
-    sync_cmd_for_config_body, sync_cmd_for_validation, write_fake_two_factor_config,
-    write_sync_config,
+    HELPER_SCHEMA_VERSION, clean_cmd, create_state_db, download_config_args, insert_asset,
+    sanitize_username, sync_cmd_for_config_body, sync_cmd_for_validation,
+    write_fake_two_factor_config, write_sync_config,
 };

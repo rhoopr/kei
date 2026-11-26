@@ -293,15 +293,24 @@ pub(crate) async fn run_reconcile(
             Ok(_) => {}
         }
     }
-    for path in missing.iter().take(LISTING_CAP) {
+    // Carried-over copies with no file are never taken over, so the next
+    // sync downloads them as new copies; list them with the rest.
+    let mut carried = Vec::new();
+    for copy in state.list_imported().await? {
+        if tokio::fs::symlink_metadata(directory.join(&copy.path))
+            .await
+            .is_err()
+        {
+            carried.push(copy.path);
+        }
+    }
+    let total = missing.len() + carried.len();
+    for path in missing.iter().chain(carried.iter()).take(LISTING_CAP) {
         println!("MISSING: {}", directory.join(path).display());
     }
-    print_truncation_tail(missing.len(), missing.len().min(LISTING_CAP));
+    print_truncation_tail(total, total.min(LISTING_CAP));
     if args.dry_run {
-        println!(
-            "Dry run: {} missing files would be downloaded again by the next sync.",
-            missing.len()
-        );
+        println!("Dry run: {total} missing files would be downloaded again by the next sync.");
         return Ok(());
     }
     for path in &missing {
@@ -309,10 +318,7 @@ pub(crate) async fn run_reconcile(
             state.owe_again(row.id, None).await?;
         }
     }
-    println!(
-        "{} missing files will be downloaded again by the next sync.",
-        missing.len()
-    );
+    println!("{total} missing files will be downloaded again by the next sync.");
     Ok(())
 }
 

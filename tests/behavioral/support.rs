@@ -30,6 +30,15 @@ pub(super) fn clean_cmd() -> assert_cmd::Command {
     cmd
 }
 
+/// Arguments selecting a config whose download directory is `dir`. Commands
+/// need it to upgrade previous-engine state, whose paths are absolute.
+pub(super) fn download_config_args(dir: &std::path::Path) -> [String; 2] {
+    // Beside the directory, so tests can count the directory's own entries.
+    let config = dir.with_extension("kei-test-config.toml");
+    write_sync_config(&config, dir.to_str().unwrap());
+    ["--config".to_owned(), config.to_str().unwrap().to_owned()]
+}
+
 pub(super) fn write_sync_config(config_path: &std::path::Path, download_dir: &str) {
     std::fs::write(
         config_path,
@@ -761,13 +770,26 @@ pub(super) fn insert_asset(
     last_error: Option<&str>,
     local_checksum: Option<&str>,
 ) {
+    // The previous engine recorded the downloaded file's real size.
+    let size = local_path
+        .and_then(|path| std::fs::metadata(path).ok())
+        .filter(std::fs::Metadata::is_file)
+        .map_or(1000, |meta| meta.len() as i64);
     conn.execute(
         "INSERT INTO assets (library, id, version_size, checksum, filename, created_at, \
          size_bytes, media_type, status, local_path, last_seen_at, last_error, \
          local_checksum, downloaded_at) \
-         VALUES ('PrimarySync', ?1, 'original', 'abc', ?2, 1700000000, 1000, 'photo', ?3, ?4, \
+         VALUES ('PrimarySync', ?1, 'original', 'abc', ?2, 1700000000, ?7, 'photo', ?3, ?4, \
          1700000000, ?5, ?6, CASE WHEN ?3 = 'downloaded' THEN 1700000000 ELSE NULL END)",
-        rusqlite::params![id, filename, status, local_path, last_error, local_checksum],
+        rusqlite::params![
+            id,
+            filename,
+            status,
+            local_path,
+            last_error,
+            local_checksum,
+            size
+        ],
     )
     .unwrap();
 }

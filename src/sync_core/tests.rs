@@ -873,7 +873,7 @@ async fn an_upgrade_reuses_recorded_copies_then_removes_the_old_state() {
         .unwrap()
         .unwrap();
     assert_eq!(import.recorded, 3);
-    assert_eq!(import.imported, 2);
+    assert_eq!(import.imported, 3);
     assert_eq!(import.changed_on_disk, 1);
     assert_eq!(std::fs::read(&legacy).unwrap(), legacy_before);
     assert!(
@@ -925,4 +925,107 @@ async fn an_upgrade_refuses_another_accounts_state() {
     );
     assert_eq!(std::fs::read(&legacy).unwrap(), before);
     assert!(!target.exists());
+}
+
+#[tokio::test]
+async fn an_upgrade_reads_the_released_v0240_schema_after_ownership_is_bound() {
+    let root = tempfile::tempdir().unwrap();
+    let media = root.path().join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    let legacy = root.path().join("account.db");
+    let conn = rusqlite::Connection::open(&legacy).unwrap();
+    conn.execute_batch(include_str!("../../tests/data/released-v0240-schema.sql"))
+        .unwrap();
+    // `kei migrate-state` binds this header to a released, unowned file.
+    let owner = account("released@example.invalid");
+    conn.execute_batch(
+        "CREATE TABLE account_owner (singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+             version INTEGER NOT NULL, account_key TEXT NOT NULL, provider_key TEXT NOT NULL);",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO account_owner VALUES (1, 1, ?1, ?2)",
+        rusqlite::params![owner.key(), owner.provider_key().unwrap()],
+    )
+    .unwrap();
+    for (id, name, bytes) in [
+        ("same", "original.jpg", b"original".as_slice()),
+        ("other", "other.jpg", b"other bytes"),
+    ] {
+        let path = media.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        conn.execute(
+            "INSERT INTO assets (library, id, version_size, checksum, filename, created_at, size_bytes,
+                 media_type, status, local_path, last_seen_at, local_checksum)
+             VALUES ('PrimarySync', ?1, 'original', 'AQID', ?2, 0, ?3, 'photo', 'downloaded', ?4, 0, ?5)",
+            rusqlite::params![id, name, bytes.len() as i64, path.to_string_lossy(), sha256_hex(bytes)],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let target = State::path_for(&legacy);
+    let import = upgrade::prepare(&legacy, &target, &owner, &media)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (import.recorded, import.imported, import.changed_on_disk),
+        (2, 2, 0)
+    );
+    let state = State::open(&target).await.unwrap();
+    let copies = state.list_imported().await.unwrap();
+    assert_eq!(
+        copies
+            .iter()
+            .map(|copy| copy.path.as_str())
+            .collect::<Vec<_>>(),
+        ["original.jpg", "other.jpg"]
+    );
+    assert_eq!(
+        copies[0].sha256.as_deref(),
+        Some(sha256_hex(b"original").as_str())
+    );
+
+    // Another download directory leaves the recorded copies outside it.
+    let elsewhere = root.path().join("new-destination");
+    let other_target = root.path().join("other.sync.db");
+    let import = upgrade::prepare(&legacy, &other_target, &owner, &elsewhere)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((import.imported, import.outside), (0, 2));
+}
+
+#[tokio::test]
+async fn confirmed_damage_is_replaced_by_the_next_sync_only_while_unchanged() {
+    let h = Harness::new().await;
+    library_with_album(&h).await;
+    h.run().await;
+    let path = h.photos().join("2023/IMG_0001.JPG");
+    std::fs::write(&path, b"\xFF\xD8\xFF\xE0damaged").unwrap();
+    let state = h.state().await;
+    let row = state.file_at("2023/IMG_0001.JPG").await.unwrap().unwrap();
+    // What `reconcile --confirm-damage` records: the exact damaged bytes.
+    state
+        .owe_again(row.id, Some(&sha256_hex(b"\xFF\xD8\xFF\xE0damaged")))
+        .await
+        .unwrap();
+    drop(state);
+
+    let report = h.run().await;
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(h.file("2023/IMG_0001.JPG").unwrap(), jpeg("one"));
+
+    // A file edited again after confirmation is kept.
+    let state = h.state().await;
+    let row = state.file_at("2023/IMG_0001.JPG").await.unwrap().unwrap();
+    state
+        .owe_again(row.id, Some(&sha256_hex(b"confirmed")))
+        .await
+        .unwrap();
+    drop(state);
+    let report = h.run().await;
+    assert_eq!(report.completeness.modified, 1);
+    assert_eq!(h.file("2023/IMG_0001.JPG").unwrap(), jpeg("one"));
 }

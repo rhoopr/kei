@@ -28,18 +28,18 @@ pub(crate) async fn run_verify(
     };
     let directory = super::download_directory(toml)
         .context("Set [download].directory in the config file to verify downloaded files.")?;
-    let mut targets: Vec<(String, Option<String>)> = state
+    let mut targets: Vec<(String, String, Option<String>)> = state
         .list_files(&[FileState::Done])
         .await?
         .into_iter()
-        .map(|file| (file.path, file.sha256))
+        .map(|file| (file.path, file.asset, file.sha256))
         .collect();
     targets.extend(
         state
             .list_imported()
             .await?
             .into_iter()
-            .map(|copy| (copy.path, copy.sha256)),
+            .map(|copy| (copy.path, copy.master, copy.sha256)),
     );
 
     println!("Verifying {} downloaded assets...", targets.len());
@@ -58,17 +58,20 @@ pub(crate) async fn run_verify(
         }
     };
 
-    for (relative, sha256) in &targets {
+    for (relative, asset, sha256) in &targets {
         let path = directory.join(relative);
         match inspect_local_path(&path).await {
             LocalPathState::File => {}
             LocalPathState::Missing => {
-                report(format!("MISSING: {}", path.display()));
+                report(format!("MISSING: {} ({asset})", path.display()));
                 missing += 1;
                 continue;
             }
             LocalPathState::Unreadable(error) => {
-                report(format!("UNREADABLE: {} - {error}", path.display()));
+                report(format!(
+                    "UNREADABLE: {} ({asset}) - {error}",
+                    path.display()
+                ));
                 unreadable += 1;
                 continue;
             }
@@ -85,13 +88,16 @@ pub(crate) async fn run_verify(
             Ok(true) => checksum_verified += 1,
             Ok(false) => {
                 report(format!(
-                    "DIFFERENT: {} - checksum does not match",
+                    "DIFFERENT: {} ({asset}) - checksum does not match",
                     path.display()
                 ));
                 different += 1;
             }
             Err(error) => {
-                report(format!("UNREADABLE: {} - {error}", path.display()));
+                report(format!(
+                    "UNREADABLE: {} ({asset}) - {error}",
+                    path.display()
+                ));
                 unreadable += 1;
             }
         }

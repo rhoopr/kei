@@ -238,6 +238,12 @@ pub(crate) struct State {
     conn: Arc<Mutex<Connection>>,
 }
 
+impl std::fmt::Debug for State {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("State").finish_non_exhaustive()
+    }
+}
+
 impl State {
     /// The sync core's database file for an account's legacy state path.
     pub(crate) fn path_for(legacy_state: &Path) -> PathBuf {

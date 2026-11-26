@@ -33,7 +33,8 @@ pub(crate) struct ImportReport {
     /// Verified copies the old state recorded.
     pub(crate) recorded: u64,
     pub(crate) imported: u64,
-    /// The file is gone or its size changed since it was recorded.
+    /// Carried over although the file is gone or its size changed since it
+    /// was recorded. Such a copy is never taken over.
     pub(crate) changed_on_disk: u64,
     /// The recorded path is outside the current download directory.
     pub(crate) outside: u64,
@@ -183,8 +184,8 @@ async fn exists(path: &Path) -> anyhow::Result<bool> {
     }
 }
 
-/// Every verified local copy the old state recorded, kept only when its file
-/// is still in the download directory with its recorded size.
+/// Every verified local copy the old state recorded inside the download
+/// directory, counting those whose file is gone or changed size.
 fn read_copies(
     conn: &Connection,
     directory: &Path,
@@ -289,12 +290,11 @@ fn read_copies(
             continue;
         }
         let size = u64::try_from(size)?;
+        // Kept either way: the planner takes over only a file with the
+        // recorded size, and verify reports the rest.
         match std::fs::symlink_metadata(&absolute) {
             Ok(meta) if meta.is_file() && meta.len() == size => {}
-            _ => {
-                report.changed_on_disk += 1;
-                continue;
-            }
+            _ => report.changed_on_disk += 1,
         }
         copies.push(ImportedCopy {
             path: relative,
