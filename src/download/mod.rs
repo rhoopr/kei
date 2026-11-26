@@ -3,6 +3,7 @@
 //! upfront. Uses a two-phase approach: (1) stream-and-download with bounded
 //! concurrency, then (2) cleanup pass with fresh CDN URLs for any failures.
 
+pub(crate) mod core_io;
 pub mod error;
 pub mod file;
 pub(crate) mod filter;

@@ -709,6 +709,27 @@ impl PhotoLibrary {
     fn clone_session(&self) -> Box<dyn PhotosSession> {
         self.session.clone_box()
     }
+
+    /// Build an endpoint URL for this library's database with its query parameters.
+    pub(super) fn endpoint_url(&self, path: &str) -> String {
+        format!(
+            "{}/{path}?{}",
+            self.service_endpoint,
+            encode_params(&self.params)
+        )
+    }
+
+    pub(super) fn session(&self) -> &dyn PhotosSession {
+        self.session.as_ref()
+    }
+
+    pub(super) fn zone_id(&self) -> &Value {
+        &self.zone_id
+    }
+
+    pub(super) fn retry_config(&self) -> &RetryConfig {
+        &self.retry_config
+    }
 }
 
 #[cfg(test)]

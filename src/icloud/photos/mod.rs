@@ -8,6 +8,7 @@ pub mod cloudkit;
 pub(crate) mod diagnostic;
 pub(crate) mod enc;
 pub mod error;
+pub(crate) mod feed;
 mod hydration_progress;
 pub(crate) mod inbox;
 mod library;

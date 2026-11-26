@@ -50,6 +50,7 @@ mod setup;
 mod shutdown;
 mod state;
 mod support;
+mod sync_core;
 mod sync_cycle;
 mod sync_loop;
 mod systemd;

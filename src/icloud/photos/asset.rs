@@ -357,11 +357,19 @@ fn resolve_item_type(fields: &Value, filename: Option<&str>) -> AssetItemType {
 /// JSON, reducing per-asset memory and making `versions()` infallible.
 /// Incomplete entries (missing URL or checksum) are logged and skipped;
 /// the caller sees an empty map rather than a runtime error.
-fn extract_versions(
+/// Placeholder URL scheme for versions rebuilt from catalog records. It is
+/// never fetched: transfers use URLs from a fresh record lookup.
+pub(crate) const STORED_URL_PREFIX: &str = "kei-stored:";
+
+/// `require_url` is false only for catalog records, which never retain
+/// download URLs. Their versions carry an empty URL and are refreshed by
+/// record lookup before any transfer.
+fn extract_versions_with(
     item_type: Option<AssetItemType>,
     master_fields: &Value,
     asset_fields: &Value,
     record_name: &str,
+    require_url: bool,
 ) -> (VersionsMap, Vec<MalformedResource>) {
     let lookup = if item_type == Some(AssetItemType::Movie) {
         VIDEO_VERSION_LOOKUP
@@ -430,6 +438,7 @@ fn extract_versions(
                     continue;
                 }
             },
+            None if !require_url => Box::from(""),
             None => {
                 tracing::warn!(
                     asset = %record_name,
@@ -496,6 +505,13 @@ fn extract_versions(
             }
         };
 
+        // Stored versions stand in for their URL with the resource checksum,
+        // so path derivation still tells distinct resources apart.
+        let url = if url.is_empty() {
+            format!("{STORED_URL_PREFIX}{checksum}").into_boxed_str()
+        } else {
+            url
+        };
         versions.push((
             *key,
             AssetVersion {
@@ -672,8 +688,13 @@ impl PhotoAsset {
             && asset_fields.get("resJPEGFullRes").is_some())
         .then(|| enc::decode_adjustment_timestamp(&asset_fields))
         .flatten();
-        let (versions, malformed_resources) =
-            extract_versions(item_type_val, &master_fields, &asset_fields, &record_name);
+        let (versions, malformed_resources) = extract_versions_with(
+            item_type_val,
+            &master_fields,
+            &asset_fields,
+            &record_name,
+            true,
+        );
         let asset_metadata = Arc::new(metadata::extract(&master_fields, &asset_fields));
         let rendition_facts =
             metadata::extract_renditions(item_type_val, &master_fields, &asset_fields);
@@ -736,6 +757,24 @@ impl PhotoAsset {
         asset: &super::cloudkit::Record,
         source_zone: Option<Arc<str>>,
     ) -> Self {
+        Self::build(master, asset, source_zone, true)
+    }
+
+    /// Rebuild an asset from catalog records stored without download URLs.
+    /// Its versions carry empty URLs and must not be used for transfer.
+    pub(crate) fn from_stored_records(
+        master: super::cloudkit::Record,
+        asset: &super::cloudkit::Record,
+    ) -> Self {
+        Self::build(master, asset, None, false)
+    }
+
+    fn build(
+        master: super::cloudkit::Record,
+        asset: &super::cloudkit::Record,
+        source_zone: Option<Arc<str>>,
+        require_url: bool,
+    ) -> Self {
         let filename = decode_filename(&master.fields).map(String::into_boxed_str);
         let item_type_val = Some(resolve_item_type(&master.fields, filename.as_deref()));
         let asset_date_ms = asset
@@ -748,11 +787,12 @@ impl PhotoAsset {
             .get("addedDate")
             .and_then(|f| f.get("value"))
             .and_then(Value::as_f64);
-        let (versions, malformed_resources) = extract_versions(
+        let (versions, malformed_resources) = extract_versions_with(
             item_type_val,
             &master.fields,
             &asset.fields,
             &master.record_name,
+            require_url,
         );
         let asset_metadata = Arc::new(metadata::extract(&master.fields, &asset.fields));
         let rendition_facts =
