@@ -229,15 +229,22 @@ pub(super) async fn read_zone_delta(
         if let Ok(completion) = completion_rx.await {
             delta.summary.raw_records_observed = Some(completion.records != 0);
             // Pairing can omit unknown records or leave orphans. Only direct
-            // pairs which account for the entire raw stream replace a listing.
+            // pairs and their explicit live links can replace a listing.
             let mut masters = FxHashSet::default();
-            if completion.records == change_events.len().saturating_mul(2)
+            let mut children = FxHashSet::default();
+            if change_events.iter().all(|event| {
+                IncrementalDeltaState::created_asset(event).is_some_and(|asset| {
+                    !asset.metadata().is_hidden
+                        && !asset.metadata().is_deleted
+                        && masters.insert(asset.id())
+                        && children.insert(asset.asset_record_name())
+                }) || event.relation.as_ref().is_some_and(|link| !link.is_deleted)
+            }) && completion.records == change_events.len().saturating_add(children.len())
                 && change_events.iter().all(|event| {
-                    IncrementalDeltaState::created_asset(event).is_some_and(|asset| {
-                        !asset.metadata().is_hidden
-                            && !asset.metadata().is_deleted
-                            && masters.insert(asset.id())
-                    })
+                    event
+                        .relation
+                        .as_ref()
+                        .is_none_or(|link| children.contains(link.asset_record_name.as_ref()))
                 })
             {
                 delta.summary.paired_pages = completion.pages;

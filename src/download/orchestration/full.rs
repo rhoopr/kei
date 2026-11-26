@@ -19,7 +19,7 @@ use crate::download::pipeline::{
 };
 use crate::icloud::photos::PhotoAsset;
 
-use super::config::{DownloadConfig, IndexingWindow, inventory_scope};
+use super::config::{DownloadConfig, IndexingWindow, InventoryCheckpointPolicy, inventory_scope};
 use super::context::{DownloadContext, preload_download_context};
 use super::models::{
     DATE_BOUNDED_FULL_ENUMERATION_REASON, DownloadControls, DownloadStore,
@@ -576,6 +576,15 @@ fn filter_stream_to_enumeration_bounds(
     shutdown_token: CancellationToken,
 ) -> DownloadPhotoStream {
     let lower_created_bound = enumeration_created_lower_bound(config);
+    if config.inventory_checkpoint == InventoryCheckpointPolicy::Baseline
+        && let Some(bound) = lower_created_bound
+    {
+        // Drain the first query to EOF. Skip only definitely out-of-range
+        // observations; later pages can contain errors or in-range photos.
+        return Box::pin(stream.take_until(shutdown_token.cancelled_owned()).filter(move |item| {
+            std::future::ready(!matches!(item, Ok(asset) if asset.asset_date_evidence().is_some_and(|date| date < bound)))
+        }));
+    }
     if config.complete_path_selection {
         let mut prefix_ended = false;
         let stream = stream.take_until(shutdown_token.cancelled_owned());
@@ -721,12 +730,7 @@ struct PassCountPlan {
 }
 
 fn should_skip_pass_count_fetch(config: &DownloadConfig) -> bool {
-    // Recent-limited and lower-date-bounded runs deliberately enumerate only a
-    // prefix of each newest-first pass. The Hyperion count endpoint reports the
-    // full pass size, not how many complete assets will be yielded inside that
-    // bounded prefix, so using it as an exact undercount bound false-fires on
-    // live accounts with sparse windows. These bounded full syncs suppress the
-    // sync token below because they are not complete zone enumerations.
+    // The provider counts the whole pass, not the selected date range.
     config.skip_created_before.is_some()
 }
 
@@ -899,6 +903,7 @@ pub(super) async fn download_photos_full_with_token_policy(
     let unfiled_only = matches!(passes, [pass] if pass.kind == crate::commands::PassKind::Unfiled);
     let bounds_truncated = Arc::new(AtomicBool::new(false));
     let strict_empty_tail_errors = (config.complete_path_selection
+        || config.inventory_checkpoint == InventoryCheckpointPolicy::Baseline
         || config.skip_created_before.is_none())
         && !controls.run_mode.only_print_filenames()
         && !controls.run_mode.is_dry_run();

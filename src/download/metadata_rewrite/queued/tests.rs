@@ -1782,6 +1782,7 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_rewrite_and_retry(
             "GPS_PROVENANCE",
             "original",
             &path,
+            "checksum123",
             &checksum,
             Some(&checksum),
             false,

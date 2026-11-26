@@ -32,7 +32,7 @@ async fn adopt_released(database: &std::path::Path) {
 #[derive(Clone, Debug)]
 struct UpgradeSession {
     records: serde_json::Value,
-    quiet: bool,
+    cycle: usize,
 }
 
 #[async_trait::async_trait]
@@ -44,9 +44,11 @@ impl crate::icloud::photos::PhotosSession for UpgradeSession {
         _headers: &[(&str, &str)],
     ) -> anyhow::Result<serde_json::Value> {
         if url.contains("/records/query/batch?") {
+            assert!(self.cycle < 2, "upgrade restart requested a count");
             return Ok(crate::sync_loop::test_support::album_count_response(1));
         }
         if url.contains("/records/query?") {
+            assert!(self.cycle < 2, "upgrade restart listed the library");
             let request: serde_json::Value = serde_json::from_str(&body).unwrap();
             let offset = request["query"]["filterBy"]
                 .as_array()
@@ -60,27 +62,43 @@ impl crate::icloud::photos::PhotosSession for UpgradeSession {
             );
         }
         if url.contains("/changes/zone?") {
-            let records = if self.quiet {
-                serde_json::json!([])
-            } else {
-                self.records.clone()
+            let request: serde_json::Value = serde_json::from_str(&body)?;
+            let (records, successor) = match self.cycle {
+                2 => {
+                    assert_eq!(request["zones"][0]["syncToken"], "after");
+                    (serde_json::json!([]), "before-added")
+                }
+                5 => {
+                    assert_eq!(request["zones"][0]["syncToken"], "after-added");
+                    (serde_json::json!([]), "quiet")
+                }
+                3 | 4 => {
+                    assert_eq!(request["zones"][0]["syncToken"], "before-added");
+                    let mut records = self.records.clone();
+                    records.as_array_mut().unwrap().push(serde_json::json!({
+                        "recordName":"added-link","recordType":"CPLContainerRelation",
+                        "zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},
+                        "fields":{"containerId":{"type":"STRING","value":"other-album"},
+                                  "itemId":{"type":"STRING","value":"asset-added"}}
+                    }));
+                    (records, "after-added")
+                }
+                _ => (self.records.clone(), "after"),
             };
             return Ok(
-                serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":"after","moreComing":false,"records":records}]}),
+                serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":successor,"moreComing":false,"records":records}]}),
             );
         }
         assert!(
             url.contains("/records/lookup?"),
             "unexpected provider call: {url}"
         );
-        assert!(!self.quiet, "completed history must not hydrate again");
+        assert!(
+            matches!(self.cycle, 0 | 1 | 3),
+            "completed history must not hydrate again"
+        );
         let request: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(request["zoneID"]["zoneName"], "PrimarySync");
-        for record in request["records"].as_array().unwrap() {
-            assert!(
-                ["asset-recovered", "recovered"].contains(&record["recordName"].as_str().unwrap())
-            );
-        }
         let requested = request["records"].as_array().unwrap();
         let records: Vec<_> = requested
             .iter()
@@ -124,6 +142,29 @@ async fn released_v0240_failed_history_recovers_after_upgrade_and_restart() {
         &checksum,
     )["records"]
         .clone();
+    let added_bytes = include_bytes!("../../../../tests/data/media/pattern.jpg");
+    Mock::given(method("GET"))
+        .and(path("/added.jpg"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(added_bytes.as_slice()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut added = full_album_page_with_download(
+        "PrimarySync",
+        "added",
+        "after-added",
+        &format!("{}/added.jpg", server.uri()),
+        added_bytes.len() as u64,
+        &base64::engine::general_purpose::STANDARD.encode(Sha256::digest(added_bytes)),
+    )["records"]
+        .clone();
+    added[0]["fields"]["filenameEnc"]["value"] = serde_json::json!("YWRkZWQuanBn");
+    for record in added.as_array_mut().unwrap() {
+        record["zoneID"] =
+            serde_json::json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
+    }
+    added[1]["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+        serde_json::json!("_defaultOwner");
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("upgradeexampleinvalid.db");
     let media = dir.path().join("media");
@@ -180,7 +221,7 @@ async fn released_v0240_failed_history_recovers_after_upgrade_and_restart() {
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
     let (capture, _trace_guard) = crate::test_helpers::TracingCapture::install();
     let mut recovered_path = None;
-    for cycle in 0..3 {
+    for cycle in 0..6 {
         {
             let inner = crate::sync_loop::test_support::open_owned_cycle_db(&database).await;
             let conn = rusqlite::Connection::open(&database).unwrap();
@@ -188,6 +229,12 @@ async fn released_v0240_failed_history_recovers_after_upgrade_and_restart() {
                 conn.execute_batch("CREATE TRIGGER fail_upgrade_recovery BEFORE INSERT ON assets WHEN NEW.id='asset-recovered' BEGIN SELECT RAISE(ABORT, 'injected upgrade recovery failure'); END;").unwrap();
             } else {
                 conn.execute_batch("DROP TRIGGER IF EXISTS fail_upgrade_recovery;")
+                    .unwrap();
+            }
+            if cycle == 3 {
+                conn.execute_batch("CREATE TRIGGER fail_added_checkpoint BEFORE INSERT ON metadata WHEN NEW.key='sync_token:PrimarySync' AND NEW.value='after-added' BEGIN SELECT RAISE(ABORT,'checkpoint write failed'); END;").unwrap();
+            } else if cycle == 4 {
+                conn.execute_batch("DROP TRIGGER fail_added_checkpoint")
                     .unwrap();
             }
             drop(conn);
@@ -200,8 +247,12 @@ async fn released_v0240_failed_history_recovers_after_upgrade_and_restart() {
                     "PrimarySync",
                     "private",
                     Box::new(UpgradeSession {
-                        records: records.clone(),
-                        quiet: cycle == 2,
+                        records: if cycle < 3 {
+                            records.clone()
+                        } else {
+                            added.clone()
+                        },
+                        cycle,
                     }),
                 ),
             );
@@ -228,6 +279,9 @@ async fn released_v0240_failed_history_recovers_after_upgrade_and_restart() {
                     result.failed_count > 0 || result.stats.state_write_failures > 0,
                     "{result:?}"
                 );
+            } else if cycle == 3 {
+                assert!(!result.db_sync_token_advance_safe);
+                assert_eq!(result.stats.downloaded, 1, "{result:?}");
             } else {
                 assert_eq!(result.failed_count, 0);
                 assert!(!result.stats.identity_incomplete);
@@ -260,7 +314,14 @@ async fn released_v0240_failed_history_recovers_after_upgrade_and_restart() {
             .unwrap();
         assert_eq!(
             token.as_deref(),
-            if cycle == 0 { None } else { Some("after") },
+            [
+                None,
+                Some("after"),
+                Some("before-added"),
+                Some("before-added"),
+                Some("after-added"),
+                Some("quiet")
+            ][cycle],
             "cycle {cycle}"
         );
         assert_eq!(
@@ -285,7 +346,19 @@ async fn released_v0240_failed_history_recovers_after_upgrade_and_restart() {
             } else {
                 assert_eq!(local_path, recovered_path);
             }
-            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                if cycle < 3 { 1 } else { 2 }
+            );
+        }
+        if cycle >= 3 {
+            let path: String = conn.query_row("SELECT local_path FROM assets WHERE library='PrimarySync' AND id='asset-added' AND status='downloaded'", [], |row| row.get(0)).unwrap();
+            assert_eq!(std::fs::read(path).unwrap(), added_bytes);
+            let batches: i64 = conn.query_row("SELECT count(*) FROM provider_active_generations WHERE sealed=1 AND json_extract(specification,'$.profile.coverage')='library_delta'", [], |row| row.get(0)).unwrap();
+            assert_eq!(
+                batches, 1,
+                "replayed the same completed publication as new work"
+            );
         }
         assert_eq!(
             std::fs::read(&original).unwrap(),

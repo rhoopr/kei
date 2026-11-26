@@ -26,6 +26,16 @@ pub(super) fn upsert_asset_row(
     record: &AssetRecord,
     last_seen_at: i64,
 ) -> Result<(), StateError> {
+    super::provider_work::guard_projected_generation(conn, record, None)?;
+    upsert_checked_asset_row(conn, record, last_seen_at)
+}
+
+/// The caller validated all projected records in this same writer transaction.
+pub(super) fn upsert_checked_asset_row(
+    conn: &Connection,
+    record: &AssetRecord,
+    last_seen_at: i64,
+) -> Result<(), StateError> {
     let meta = &record.metadata;
     // Lazily compute metadata_hash if caller supplied metadata without one.
     // Storing the hash alongside the metadata is what lets feature 5 detect
@@ -37,7 +47,6 @@ pub(super) fn upsert_asset_row(
         None
     };
     let metadata_hash: Option<&str> = meta.metadata_hash.as_deref().or(computed_hash.as_deref());
-    super::provider_work::guard_projected_generation(conn, record)?;
     let source = metadata_rewrite_source_sql();
     let blocked_capture_repair: i64 = conn
         .query_row(
@@ -292,6 +301,7 @@ pub(super) enum MetadataPathWrite {
 
 /// Checksum roles supplied by one file-finalization route.
 pub(super) struct DownloadChecksums<'a> {
+    pub(super) provider: Option<&'a str>,
     pub(super) local: &'a str,
     pub(super) downloaded: Option<&'a str>,
     pub(super) source: Option<&'a str>,
@@ -396,6 +406,7 @@ pub(super) fn update_status_to_downloaded(
     version_size: &str,
     local_path: &Path,
     local_checksum: &str,
+    expected_provider_checksum: Option<&str>,
     download_checksum: Option<&str>,
     mark_capture_repair: bool,
     downloaded_at: i64,
@@ -408,6 +419,11 @@ pub(super) fn update_status_to_downloaded(
         ).optional()?;
     let checksum = prior.as_ref().map(|p| p.0.as_str());
     if let Some(checksum) = checksum {
+        if expected_provider_checksum.is_some_and(|expected| expected != checksum) {
+            return Err(StateError::ProviderWorkConflict(
+                "download_generation_changed",
+            ));
+        }
         super::primary_layout::guard_slot(conn, library, id, version_size, checksum, local_path)?;
         super::primary_layout::guard_downloaded_checksum(conn, local_path, local_checksum)?;
     }

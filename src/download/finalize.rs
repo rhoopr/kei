@@ -24,11 +24,32 @@ pub(super) struct PendingStateWrite {
     pub(super) asset_id: Arc<str>,
     pub(super) version_size: VersionSizeKey,
     pub(super) download_path: PathBuf,
+    pub(super) provider_checksum: Box<str>,
     pub(super) local_checksum: String,
     pub(super) download_checksum: Option<String>,
     pub(super) mark_capture_repair: bool,
     pub(super) retained: Option<Arc<super::file::RetainedPendingFile>>,
     pub(super) requires_retained: bool,
+}
+
+impl PendingStateWrite {
+    async fn persist(
+        &self,
+        db: &(impl DownloadStateStore + ?Sized),
+    ) -> Result<(), crate::state::error::StateError> {
+        db.mark_verified_download(
+            &self.library,
+            &self.asset_id,
+            self.version_size.as_str(),
+            &self.download_path,
+            &self.provider_checksum,
+            &self.local_checksum,
+            self.download_checksum.as_deref(),
+            self.mark_capture_repair,
+            &self.embedded_fields,
+        )
+        .await
+    }
 }
 
 /// Maximum retry attempts for deferred state writes.
@@ -114,6 +135,7 @@ where
         asset_id: task.asset_id.clone(),
         version_size: task.version_size,
         download_path: task.download_path.clone(),
+        provider_checksum: task.checksum.clone(),
         local_checksum,
         download_checksum,
         mark_capture_repair,
@@ -126,19 +148,7 @@ where
             error: Box::new(error),
         };
     }
-    match db
-        .mark_verified_download(
-            library,
-            &task.asset_id,
-            task.version_size.as_str(),
-            &task.download_path,
-            &write.local_checksum,
-            write.download_checksum.as_deref(),
-            mark_capture_repair,
-            &write.embedded_fields,
-        )
-        .await
-    {
+    match write.persist(db).await {
         Ok(()) => {
             #[cfg(all(test, target_os = "linux"))]
             crate::test_helpers::process_death_point("download-state-committed");
@@ -273,19 +283,7 @@ where
                 "Publication validation or durability failed; retaining media and pending debt");
             return false;
         }
-        let result = db
-            .mark_verified_download(
-                &write.library,
-                &write.asset_id,
-                write.version_size.as_str(),
-                &write.download_path,
-                &write.local_checksum,
-                write.download_checksum.as_deref(),
-                write.mark_capture_repair,
-                &write.embedded_fields,
-            )
-            .await;
-        match result {
+        match write.persist(db).await {
             Ok(()) => {
                 if attempt > 1 {
                     tracing::info!(
@@ -297,6 +295,9 @@ where
                 }
                 return true;
             }
+            Err(crate::state::error::StateError::ProviderWorkConflict(
+                "download_generation_changed",
+            )) => return false,
             Err(e) => {
                 if attempt < STATE_WRITE_MAX_RETRIES {
                     tracing::info!(
@@ -449,7 +450,7 @@ mod tests {
             download_path: path,
             replacement_fingerprint: None,
             pending_cross_parent_root: None,
-            checksum: "remote_checksum".into(),
+            checksum: "checksum123".into(),
             asset_id: Arc::from(asset_id),
             asset_record_name: Arc::from(asset_id),
             library: Arc::from(LIBRARY),
@@ -471,6 +472,62 @@ mod tests {
 
     async fn write_file(path: &Path) {
         tokio::fs::write(path, b"finalized").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn late_receipt_must_not_verify_a_newer_provider_rendition() {
+        let dir = TempDir::new().unwrap();
+        let state = dir.path().join("state.db");
+        let path = dir.path().join("old.jpg");
+        let id = "LATE";
+        let old = task(id, path.clone());
+        let db = SqliteStateDb::open(&state).await.unwrap();
+        let mut record = TestAssetRecord::new(id)
+            .library(LIBRARY)
+            .filename("old.jpg")
+            .checksum(&old.checksum)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        write_file(&path).await;
+        let sha = super::super::file::compute_sha256(&path).await.unwrap();
+        // Simulate a refused receipt after the bytes landed. Retry the actual
+        // pending write only after the catalogue points at a newer rendition.
+        db.acquire_lock("fail initial finalization").unwrap().execute_batch(
+            "CREATE TRIGGER refuse_old BEFORE UPDATE ON assets WHEN NEW.status='downloaded' BEGIN SELECT RAISE(ABORT,'synthetic failed receipt'); END;"
+        ).unwrap();
+        let DownloadedFinalization::Deferred { write, .. } = finalize_downloaded(
+            &db,
+            &Arc::from(LIBRARY),
+            &old,
+            sha.clone(),
+            Some(sha.clone()),
+            true,
+            false,
+        )
+        .await
+        else {
+            panic!("expected a deferred write")
+        };
+        db.acquire_lock("allow retry")
+            .unwrap()
+            .execute_batch("DROP TRIGGER refuse_old")
+            .unwrap();
+        record.checksum = "current-provider-generation".into();
+        db.upsert_seen(&record).await.unwrap();
+        let mut pending = vec![write];
+        let flush = flush_pending_state_writes_retaining_failures(&db, &mut pending).await;
+        assert_eq!((flush.attempted, flush.failures, pending.len()), (1, 1, 1));
+        drop(db);
+        let conn = rusqlite::Connection::open(state).unwrap();
+        let row: (String, String, Option<String>) = conn.query_row(
+            "SELECT a.checksum,a.status,p.source_checksum FROM assets a LEFT JOIN asset_metadata_paths p USING(library,id,version_size) WHERE a.id='LATE'",
+            [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"finalized");
+        assert_eq!(
+            row,
+            ("current-provider-generation".into(), "pending".into(), None),
+            "old file SHA was {sha}"
+        );
     }
 
     /// Invoked by the exclusive preload matrix; ordinary suite execution is inert.

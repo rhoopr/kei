@@ -128,6 +128,7 @@ impl SqliteStateDb {
                 record.version_size.as_str(),
                 &local_path,
                 &local_checksum,
+                Some(&record.checksum),
                 None,
                 false,
                 now,

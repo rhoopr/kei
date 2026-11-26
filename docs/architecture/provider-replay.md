@@ -261,7 +261,7 @@ The generation source store also accepts original album-owner membership scan pa
 
 An incomplete replay can also use the source store for a standalone unfiled pass or eligible same-zone named albums. Its generation binds the current selection and the accepted inbox page IDs. Each eligible pass binds its own retained page evidence. Admission checks the captured media facts against a fresh lookup before using the normal destination owner. For a named album, kei looks up the captured link when present. Admission checks that the same lookup confirms the exact child and container in the authenticated zone. Kei retains that link with the paired proof. The generation cannot be sealed or used as full selection coverage. It does not replace existing media or write metadata.
 
-For a completed unfiled replay, `library_delta` records the original pages and destinations for the changed photos. Its seal covers that batch only. It never qualifies a full inventory, and the successor comes from the terminal change page. Earlier inventory records need no migration. Older builds that do not recognize `library_delta` reject a database containing that coverage type.
+For a completed unfiled or named-album replay, `library_delta` records the original pages and destinations for the changed photos. A named destination requires the captured relation plus a fresh lookup confirming that same relation, child and album. Its seal covers that batch only. If publication succeeds but the cursor write fails, the same pages can reuse the sealed batch after restart. The successor comes from the terminal change page. Earlier inventory records need no migration. Older builds that do not recognize the stored coverage or pass combination reject the generation.
 
 When only the child was captured, the exact lookup can supply its master. Kei compares the accepted child using that master before planning a destination and again at admission. A fresh lookup cannot replace a master already in the accepted pages, override a captured deletion, or use a historical mapping in place of the retained reference.
 
@@ -284,6 +284,7 @@ links, per-pass/rendition/path obligations, existing queue records, mappings and
 grouping changes together. Unfinished old versions and frozen grouping/writer
 intent fence incompatible newer work. Independent healthy work can proceed.
 A caption change does not block an unpublished transfer of the same rendition.
+When establishing a baseline, a fresh paired lookup can confirm a different rendition for an earlier failed transfer in the same selection. The catalog slot must still be unpublished. The old plan keeps its original checksum and receives no receipt for the new bytes.
 Published files, prepared outputs and confirmed repairs retain their metadata guards.
 A changed grouping alone does not block a missing media download. Under the
 destination lock, a selected metadata writer can take over an older intent

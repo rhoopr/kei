@@ -21,6 +21,7 @@ async fn flush_pending_state_writes_succeeds_on_first_try() {
     let dir = tempfile::tempdir().expect("state write fixture");
     let db = FailingDownloadStore::new(0);
     let pending = vec![PendingStateWrite {
+        provider_checksum: "provider".into(),
         embedded_fields: Default::default(),
         library: "PrimarySync".into(),
         asset_id: "A1".into(),
@@ -44,6 +45,7 @@ async fn flush_pending_state_writes_recovers_after_transient_failure() {
     let dir = tempfile::tempdir().expect("state write fixture");
     let db = FailingDownloadStore::new(1);
     let pending = vec![PendingStateWrite {
+        provider_checksum: "provider".into(),
         embedded_fields: Default::default(),
         library: "PrimarySync".into(),
         asset_id: "A1".into(),
@@ -69,6 +71,7 @@ async fn flush_pending_state_writes_reports_persistent_failure() {
     let dir = tempfile::tempdir().expect("state write fixture");
     let db = FailingDownloadStore::new(STATE_WRITE_MAX_RETRIES as usize);
     let pending = vec![PendingStateWrite {
+        provider_checksum: "provider".into(),
         embedded_fields: Default::default(),
         library: "PrimarySync".into(),
         asset_id: "A1".into(),
@@ -93,6 +96,7 @@ async fn flush_pending_state_writes_partial_recovery() {
     let db = FailingDownloadStore::new(STATE_WRITE_MAX_RETRIES as usize + 1);
     let pending = vec![
         PendingStateWrite {
+            provider_checksum: "provider".into(),
             embedded_fields: Default::default(),
             library: "PrimarySync".into(),
             asset_id: "A1".into(),
@@ -105,6 +109,7 @@ async fn flush_pending_state_writes_partial_recovery() {
             requires_retained: false,
         },
         PendingStateWrite {
+            provider_checksum: "provider".into(),
             embedded_fields: Default::default(),
             library: "PrimarySync".into(),
             asset_id: "A2".into(),
@@ -133,6 +138,7 @@ async fn flush_pending_state_writes_retains_all_records() {
     let db = FailingDownloadStore::new(2);
     let pending: Vec<PendingStateWrite> = (0..5)
         .map(|i| PendingStateWrite {
+            provider_checksum: "provider".into(),
             embedded_fields: Default::default(),
             library: "PrimarySync".into(),
             asset_id: format!("ASSET_{i}").into(),
@@ -157,6 +163,7 @@ async fn flush_pending_state_writes_retains_only_persistent_failures() {
     let db = FailingDownloadStore::new(STATE_WRITE_MAX_RETRIES as usize + 1);
     let mut pending = vec![
         PendingStateWrite {
+            provider_checksum: "provider".into(),
             embedded_fields: Default::default(),
             library: "PrimarySync".into(),
             asset_id: "A1".into(),
@@ -169,6 +176,7 @@ async fn flush_pending_state_writes_retains_only_persistent_failures() {
             requires_retained: false,
         },
         PendingStateWrite {
+            provider_checksum: "provider".into(),
             embedded_fields: Default::default(),
             library: "PrimarySync".into(),
             asset_id: "A2".into(),

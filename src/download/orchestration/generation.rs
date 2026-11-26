@@ -45,6 +45,7 @@ use crate::state::db::provider_inbox::CapturedPageId;
 use crate::state::db::provider_selection::{
     SelectionDecision, SelectionDestination, SelectionOutcome, SelectionPath,
 };
+use crate::state::error::StateError;
 use crate::types::ChangeReason;
 
 const MAX_REPLAY_DECISIONS: u32 = 64;
@@ -1080,7 +1081,9 @@ impl SelectionRun {
             !self.session_expired.load(Ordering::Relaxed),
             "Selection confirmation stopped after provider session expiry"
         );
-        if !self.root.spec.is_accepted_replay() {
+        if !self.root.spec.is_accepted_replay()
+            && self.root.spec.accepted_album_requirement(key).is_none()
+        {
             return album.confirm_selected_asset(observed).await;
         }
         anyhow::ensure!(
@@ -1593,6 +1596,9 @@ impl SelectionRun {
                     records.clone(),
                     fresh.clone(),
                     AdmissionChecks {
+                        baseline: config.inventory_checkpoint
+                            == InventoryCheckpointPolicy::Baseline
+                            && matches!(config.sync_mode, crate::download::SyncMode::Full),
                         inventory_observation: retry_observation
                             .as_ref()
                             .filter(|_| matches!(config.sync_mode, crate::download::SyncMode::Full))
@@ -2220,7 +2226,7 @@ pub(super) async fn inventory(
     result.outcome = merge_download_outcomes(&result.outcome, &retained.outcome);
     result.accumulate(&retained);
     if covered {
-        context
+        match context
             .capture
             .db
             .seal_selection_generation(
@@ -2229,7 +2235,27 @@ pub(super) async fn inventory(
                 query_checkpoint_ready,
                 query_veto,
             )
-            .await?;
+            .await
+        {
+            Ok(()) => {}
+            Err(StateError::ProviderWorkConflict("frozen_grouping_changed")) => {
+                tracing::warn!(
+                    diagnostic = "selection_seal_frozen_grouping_changed_v1",
+                    "Selected grouping changed before the selection snapshot could seal; retaining accumulated work for retry"
+                );
+                result.checkpoint.state_write_failures =
+                    result.checkpoint.state_write_failures.saturating_add(1);
+                result.checkpoint.project(&mut result.stats);
+                result.outcome = merge_download_outcomes(
+                    &result.outcome,
+                    &DownloadOutcome::PartialFailure { failed_count: 1 },
+                );
+                result.block_incremental_token(DEFERRED_REASON);
+                result.sync_token = None;
+                return Ok(result);
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
     context
         .capture
@@ -3417,15 +3443,18 @@ pub(super) async fn publish_accepted_replay(
 /// writer transactions as inventory. Its seal never certifies a full listing.
 async fn publish_library_delta(
     client: &Client,
-    pass: &AlbumPass,
+    passes: &[AlbumPass],
     config: &Arc<DownloadConfig>,
     controls: DownloadControls,
     cancel: &CancellationToken,
-    delta: &mut IncrementalDeltaSummary,
-    context: &SelectionContext,
+    delta: &IncrementalDeltaSummary,
+    current: Option<&ActiveGeneration>,
 ) -> Result<Option<SyncResult>> {
-    let passes = std::slice::from_ref(pass);
-    let mut context = context.clone();
+    let mut context = config
+        .selection_context
+        .as_deref()
+        .context("Missing selection context")?
+        .clone();
     let profile = context
         .profile
         .as_object_mut()
@@ -3437,38 +3466,74 @@ async fn publish_library_delta(
             &delta.paired_pages.iter().map(|id| id.0).collect::<Vec<_>>()
         )?)),
     );
-    let run = context.start(passes, config).await?;
-    let key = config.pass_key(pass);
-    let children = run
-        .link_delta_pages(pass, &key, &delta.paired_pages, cancel)
-        .await?;
-    if children.len() != delta.paired_assets.len()
-        || !delta
-            .paired_assets
-            .iter()
-            .all(|asset| children.contains(asset.asset_record_name()))
+    // Publication can commit before the cursor transaction fails. An exact
+    // repeat of that sealed batch needs only its remaining destination work.
+    if let Some(root) = current
+        && root.sealed
+        && root.spec.profile == context.profile
     {
-        return Ok(None);
-    }
-    let started = Instant::now();
-    let work = run
-        .publish_assets(
+        return replay(
             client,
-            pass,
+            passes,
             config,
             controls,
-            cancel,
-            std::mem::take(&mut delta.paired_assets),
+            cancel.clone(),
+            root.clone(),
         )
-        .await?;
-    run.remember_retry_sources(&work.failed, passes, config)
-        .await?;
+        .await
+        .map(Some);
+    }
+    let run = context.start(passes, config).await?;
+    let started = Instant::now();
+    let mut combined = StreamingResult {
+        enumeration_complete: true,
+        ..Default::default()
+    };
+    for pass in passes {
+        let children = run
+            .link_delta_pages(pass, &config.pass_key(pass), &delta.paired_pages, cancel)
+            .await?;
+        if children.len() != delta.paired_assets.len()
+            || !delta
+                .paired_assets
+                .iter()
+                .all(|asset| children.contains(asset.asset_record_name()))
+        {
+            return Ok(None);
+        }
+    }
+    for pass in passes {
+        if cancel.is_cancelled()
+            || run.session_expired.load(Ordering::Relaxed)
+            || combined.storage_failed
+            || combined.provider_auth_errors > 0
+            || combined.auth_errors >= AUTH_ERROR_THRESHOLD
+        {
+            combined.enumeration_complete = false;
+            break;
+        }
+        let mut work = run
+            .publish_assets(
+                client,
+                pass,
+                config,
+                controls,
+                cancel,
+                delta.paired_assets.clone(),
+            )
+            .await?;
+        run.remember_retry_sources(&work.failed, passes, config)
+            .await?;
+        combined.recap.merge(std::mem::take(&mut work.recap));
+        combined.rate_limit_observations += work.rate_limit_observations;
+        super::models::merge_streaming_result(&mut combined, work);
+    }
     let mut result = build_download_result(
         client,
         passes,
         config,
         controls,
-        work,
+        combined,
         started,
         cancel.clone(),
     )
@@ -3604,10 +3669,26 @@ pub(super) async fn after_delta(
                 )
             )
         });
-    let publication = if let [pass] = passes
-        && let Some(prior) = prior.as_ref()
+    // A pair proves a library-wide observation. Named selections also need
+    // positive membership for each requested copy. Missing links are unknown.
+    let placement_known = passes.iter().all(|pass| match pass.kind {
+        PassKind::Unfiled => passes.len() == 1,
+        PassKind::Album => pass.album.container_id().is_some_and(|container| {
+            delta.paired_assets.iter().all(|asset| {
+                delta
+                    .membership
+                    .relations
+                    .get(&(container.to_owned(), asset.asset_record_name().to_owned()))
+                    == Some(&false)
+            })
+        }),
+        PassKind::SmartFolder => false,
+    });
+    let publication = if let Some(prior) = prior.as_ref()
         && (prior.checkpoint_ready || prior.spec.is_library_delta())
-        && !refresh_selection
+        && placement_known
+        && delta.membership.containers.is_empty()
+        && !delta.membership.has_membership_deletions()
         && !retry_pass_tokens
         && delta_safe
         && delta_result.checkpoint.completed_delta_replay
@@ -3625,7 +3706,13 @@ pub(super) async fn after_delta(
                 .await?)
     {
         Box::pin(publish_library_delta(
-            client, pass, config, controls, &cancel, &mut delta, context,
+            client,
+            passes,
+            config,
+            controls,
+            &cancel,
+            &delta,
+            root.as_ref(),
         ))
         .await?
     } else {

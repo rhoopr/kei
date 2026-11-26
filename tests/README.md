@@ -1461,7 +1461,7 @@ mutations before unchanged success.
 
 `behavioral::released_upgrade::released_v0240_history_preserves_durable_evidence_through_upgrade`
 starts from the SQL schema emitted by the official v0.24.0 Linux x86_64
-binary (schema 25), then executes the current production CLI through schema 42.
+binary (schema 25), then executes the current production CLI through the current schema.
 The fixture contains no captured user data. SQL explicitly reconstructs a
 synthetic history with original and edited renditions, repeated IDs in two
 libraries, a local removal, metadata debt, an unfinished sync ledger row,
@@ -1474,12 +1474,11 @@ Restoring a file alone must not falsely finalize its failed row. The companion l
 `released_v0240_failed_history_recovers_after_upgrade_and_restart` starts from
 the same schema fixture (or actual released-binary-created schema), retains an
 explicit authoritative source/master mapping and failed media row, and runs
-three production cycles. The first injects a state-write failure and must retain
+six production cycles. The first injects a state-write failure and must retain
 the archived checkpoint, no active replacement checkpoint and a pending retry row (retry routing resets failed to
 pending before the injected write). After reopening SQLite, authoritative synthetic
 provider evidence and a local HTTP JPEG must finish recovery on the second
-cycle. The third must retain the recovered path and bytes without another
-lookup or download. Unrelated original and sidecar bytes remain unchanged.
+cycle. After a quiet restart a new photo arrives. Its download succeeds, but a SQLite trigger refuses the cursor write. The next process must replay from the previous cursor, reuse the sealed batch and advance without listing or fetching the file again. A final restart checks the successor. Unrelated original and sidecar bytes remain unchanged.
 This companion test uses real JPEG framing and provider checksum encoding. Text byte fixtures
 test preservation and SHA-256 checks; they do not qualify image decoders.
 

@@ -95,6 +95,7 @@ async fn publish(
         ID,
         version.as_str(),
         file,
+        &record.checksum,
         &local,
         Some(&local),
         false,

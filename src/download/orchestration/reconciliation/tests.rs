@@ -1894,6 +1894,7 @@ async fn assert_pending_retry_reservations(entry: PendingReservationEntry) {
                 "B",
                 "original",
                 &owned_path,
+                &checksum,
                 &local,
                 Some(&local),
                 false,

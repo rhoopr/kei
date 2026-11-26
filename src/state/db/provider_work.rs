@@ -417,8 +417,9 @@ fn has_projected_obligation(
 pub(super) fn guard_projected_generation(
     conn: &rusqlite::Connection,
     record: &AssetRecord,
+    current: Option<(&str, &str)>,
 ) -> Result<(), StateError> {
-    super::provider_generations::guard_generation(conn, record)?;
+    super::provider_generations::guard_generation(conn, record, current)?;
     if !has_projected_obligation(
         conn,
         &record.library,

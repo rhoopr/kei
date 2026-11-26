@@ -419,6 +419,8 @@ means no outcome was recorded; it does not identify the cause of the hold.
 
 ## Full and incremental enumeration
 
+With a fixed date range and no saved cursor, ordinary sync reads the first inventory to the end of each pass. It skips photos known to be older than the range and checks later pages for errors and in-range photos. Only a complete inventory with usable token evidence can establish the checkpoint. The date range still controls which files kei saves.
+
 Debug builds can set `KEI_REQUEST_DUMP_DIR` to capture Photos session
 bodies as `000001.req.<epoch-ms>.json` and `000001.res.<epoch-ms>.json`.
 The counter pairs requests and responses; timestamps are captured separately.

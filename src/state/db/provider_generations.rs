@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::asset_writes::upsert_asset_row;
+use super::asset_writes::upsert_checked_asset_row;
 use super::contracts::PreservedLocal;
 use super::membership::refresh_asset_album_groupings_tx;
 use super::provider_inbox::{CapturedPageId, load_page};
@@ -571,8 +571,9 @@ impl GenerationSpec {
     }
 
     pub(crate) fn accepted_album_container(&self, key: &str) -> Option<&str> {
-        if self.profile.get("coverage").and_then(Value::as_str)
-            != Some(ACCEPTED_ALBUM_REPLAY_COVERAGE)
+        if !self.is_library_delta()
+            && self.profile.get("coverage").and_then(Value::as_str)
+                != Some(ACCEPTED_ALBUM_REPLAY_COVERAGE)
         {
             return None;
         }
@@ -584,7 +585,7 @@ impl GenerationSpec {
         key: &str,
     ) -> Option<(Vec<&str>, crate::icloud::photos::ReplayAlbumLink)> {
         use crate::icloud::photos::ReplayAlbumLink;
-        if !self.is_accepted_replay() {
+        if !self.uses_delta_pages() {
             return None;
         }
         if self.accepted_foreign_replay(key).is_some() {
@@ -616,9 +617,16 @@ pub(crate) fn accepted_replay_coverage(profile: &Value) -> Option<&'static str> 
 
 pub(crate) fn library_delta_selection(profile: &Value) -> bool {
     has_no_replay_excludes(profile)
-        && profile.get("passes").and_then(Value::as_array).is_some_and(
-            |passes| matches!(passes.as_slice(), [pass] if is_replay_unfiled_pass(pass)),
-        )
+        && profile
+            .get("passes")
+            .and_then(Value::as_array)
+            .is_some_and(|passes| {
+                matches!(passes.as_slice(), [pass] if is_replay_unfiled_pass(pass))
+                    || (!passes.is_empty()
+                        && passes
+                            .iter()
+                            .all(|pass| accepted_album_container(pass).is_some()))
+            })
 }
 
 pub(crate) fn accepted_replay_pass(profile: &Value, key: &str) -> bool {
@@ -983,6 +991,7 @@ pub(crate) struct GenerationProjection {
 }
 
 pub(crate) struct AdmissionChecks {
+    pub(crate) baseline: bool,
     /// Live rank observation, supplied only by full inventory after a paired lookup.
     pub(crate) inventory_observation: Option<Arc<crate::icloud::photos::PhotoAsset>>,
     pub(crate) capacity: u64,
@@ -3366,7 +3375,8 @@ fn accepted_album_proof_matches(
             .map_err(|_invalid| StateError::ProviderSelectionInvalid)
         }
         AcceptedAlbumLinks::Missing
-            if matches!(status, crate::icloud::photos::ReplayAlbumLink::Live) =>
+            if root.spec.is_accepted_replay()
+                && matches!(status, crate::icloud::photos::ReplayAlbumLink::Live) =>
         {
             let ([container], Some(master)) = (containers.as_slice(), decision.master.as_deref())
             else {
@@ -3772,6 +3782,7 @@ impl SqliteStateDb {
             records,
             fresh_confirmation,
             AdmissionChecks {
+                baseline: false,
                 inventory_observation: None,
                 capacity,
                 layouts: Vec::new(),
@@ -3794,6 +3805,7 @@ impl SqliteStateDb {
         checks: AdmissionChecks,
     ) -> Result<GenerationProjection, StateError> {
         let AdmissionChecks {
+            baseline,
             inventory_observation,
             capacity,
             layouts,
@@ -3924,8 +3936,13 @@ impl SqliteStateDb {
                 // not independently authenticated children sharing that master.
                 let blocked:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM unattributed_legacy WHERE library=?1 AND asset_id=?2)",params![manifest.media_zone(&root).get("zoneName").and_then(Value::as_str),manifest.state_id],|r|r.get(0))?;
                 if blocked {reason="identity_conflict".to_owned()}
+                // Only a fresh paired observation from this standalone inventory can
+                // replace a resource that an earlier generation merely planned.
+                let current = (baseline && !root.sealed && !changed_basis && !root.spec.uses_delta_pages()
+                    && fresh_confirmation.is_some() && fresh_confirmation == d.confirmation)
+                    .then_some((root.id.as_str(), d.child.as_str()));
                 for record in &records {
-                    match super::provider_work::guard_projected_generation(&tx,record) {
+                    match super::provider_work::guard_projected_generation(&tx,record,current) {
                         Ok(())=>{},Err(StateError::ProviderWorkConflict(_))=>{reason="unfinished_generation_conflict".to_owned();break},Err(error)=>return Err(error),
                     }
                 }
@@ -3956,7 +3973,7 @@ impl SqliteStateDb {
                     let now=Utc::now().timestamp();
                     for record in &records {
                         let drift:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM assets WHERE library=?1 AND id=?2 AND version_size=?3 AND metadata_hash IS NOT ?4)",params![record.library,record.id,record.version_size.as_str(),record.metadata.metadata_hash],|r|r.get(0))?;
-                        upsert_asset_row(&tx,record,now)?;
+                        upsert_checked_asset_row(&tx,record,now)?;
                         if drift && root.spec.metadata_enabled {
                             tx.execute("UPDATE assets SET metadata_write_failed_at=COALESCE(metadata_write_failed_at,?4) WHERE library=?1 AND id=?2 AND version_size=?3",params![record.library,record.id,record.version_size.as_str(),now])?;
                             tx.execute("UPDATE asset_metadata_paths SET metadata_write_failed_at=COALESCE(metadata_write_failed_at,?4) WHERE library=?1 AND id=?2 AND version_size=?3",params![record.library,record.id,record.version_size.as_str(),now])?;
@@ -4842,14 +4859,39 @@ const UNFINISHED: &str = "w.admitted=1
 // preserved files) and fingerprint-confirmed repairs still own their metadata.
 const OWNS_METADATA_INPUT: &str = "(w.verified_media=1 OR w.preserved_local IS NOT NULL OR w.prepared_hash IS NOT NULL OR w.confirmed_repair IS NOT NULL)";
 
-pub(super) fn guard_generation(conn: &Connection, record: &AssetRecord) -> Result<(), StateError> {
+pub(super) fn guard_generation(
+    conn: &Connection,
+    record: &AssetRecord,
+    current: Option<(&str, &str)>,
+) -> Result<(), StateError> {
     validate_identity_decisions(conn, &record.library, &record.id)?;
     let hash = record
         .metadata
         .metadata_hash
         .clone()
         .unwrap_or_else(|| record.metadata.compute_hash());
-    let conflict:bool=conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.library=?1 AND w.asset_id=?2 AND w.version_size=?3 AND {UNFINISHED} AND (w.checksum<>?4 OR w.size_bytes IS NOT ?5 OR w.created_at IS NOT ?6 OR w.added_at IS NOT ?7 OR (w.metadata_hash<>?8 AND {OWNS_METADATA_INPUT})))"),params![record.library,record.id,record.version_size.as_str(),record.checksum,i64::try_from(record.size_bytes).ok(),encode_asset_date(record.created_at),record.added_at.map(encode_asset_date),hash],|r|r.get(0))?;
+    let (generation, child) = current.unzip();
+    // An idempotent producer upsert doesn't replace the catalog rendition.
+    // Changing it needs a newer inventory and an entirely unpublished slot.
+    let conflict: bool = conn.query_row(&format!("WITH slot AS (
+        SELECT * FROM assets WHERE library=?1 AND id=?2 AND version_size=?3
+    ), fresh_inventory AS (
+        SELECT scope,config_hash,created_at FROM provider_active_generations WHERE id=?9
+          AND EXISTS(SELECT 1 FROM slot WHERE status IN ('pending','failed') AND downloaded_at IS NULL
+                     AND local_path IS NULL AND local_checksum IS NULL AND imported_size IS NULL)
+          AND NOT EXISTS(SELECT 1 FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND version_size=?3)
+          AND NOT EXISTS(SELECT 1 FROM primary_layout_claims WHERE library=?1 AND child=?2 AND version=?3)
+    ) SELECT EXISTS(
+        SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation
+        WHERE w.library=?1 AND w.asset_id=?2 AND w.version_size=?3 AND {UNFINISHED} AND (
+            w.created_at IS NOT ?6 OR w.added_at IS NOT ?7 OR (w.metadata_hash<>?8 AND {OWNS_METADATA_INPUT})
+            OR (w.checksum=?4 AND w.size_bytes IS NOT ?5)
+            OR (w.checksum<>?4 AND ({OWNS_METADATA_INPUT} OR (
+                NOT EXISTS(SELECT 1 FROM slot WHERE checksum=?4 AND size_bytes=?5)
+                AND NOT EXISTS(SELECT 1 FROM fresh_inventory n WHERE w.child=?10
+                    AND n.scope=g.scope AND n.config_hash=g.config_hash AND n.created_at>g.created_at)
+            )))))"),
+        params![record.library,record.id,record.version_size.as_str(),record.checksum,i64::try_from(record.size_bytes).ok(),encode_asset_date(record.created_at),record.added_at.map(encode_asset_date),hash,generation,child],|r|r.get(0))?;
     if conflict {
         Err(StateError::ProviderWorkConflict("unfinished_asset_changed"))
     } else {
@@ -5261,7 +5303,7 @@ impl SqliteStateDb {
             if let Some((moved, handoff)) = directory_publication_source(&tx,&root.spec.scope,&key,&child,library,&path,(&local,size))?
                 && moved.version_size == selected.version_size && moved.checksum == selected.checksum && moved.size == selected.size {
                 let source = handoff.source;
-                super::asset_writes::update_status_to_downloaded(&tx,library,&manifest.state_id,&selected.version_size,&native,&local,Some(&source),false,chrono::Utc::now().timestamp())?;
+                super::asset_writes::update_status_to_downloaded(&tx,library,&manifest.state_id,&selected.version_size,&native,&local,Some(&selected.checksum),Some(&source),false,chrono::Utc::now().timestamp())?;
                 record_destination_source(&tx,library,&manifest.state_id,&selected.version_size,&native,&local,VerifiedDestinationSource::DirectoryPublication(&source))?;
                 if let Some(embedded) = handoff.embedded.filter(|receipt| receipt.published && receipt.output_checksum == local) {
                     let raw = serde_json::to_string(&embedded).map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
@@ -5289,7 +5331,7 @@ impl SqliteStateDb {
                 let library=manifest.media_zone(&root).get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?;
                 let restorable:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM assets a JOIN asset_metadata_paths p USING(library,id,version_size) WHERE a.library=?1 AND a.id=?2 AND a.version_size=?3 AND a.status IN ('pending','failed') AND a.is_deleted=0 AND a.checksum=?4 AND a.size_bytes=?5 AND p.provider_checksum=a.checksum AND p.local_path=?6 AND p.local_checksum=?7 AND p.source_checksum=?8)",params![library,manifest.state_id,selected.version_size,selected.checksum,i64::try_from(selected.size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?,native.to_str(),local,source],|r|r.get(0))?;
                 if restorable {
-                    super::asset_writes::update_status_to_downloaded(&tx,library,&manifest.state_id,&selected.version_size,&native,&local,Some(&source),false,chrono::Utc::now().timestamp())?;
+                    super::asset_writes::update_status_to_downloaded(&tx,library,&manifest.state_id,&selected.version_size,&native,&local,Some(&selected.checksum),Some(&source),false,chrono::Utc::now().timestamp())?;
                 }
                 record_destination_source(&tx,manifest.media_zone(&root).get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?,&manifest.state_id,&selected.version_size,&native,&local,VerifiedDestinationSource::RetainedNative(&source))?;
                 if let Some(fields) = recovered_fields {
@@ -5324,7 +5366,7 @@ impl SqliteStateDb {
                 let unfinished:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM assets a JOIN provider_active_destinations d ON d.library=a.library AND d.asset_id=a.id AND d.version_size=a.version_size WHERE d.generation=?1 AND d.pass_key=?2 AND d.child=?3 AND d.path=?4 AND d.admitted=1 AND d.verified_media=0 AND d.prepared_checksum IS NULL AND (a.status IN ('pending','failed') OR (a.status='downloaded' AND a.downloaded_at IS NOT NULL AND a.local_path IS NOT NULL AND a.local_path<>d.compat_path)) AND a.is_deleted=0 AND (a.downloaded_at IS NULL OR a.local_path IS NOT d.compat_path) AND a.imported_size IS NULL AND a.checksum=d.checksum AND a.size_bytes=d.size_bytes AND a.metadata_hash IS d.metadata_hash AND a.created_at IS d.created_at AND a.added_at IS d.added_at)",params![generation,key,child,path.key()?],|r|r.get(0))?;
                 if unfinished {
                     let now=chrono::Utc::now().timestamp();
-                    super::asset_writes::update_status_to_downloaded(&tx,library,&manifest.state_id,&selected.version_size,&native,&local,Some(&local),false,now)?;
+                    super::asset_writes::update_status_to_downloaded(&tx,library,&manifest.state_id,&selected.version_size,&native,&local,Some(&selected.checksum),Some(&local),false,now)?;
                     tx.execute("UPDATE asset_metadata_paths SET source_checksum=?5 WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4",params![library,manifest.state_id,selected.version_size,text,local])?;
                     record_destination_source(&tx,library,&manifest.state_id,&selected.version_size,&native,&local,VerifiedDestinationSource::RecoveredPublication(&local))?;
                     super::asset_writes::record_metadata_capture_revision(&tx,library,&manifest.state_id,crate::state::types::METADATA_CAPTURE_REVISION,now)?;

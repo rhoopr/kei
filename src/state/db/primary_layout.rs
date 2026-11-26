@@ -558,7 +558,7 @@ impl SqliteStateDb {
                     if member.archive_source.is_some() && !file.local_preserved {
                         let current:Option<String>=tx.query_row("SELECT checksum FROM assets WHERE library=?1 AND id=?2 AND version_size=?3",params![op.library,op.child,file.version],|row|row.get(0)).optional()?;
                         if current.as_deref()==Some(file.provider_checksum.as_str()) {
-                            super::asset_writes::update_status_to_downloaded(&tx,&op.library,&op.child,&file.version,&file.path.to_path(),&data_encoding::HEXLOWER.encode(&file.fingerprint.sha256),file.source_checksum.as_deref(),false,chrono::Utc::now().timestamp())?;
+                            super::asset_writes::update_status_to_downloaded(&tx,&op.library,&op.child,&file.version,&file.path.to_path(),&data_encoding::HEXLOWER.encode(&file.fingerprint.sha256),Some(&file.provider_checksum),file.source_checksum.as_deref(),false,chrono::Utc::now().timestamp())?;
                         }
                     }
                     files.push(file.clone());
@@ -576,7 +576,7 @@ impl SqliteStateDb {
                         files.push(installed.clone());
                         continue;
                     }
-                    super::asset_writes::update_status_to_downloaded(&tx,&op.library,&op.child,record.version_size.as_str(),&path,&data_encoding::HEXLOWER.encode(&installed.fingerprint.sha256),installed.source_checksum.as_deref(),false,chrono::Utc::now().timestamp())?;
+                    super::asset_writes::update_status_to_downloaded(&tx,&op.library,&op.child,record.version_size.as_str(),&path,&data_encoding::HEXLOWER.encode(&installed.fingerprint.sha256),Some(&record.checksum),installed.source_checksum.as_deref(),false,chrono::Utc::now().timestamp())?;
                     tx.execute("UPDATE assets SET metadata_write_failed_at=NULL WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4 AND checksum=?5 AND metadata_hash IS ?6",params![op.library,op.child,record.version_size.as_str(),path.to_string_lossy(),record.checksum.as_ref(),record.metadata.metadata_hash])?;
                     tx.execute("UPDATE asset_metadata_paths SET metadata_write_failed_at=NULL,source_checksum=?7 WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4 AND provider_checksum=?5 AND EXISTS(SELECT 1 FROM assets a WHERE a.library=?1 AND a.id=?2 AND a.version_size=?3 AND a.metadata_hash IS ?6)",params![op.library,op.child,record.version_size.as_str(),path.to_string_lossy(),record.checksum.as_ref(),record.metadata.metadata_hash,installed.source_checksum])?;
                     super::provider_generations::record_layout_destination(&tx,record,installed,op.metadata_flags)?;

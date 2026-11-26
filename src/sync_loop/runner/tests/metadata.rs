@@ -4662,6 +4662,7 @@ async fn exercise_legacy_child_cycles_with_provenance(
                         child,
                         "original",
                         &current,
+                        &checksum,
                         &hash,
                         Some(&hash),
                         false,

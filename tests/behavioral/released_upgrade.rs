@@ -56,9 +56,17 @@ fn released_v0240_history_preserves_durable_evidence_through_upgrade() {
     let db = root.join("upgradeexampleinvalid.db");
     let config = root.join("config.toml");
     let current = PathBuf::from(assert_cmd::cargo::cargo_bin!("kei"));
-    super::write_sync_config(&config, root.join("media").to_str().unwrap());
     let old = std::env::var_os("KEI_TEST_RELEASED_V0240").map(PathBuf::from);
     if let Some(old) = &old {
+        // v0.24 predates the versioned config format.
+        std::fs::write(
+            &config,
+            format!(
+                "[download]\ndirectory = {}\n",
+                serde_json::to_string(&root.join("media")).unwrap()
+            ),
+        )
+        .unwrap();
         // Empty file only: the released production migration creates every table.
         std::fs::write(&db, []).unwrap();
         run(old, root, &["verify"], true);
@@ -164,6 +172,7 @@ fn released_v0240_history_preserves_durable_evidence_through_upgrade() {
             before
         );
     }
+    super::write_sync_config(&config, root.join("media").to_str().unwrap());
     // Unowned released state is never silently adopted by an offline command.
     let refusal = run(&current, root, &["verify"], false);
     assert!(refusal.contains("explicit verified ownership migration"));

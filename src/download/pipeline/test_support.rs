@@ -158,6 +158,36 @@ impl DownloadStateStore for FailingDownloadStore {
         }
     }
 
+    async fn mark_verified_download(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+        local_path: &Path,
+        _provider_checksum: &str,
+        local_checksum: &str,
+        download_checksum: Option<&str>,
+        mark_capture_repair: bool,
+        embedded_fields: &crate::state::types::EmbeddedMetadataFields,
+    ) -> Result<(), StateError> {
+        if *embedded_fields != Default::default() {
+            return Err(StateError::Invariant {
+                operation: "mark_verified_download",
+                detail: "atomic embedded metadata publication is not implemented by this store"
+                    .into(),
+            });
+        }
+        self.mark_downloaded_with_capture_repair(
+            library,
+            id,
+            version_size,
+            local_path,
+            local_checksum,
+            download_checksum,
+            mark_capture_repair,
+        )
+        .await
+    }
     async fn mark_failed(&self, _: &str, _: &str, _: &str, _: &str) -> Result<(), StateError> {
         if self.track_failed_calls {
             self.failed_calls.fetch_add(1, Ordering::Relaxed);

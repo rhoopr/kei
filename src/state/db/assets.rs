@@ -99,6 +99,7 @@ impl SqliteStateDb {
         let local_checksum = checksums.local.to_owned();
         let download_checksum = checksums.downloaded.map(str::to_owned);
         let source_checksum = checksums.source.map(str::to_owned);
+        let provider_checksum = checksums.provider.map(str::to_owned);
         let embedded_fields = checksums.embedded_fields.cloned();
 
         self.with_conn_mut("mark_downloaded", move |conn| {
@@ -112,6 +113,7 @@ impl SqliteStateDb {
                 &version_size,
                 &local_path,
                 &local_checksum,
+                provider_checksum.as_deref(),
                 download_checksum.as_deref(),
                 mark_capture_repair,
                 downloaded_at,
@@ -611,6 +613,7 @@ impl DownloadStateStore for SqliteStateDb {
             local_path,
             DownloadChecksums {
                 local: local_checksum,
+                provider: None,
                 downloaded: download_checksum,
                 source: None,
                 embedded_fields: None,
@@ -626,6 +629,7 @@ impl DownloadStateStore for SqliteStateDb {
         id: &str,
         version_size: &str,
         local_path: &Path,
+        provider_checksum: &str,
         local_checksum: &str,
         download_checksum: Option<&str>,
         mark_capture_repair: bool,
@@ -638,6 +642,7 @@ impl DownloadStateStore for SqliteStateDb {
             local_path,
             DownloadChecksums {
                 local: local_checksum,
+                provider: Some(provider_checksum),
                 downloaded: download_checksum,
                 source: download_checksum,
                 embedded_fields: Some(embedded_fields),

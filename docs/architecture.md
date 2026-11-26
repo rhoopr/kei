@@ -36,7 +36,9 @@ Replay scheduling looks for due work, then validates the decisions in the select
 
 A standalone full inventory that establishes a zone's baseline checks work from the current selection, not older plans for that selection. Its generation and zone cursor commit together. Retained path ownership and prepared publication still protect local files. Incremental refreshes and inventories that require a retained-cursor bridge keep their existing coverage checks.
 
-After a complete unfiled inventory, ordinary sync can download paired photos directly from a completed library change feed. It links the original change pages to the selected destinations and confirms each photo before publication. A delta covers only those photos. Earlier files keep their receipts, and only a full query can establish a new inventory. If the feed leaves selection or placement unresolved, kei queries the selection again.
+If an inventory cannot seal because frozen metadata grouping changed during the scan, the cycle holds the checkpoint and leaves the service running. It keeps the original selection and destination receipts for recovery.
+
+After a baseline, ordinary sync can save a new photo directly from the change feed for a standalone unfiled pass or a selection of same-zone named albums. For named albums the feed must include a live link from each changed photo to each selected album. Kei confirms each link with the current photo before publishing that copy. If placement is unclear, it queries the selection again. A completed batch covers only its changed photos. Earlier files keep their receipts, and only a full query can establish a new inventory.
 
 If a continuation is refused, Kei can still save newly verified media from accepted pages in a standalone unfiled pass or in eligible named albums within a mixed selection. Each named album needs fresh proof of its own link. Neither publication nor membership proof advances the held cursor.
 

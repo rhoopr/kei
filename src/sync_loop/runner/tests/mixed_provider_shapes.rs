@@ -297,6 +297,7 @@ async fn seed_file(
                 id,
                 version.as_str(),
                 target,
+                &row.checksum,
                 &hash,
                 Some(&hash),
                 false,

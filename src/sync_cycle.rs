@@ -1291,10 +1291,10 @@ async fn run_cycle_inner(
             Some(db) => db.get_metadata(&replay_key).await?,
             None => None,
         };
-        let indexing_replay_pending = replay_at_start.is_some()
-            && retained_cursor_at_start
-                .as_deref()
-                .is_some_and(|s| !s.trim().is_empty());
+        let has_retained_cursor = retained_cursor_at_start
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty());
+        let indexing_replay_pending = replay_at_start.is_some() && has_retained_cursor;
         let materialization_key = indexing_materialization_key(&lib_state.zone_name);
         let materialization_at_start = match state_db {
             Some(db) => db.get_metadata(&materialization_key).await?,
@@ -1534,8 +1534,11 @@ async fn run_cycle_inner(
         if checkpoint_transition_state_safe
             && !download_config.provisional
             && !download_config.refresh_metadata
-            && download_config.skip_created_before.is_none()
-            && download_config.skip_created_after.is_none()
+            && ((download_config.skip_created_before.is_none()
+                && download_config.skip_created_after.is_none())
+                || (state_db.is_some()
+                    && download_controls.run_mode.downloads_files()
+                    && !has_retained_cursor))
             && !indexing_replay_pending
             && !indexing_materialization_pending
         {

@@ -277,7 +277,7 @@ pub(super) fn recover_current(
         &proof.id,
         "recover_pending_publication",
     )?;
-    super::provider_work::guard_projected_generation(&tx, &selected)?;
+    super::provider_work::guard_projected_generation(&tx, &selected, None)?;
     super::provider_work::guard_projected_mapping(&tx, &proof.library, &child, &master)?;
     if shutdown.is_cancelled() {
         crate::support::observe_scoped(

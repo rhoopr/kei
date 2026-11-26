@@ -206,6 +206,8 @@ write or resume .part
   -> finalize SQLite state
 ```
 
+The verified-download transaction compares the task's provider checksum with the current catalog row. A delayed state write retains that same checksum. If the provider rendition changed after the file landed, its bytes stay on disk and cannot mark the newer rendition downloaded.
+
 The transfer owner opens an existing resume file through a retained parent
 handle with no-follow access and requires a regular file. It reads the Range
 offset from that file handle and uses the same handle for append writes.

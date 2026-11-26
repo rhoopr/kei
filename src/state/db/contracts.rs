@@ -501,6 +501,8 @@ pub trait DownloadStateStore: Send + Sync {
     }
     /// Finalize bytes received by the verified download pipeline.
     ///
+    /// The task's provider checksum identifies the selected rendition. SQLite compares it
+    /// with the catalog in the receipt transaction, including on deferred retry.
     /// `download_checksum`, when present, must hash the received bytes before
     /// any kei metadata write. Adoption and local reconciliation must instead
     /// use `mark_downloaded` or `mark_downloaded_with_capture_repair`.
@@ -521,29 +523,12 @@ pub trait DownloadStateStore: Send + Sync {
         id: &str,
         version_size: &str,
         local_path: &Path,
+        provider_checksum: &str,
         local_checksum: &str,
         download_checksum: Option<&str>,
         mark_capture_repair: bool,
         embedded_fields: &crate::state::types::EmbeddedMetadataFields,
-    ) -> Result<(), StateError> {
-        if *embedded_fields != Default::default() {
-            return Err(StateError::Invariant {
-                operation: "mark_verified_download",
-                detail: "atomic embedded metadata publication is not implemented by this store"
-                    .into(),
-            });
-        }
-        self.mark_downloaded_with_capture_repair(
-            library,
-            id,
-            version_size,
-            local_path,
-            local_checksum,
-            download_checksum,
-            mark_capture_repair,
-        )
-        .await
-    }
+    ) -> Result<(), StateError>;
     async fn mark_failed(
         &self,
         library: &str,
