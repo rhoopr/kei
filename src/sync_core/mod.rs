@@ -4,6 +4,7 @@
 //! downloads. Owed copies are rows in `files` that later cycles retry. See
 //! `docs/sync-core.md`.
 
+pub(crate) mod access;
 pub(crate) mod drain;
 pub(crate) mod plan;
 pub(crate) mod runner;
@@ -40,6 +41,19 @@ pub(crate) struct CoreConfig {
     pub(crate) temp_suffix: String,
     pub(crate) concurrency: usize,
     pub(crate) retry: RetryConfig,
+    pub(crate) transfer: Transfer,
+}
+
+/// Which owed copies a cycle works on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Transfer {
+    /// Download owed copies and adopt matching local files.
+    #[default]
+    All,
+    /// Only adopt local files already at planned paths; download nothing.
+    AdoptOnly,
+    /// Observe and plan only.
+    None,
 }
 
 impl CoreConfig {
@@ -152,7 +166,7 @@ pub(crate) async fn run_cycle(
     }
 
     for (library, zone_report) in libraries.iter().zip(report.zones.iter_mut()) {
-        if cancel.is_cancelled() {
+        if cancel.is_cancelled() || config.transfer == Transfer::None {
             break;
         }
         match drain::drain_zone(state, library, config, client, cancel).await {

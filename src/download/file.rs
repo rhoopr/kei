@@ -42,6 +42,7 @@ pub(super) use publication::PublicationOutcome;
 pub(super) use replacement_recovery::finish_owned_prepared_link;
 
 /// Inspect confined regular bytes for an explicit integrity confirmation.
+#[cfg(test)]
 pub(crate) async fn inspect_integrity_fingerprint(
     root: &std::path::Path,
     path: &std::path::Path,

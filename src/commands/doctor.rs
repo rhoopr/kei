@@ -3,7 +3,9 @@
     reason = "CLI diagnostics command whose primary purpose is to print a report to stdout"
 )]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 use serde::Serialize;
 
@@ -245,7 +247,7 @@ pub(crate) async fn run_doctor(
             &username,
             &cookie_dir,
             domain.as_str(),
-            &globals.config_source,
+            super::download_directory(toml).as_deref(),
         )
         .await,
     );
@@ -408,52 +410,59 @@ async fn check_state_db(
     username: &str,
     cookie_dir: &Path,
     realm: &str,
-    source: &config::ConfigSource,
+    directory: Option<&Path>,
 ) -> DoctorCheck {
-    let Some(path) = state_db_path(username, cookie_dir, realm) else {
+    if username.is_empty() {
         return DoctorCheck {
             name: "state_db",
             status: CheckStatus::Skipped,
             message: "no username configured, so no state DB path could be derived".to_string(),
         };
-    };
-    if let Err(error) = state::db::account::state_path(cookie_dir, username, realm).await {
-        return DoctorCheck {
-            name: "state_db",
-            status: CheckStatus::Error,
-            message: error.to_string(),
-        };
     }
-    if !path.exists() {
+    let location =
+        match crate::sync_core::access::Location::resolve(cookie_dir, username, realm).await {
+            Ok(location) => location,
+            Err(error) => {
+                return DoctorCheck {
+                    name: "state_db",
+                    status: CheckStatus::Error,
+                    message: error.to_string(),
+                };
+            }
+        };
+    if !location.exists() {
         return DoctorCheck {
             name: "state_db",
             status: CheckStatus::Warning,
-            message: format!("state DB does not exist yet: {}", path.display()),
+            message: format!(
+                "state DB does not exist yet: {}",
+                location.current.display()
+            ),
         };
     }
-    let summary = match state::SqliteStateDb::open_owned_with_config(
-        &path,
-        &state::db::account::AccountOwner::configured(username, realm),
-        source,
-    )
-    .await
-    {
-        Ok(db) => db.get_summary().await,
-        Err(e) => Err(e),
+    let owner = state::db::account::AccountOwner::configured(username, realm);
+    let opened = crate::sync_core::access::open(&location, &owner, directory).await;
+    let completeness = match opened {
+        Ok(Some(state)) => state.completeness().await,
+        Ok(None) => Err(anyhow::anyhow!("state DB disappeared")),
+        Err(error) => Err(error),
     };
-    match summary {
-        Ok(summary) => DoctorCheck {
+    match completeness {
+        Ok(completeness) => DoctorCheck {
             name: "state_db",
             status: CheckStatus::Ok,
             message: format!(
-                "state DB opened: {} assets, {} pending, {} failed",
-                summary.total_assets, summary.pending, summary.failed
+                "state DB opened: {} saved, {} owed, {} failed",
+                completeness.done, completeness.pending, completeness.failed
             ),
         },
         Err(e) => DoctorCheck {
             name: "state_db",
             status: CheckStatus::Error,
-            message: format!("state DB read failed at {}: {e}", path.display()),
+            message: format!(
+                "state DB read failed at {}: {e:#}",
+                location.current.display()
+            ),
         },
     }
 }
@@ -577,6 +586,7 @@ fn check_json_file(name: &'static str, path: &Path) -> DoctorCheck {
     }
 }
 
+#[cfg(test)]
 fn state_db_path(username: &str, cookie_dir: &Path, realm: &str) -> Option<PathBuf> {
     let sanitized = crate::account::namespace(username, realm);
     (!username.is_empty()).then(|| cookie_dir.join(format!("{sanitized}.db")))
@@ -697,17 +707,15 @@ mod tests {
         .await
         .expect("create state db");
 
-        let check = check_state_db(
-            username,
-            dir.path(),
-            "com",
-            &config::ConfigSource::Unavailable,
-        )
-        .await;
+        drop(_db);
+
+        // A previous-engine file is upgraded on first use.
+        let check = check_state_db(username, dir.path(), "com", Some(dir.path())).await;
 
         assert_eq!(check.name, "state_db");
-        assert_eq!(check.status, CheckStatus::Ok);
-        assert!(check.message.contains("0 assets"));
+        assert_eq!(check.status, CheckStatus::Ok, "{}", check.message);
+        assert!(check.message.contains("0 saved"));
+        assert!(path.with_extension("sync.db").exists());
     }
 
     #[tokio::test]

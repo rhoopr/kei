@@ -23,6 +23,11 @@ impl AccountOwner {
         }
     }
 
+    /// The configured account namespace.
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
+
     /// The authenticated provider fingerprint, if this owner was authenticated.
     pub(crate) fn provider_key(&self) -> Option<&str> {
         self.provider.as_deref()
@@ -175,13 +180,14 @@ pub(super) fn open(path: &Path, owner: &AccountOwner) -> Result<(Connection, boo
 }
 
 /// Open an existing state file read-only after verifying it belongs to the
-/// authenticated account. Nothing in the file is changed.
+/// account. A configured owner checks the account; an authenticated owner
+/// also checks the provider identity. Nothing in the file is changed.
 pub(crate) fn open_verified_read_only(
     path: &Path,
     owner: &AccountOwner,
 ) -> Result<Connection, StateError> {
     let conn = open_read_only(path)?;
-    validate_authenticated(&conn, owner)?;
+    validate(&conn, owner)?;
     Ok(conn)
 }
 

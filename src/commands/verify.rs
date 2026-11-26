@@ -5,10 +5,12 @@
 
 use std::path::Path;
 
+use anyhow::Context;
+
 use crate::cli;
 use crate::config;
 use crate::download;
-use crate::state;
+use crate::sync_core::state::FileState;
 
 use super::{LISTING_CAP, print_truncation_tail};
 
@@ -18,23 +20,29 @@ pub(crate) async fn run_verify(
     globals: &config::GlobalArgs,
     toml: Option<&config::TomlConfig>,
 ) -> anyhow::Result<()> {
-    let db_path = super::super::get_db_path(globals, toml).await?;
-
-    if !db_path.exists() {
-        println!("No state database found at {}", db_path.display());
+    let (location, state) = super::core_state(globals, toml).await?;
+    let Some(state) = state else {
+        println!("No state database found at {}", location.current.display());
         println!("Run a sync first to create the database.");
         return Ok(());
-    }
+    };
+    let directory = super::download_directory(toml)
+        .context("Set [download].directory in the config file to verify downloaded files.")?;
+    let mut targets: Vec<(String, Option<String>)> = state
+        .list_files(&[FileState::Done])
+        .await?
+        .into_iter()
+        .map(|file| (file.path, file.sha256))
+        .collect();
+    targets.extend(
+        state
+            .list_imported()
+            .await?
+            .into_iter()
+            .map(|copy| (copy.path, copy.sha256)),
+    );
 
-    let db = state::SqliteStateDb::open_owned_with_config(
-        &db_path,
-        &super::super::get_account_owner(globals, toml),
-        &globals.config_source,
-    )
-    .await?;
-    let summary = db.get_summary().await?;
-
-    println!("Verifying {} downloaded assets...", summary.downloaded);
+    println!("Verifying {} downloaded assets...", targets.len());
     println!();
 
     let mut missing: usize = 0;
@@ -43,97 +51,48 @@ pub(crate) async fn run_verify(
     let mut different: usize = 0;
     let mut unreadable: usize = 0;
     let mut printed_issues: usize = 0;
-
-    const PAGE_SIZE: u32 = 1000;
-    let mut offset = 0u64;
-    loop {
-        let page = db.get_downloaded_page(offset, PAGE_SIZE).await?;
-        if page.is_empty() {
-            break;
+    let mut report = |line: String| {
+        if printed_issues < LISTING_CAP {
+            println!("{line}");
+            printed_issues += 1;
         }
-        offset += page.len() as u64;
+    };
 
-        for asset in &page {
-            debug_assert_eq!(asset.status, state::AssetStatus::Downloaded);
-
-            let Some(local_path) = &asset.local_path else {
-                if printed_issues < LISTING_CAP {
-                    println!("MISSING: {} - no local path recorded", asset.id);
-                    printed_issues += 1;
-                }
+    for (relative, sha256) in &targets {
+        let path = directory.join(relative);
+        match inspect_local_path(&path).await {
+            LocalPathState::File => {}
+            LocalPathState::Missing => {
+                report(format!("MISSING: {}", path.display()));
                 missing += 1;
                 continue;
-            };
-
-            match inspect_local_path(local_path).await {
-                LocalPathState::File => {}
-                LocalPathState::Missing => {
-                    if printed_issues < LISTING_CAP {
-                        let downloaded_at = asset.downloaded_at.map_or_else(
-                            || "unknown".to_string(),
-                            |dt| dt.format("%Y-%m-%d").to_string(),
-                        );
-                        println!(
-                            "MISSING: {} ({}) - downloaded {}",
-                            local_path.display(),
-                            asset.id,
-                            downloaded_at
-                        );
-                        printed_issues += 1;
-                    }
-                    missing += 1;
-                    continue;
-                }
-                LocalPathState::Unreadable(error) => {
-                    if printed_issues < LISTING_CAP {
-                        println!(
-                            "UNREADABLE: {} ({}) - {}",
-                            local_path.display(),
-                            asset.id,
-                            error
-                        );
-                        printed_issues += 1;
-                    }
-                    unreadable += 1;
-                    continue;
-                }
             }
-
-            if !args.checksums {
-                present_unchecked += 1;
+            LocalPathState::Unreadable(error) => {
+                report(format!("UNREADABLE: {} - {error}", path.display()));
+                unreadable += 1;
                 continue;
             }
-
-            let Some(local_checksum) = &asset.local_checksum else {
-                present_unchecked += 1;
-                continue;
-            };
-
-            match verify_local_checksum(local_path, local_checksum).await {
-                Ok(true) => checksum_verified += 1,
-                Ok(false) => {
-                    if printed_issues < LISTING_CAP {
-                        println!(
-                            "DIFFERENT: {} ({}) - may be an intentional edit",
-                            local_path.display(),
-                            asset.id
-                        );
-                        printed_issues += 1;
-                    }
-                    different += 1;
-                }
-                Err(e) => {
-                    if printed_issues < LISTING_CAP {
-                        println!(
-                            "UNREADABLE: {} ({}) - {}",
-                            local_path.display(),
-                            asset.id,
-                            e
-                        );
-                        printed_issues += 1;
-                    }
-                    unreadable += 1;
-                }
+        }
+        if !args.checksums {
+            present_unchecked += 1;
+            continue;
+        }
+        let Some(expected) = sha256 else {
+            present_unchecked += 1;
+            continue;
+        };
+        match verify_local_checksum(&path, expected).await {
+            Ok(true) => checksum_verified += 1,
+            Ok(false) => {
+                report(format!(
+                    "DIFFERENT: {} - checksum does not match",
+                    path.display()
+                ));
+                different += 1;
+            }
+            Err(error) => {
+                report(format!("UNREADABLE: {} - {error}", path.display()));
+                unreadable += 1;
             }
         }
     }
@@ -169,7 +128,8 @@ pub(crate) async fn run_verify(
 
     if missing > 0 || different > 0 || unreadable > 0 {
         anyhow::bail!(
-            "Verification found {missing} missing files, {different} files with a different checksum, and {unreadable} unreadable paths. Use `{}` to inspect an exact managed destination.",
+            "Verification found {missing} missing files, {different} files with a different checksum, and {unreadable} unreadable paths. Run `{}` to download missing files again, or `{}` to inspect one file.",
+            cli::command_for_config("reconcile", globals.config_source.recovery_path()),
             cli::command_for_config(
                 "reconcile --inspect-path PATH",
                 globals.config_source.recovery_path()

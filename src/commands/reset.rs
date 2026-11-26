@@ -6,28 +6,29 @@
 use crate::auth;
 use crate::cli;
 use crate::config;
-use crate::state;
+use crate::state::db::account::AccountOwner;
+use crate::sync_core::access::{self, Location};
 
-/// Run the reset-state command.
+/// Run the reset-state command: delete the account's state, previous and
+/// current, after checking it belongs to this account.
 pub(crate) async fn run_reset_state(
     yes: bool,
     globals: &config::GlobalArgs,
     toml: Option<&config::TomlConfig>,
     input_mode: crate::InputMode,
 ) -> anyhow::Result<()> {
-    let db_path = super::super::get_db_path(globals, toml).await?;
-
-    if !db_path.exists() {
-        println!("No state database found at {}", db_path.display());
+    let (username, _, domain, cookie_dir) =
+        config::resolve_auth(globals, &cli::PasswordArgs::default(), toml)?;
+    if username.is_empty() {
+        anyhow::bail!("Set your iCloud username with ICLOUD_USERNAME or [auth].username.");
+    }
+    let location = Location::resolve(&cookie_dir, &username, domain.as_str()).await?;
+    if !location.exists() {
+        println!("No state database found at {}", location.current.display());
         return Ok(());
     }
-
-    let _ownership_check = state::SqliteStateDb::open_owned_read_only(
-        &db_path,
-        &super::super::get_account_owner(globals, toml),
-    )
-    .await?;
-    drop(_ownership_check);
+    let owner = AccountOwner::configured(&username, domain.as_str());
+    access::check_existing(&location, &owner).await?;
 
     if !yes {
         use std::io::Write;
@@ -38,7 +39,11 @@ pub(crate) async fn run_reset_state(
             );
         }
         println!("This will delete the state database at:");
-        println!("  {}", db_path.display());
+        for path in [&location.current, &location.legacy] {
+            if path.exists() {
+                println!("  {}", path.display());
+            }
+        }
         println!();
         print!("Are you sure? [y/N] ");
         std::io::stdout().flush()?;
@@ -51,38 +56,29 @@ pub(crate) async fn run_reset_state(
         }
     }
 
-    tokio::fs::remove_file(&db_path).await?;
+    access::delete(&location, &owner).await?;
     println!("State database deleted.");
-
-    // Also remove WAL and SHM files if they exist
-    let wal_path = db_path.with_extension("db-wal");
-    let shm_path = db_path.with_extension("db-shm");
-    let _ = tokio::fs::remove_file(&wal_path).await;
-    let _ = tokio::fs::remove_file(&shm_path).await;
-
     Ok(())
 }
 
 /// Run the reset-sync-token command.
 ///
 /// `yes` skips the confirmation prompt. Without it, prompts on a TTY and
-/// errors under non-interactive use, mirroring `reset state`. Clearing the
-/// sync token forces the next sync to do a full enumeration of every asset,
-/// which on a 100k-asset library is slow and chats up Apple's API; the
-/// confirmation is here to keep a typo (or muscle memory after `reset state`)
-/// from triggering that work by accident.
+/// errors under non-interactive use, mirroring `reset state`. Forgetting the
+/// saved positions makes the next sync list every library again, which on a
+/// 100k-asset library is slow; the confirmation keeps a typo from
+/// triggering that work by accident. Saved files and their records stay.
 pub(crate) async fn run_reset_sync_token(
     yes: bool,
     globals: &config::GlobalArgs,
     toml: Option<&config::TomlConfig>,
     input_mode: crate::InputMode,
 ) -> anyhow::Result<()> {
-    let db_path = super::super::get_db_path(globals, toml).await?;
-
-    if !db_path.exists() {
-        println!("No state database found at {}", db_path.display());
+    let (location, state) = super::core_state(globals, toml).await?;
+    let Some(state) = state else {
+        println!("No state database found at {}", location.current.display());
         return Ok(());
-    }
+    };
 
     if !yes {
         use std::io::Write;
@@ -93,7 +89,7 @@ pub(crate) async fn run_reset_sync_token(
             );
         }
         println!("This will clear stored sync tokens at:");
-        println!("  {}", db_path.display());
+        println!("  {}", location.current.display());
         println!();
         println!("Next sync will re-enumerate every asset.");
         print!("Are you sure? [y/N] ");
@@ -107,23 +103,11 @@ pub(crate) async fn run_reset_sync_token(
         }
     }
 
-    let db = state::SqliteStateDb::open_owned_with_config(
-        &db_path,
-        &super::super::get_account_owner(globals, toml),
-        &globals.config_source,
-    )
-    .await?;
-    db.set_metadata("db_sync_token", "").await?;
-    let cleared = db.delete_metadata_by_prefix("sync_token:").await?;
-    let scoped_cleared = db.delete_scoped_db_sync_tokens().await?;
+    let cleared = state.forget_positions().await?;
     println!(
-        "Cleared sync tokens ({} zone token{} + db token + {} scoped db token{}). Next sync will do a full enumeration.",
-        cleared,
-        if cleared == 1 { "" } else { "s" },
-        scoped_cleared,
-        if scoped_cleared == 1 { "" } else { "s" }
+        "Cleared sync tokens ({cleared} zone token{}). Next sync will do a full enumeration.",
+        if cleared == 1 { "" } else { "s" }
     );
-
     Ok(())
 }
 

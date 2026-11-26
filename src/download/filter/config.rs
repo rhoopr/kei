@@ -96,6 +96,10 @@ impl PathDerivationConfig {
     /// Clone this path config for one resolved album/smart-folder/unfiled
     /// pass, mirroring [`DownloadConfig::with_pass`] without pulling in
     /// download-pipeline fields.
+    #[allow(
+        dead_code,
+        reason = "previous-engine code kept compiled for its remaining callers and tests until that engine is removed (docs/sync-core.md, delivery step 6)"
+    )]
     pub(crate) fn with_pass(&self, pass: &crate::commands::AlbumPass) -> Self {
         let folder_structure = folder_structure_for_pass(
             &self.folder_structure,
@@ -114,6 +118,10 @@ impl PathDerivationConfig {
 
     /// Clone this config with a different CloudKit zone for `{library}` path
     /// expansion.
+    #[allow(
+        dead_code,
+        reason = "previous-engine code kept compiled for its remaining callers and tests until that engine is removed (docs/sync-core.md, delivery step 6)"
+    )]
     pub(crate) fn with_library(&self, library: &str) -> Self {
         Self {
             library: Arc::from(library),

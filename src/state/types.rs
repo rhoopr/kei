@@ -1,4 +1,8 @@
 //! Types for the state tracking module.
+#![allow(
+    dead_code,
+    reason = "previous-engine code kept compiled for its remaining callers and tests until that engine is removed (docs/sync-core.md, delivery step 6)"
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -3,7 +3,6 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::Context;
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::SharedSession;
@@ -13,9 +12,7 @@ use crate::icloud::photos::{PRIMARY_ZONE_NAME, PhotoLibrary};
 use crate::retry::RetryConfig;
 use crate::state::db::account::AccountOwner;
 
-use super::{CoreConfig, CycleReport, State, run_cycle};
-
-pub(crate) const ACCOUNT_KEY: &str = "account_provider";
+use super::{CoreConfig, CycleReport, run_cycle};
 
 pub(crate) struct Run<'a> {
     pub(crate) config: &'a Config,
@@ -29,26 +26,17 @@ pub(crate) struct Run<'a> {
 /// Run one cycle, or cycles at the watch interval until shutdown.
 pub(crate) async fn run(run: Run<'_>) -> anyhow::Result<()> {
     let config = run.config;
-    let legacy = crate::state::db::account::state_path(
+    let location = super::access::Location::resolve(
         &config.auth.cookie_directory,
         &config.auth.username,
         config.auth.domain.as_str(),
     )
     .await?;
-    let target = State::path_for(&legacy);
-    if let Some(import) =
-        super::upgrade::prepare(&legacy, &target, run.owner, &config.download.directory).await?
-    {
-        tracing::info!(
-            recorded = import.recorded,
-            carried_over = import.imported,
-            changed_on_disk = import.changed_on_disk,
-            outside_download_directory = import.outside,
-            duplicates = import.duplicates,
-            "Upgraded sync state; the previous state file is kept until the first full listing completes"
-        );
-    }
-    let state = open_owned(&target, run.owner).await?;
+    let state =
+        match super::access::open(&location, run.owner, Some(&config.download.directory)).await? {
+            Some(state) => state,
+            None => super::access::create(&location, run.owner).await?,
+        };
     let core = core_config(config, run.retry);
     let libraries = run.libraries;
     anyhow::ensure!(!libraries.is_empty(), "No library is selected.");
@@ -87,25 +75,6 @@ pub(crate) async fn run(run: Run<'_>) -> anyhow::Result<()> {
     }
 }
 
-/// Open the sync state and bind it to the authenticated account.
-async fn open_owned(path: &std::path::Path, owner: &AccountOwner) -> anyhow::Result<State> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let state = State::open(path).await?;
-    let provider = owner
-        .provider_key()
-        .context("The iCloud account identity is unavailable")?;
-    match state.get_kv(ACCOUNT_KEY).await? {
-        Some(bound) => anyhow::ensure!(
-            bound == provider,
-            "This sync state belongs to a different iCloud account"
-        ),
-        None => state.set_kv(ACCOUNT_KEY, provider).await?,
-    }
-    Ok(state)
-}
-
 fn core_config(config: &Config, retry: RetryConfig) -> CoreConfig {
     let directory: PathBuf = config.download.directory.clone();
     let paths = PathDerivationConfig {
@@ -139,6 +108,7 @@ fn core_config(config: &Config, retry: RetryConfig) -> CoreConfig {
         temp_suffix: config.download.temp_suffix.clone(),
         concurrency: usize::from(config.download.threads_num.max(1)),
         retry,
+        transfer: super::Transfer::All,
     }
 }
 

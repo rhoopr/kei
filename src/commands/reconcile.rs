@@ -14,13 +14,15 @@
 //! never removes DB rows, and never modifies files on disk. The only DB
 //! changes are missing-file status transitions and explicit fingerprint-pinned
 //! repair intent on the existing selected destination owner.
-
+#![allow(
+    dead_code,
+    reason = "previous-engine code kept compiled for its remaining callers and tests until that engine is removed (docs/sync-core.md, delivery step 6)"
+)]
 #![allow(
     clippy::print_stdout,
     reason = "CLI subcommand whose primary purpose is to print a reconcile report to stdout"
 )]
 
-use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -28,7 +30,7 @@ use crate::cli;
 use crate::config;
 use crate::download::file::{LocalFileSizeExpectation, local_file_size_matches_state};
 use crate::state;
-use crate::state::{DownloadStateStore, ReportStateStore, VersionSizeKey};
+use crate::state::{ReportStateStore, VersionSizeKey};
 
 use super::{LISTING_CAP, print_truncation_tail};
 
@@ -257,221 +259,107 @@ pub(crate) async fn run_reconcile(
             "Legacy file trust is no longer supported. Run kei sync. Existing trust records and media were not changed."
         );
     }
-    let db_path = super::super::get_db_path(globals, toml).await?;
-
-    if !db_path.exists() {
+    let (location, state) = super::core_state(globals, toml).await?;
+    let Some(state) = state else {
         anyhow::ensure!(
             args.inspect_path.is_none(),
             "Integrity inspection requires an existing owned state database"
         );
-        println!("No state database found at {}", db_path.display());
+        println!("No state database found at {}", location.current.display());
         println!("Run a sync first to create the database.");
         return Ok(());
+    };
+    let directory = super::download_directory(toml).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Set [download].directory in the config file to reconcile downloaded files."
+        )
+    })?;
+
+    if let Some(path) = args.inspect_path {
+        return inspect(&state, &directory, &path, args.confirm_damage.as_deref()).await;
     }
 
-    let db = state::SqliteStateDb::open_owned_with_config(
-        &db_path,
-        &super::super::get_account_owner(globals, toml),
-        &globals.config_source,
-    )
-    .await?;
-    if let Some(path) = args.inspect_path {
-        let path = std::path::absolute(path)?;
-        let inspected = db
-            .inspect_integrity_destination(path.clone())
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!("Path has no current independently verified destination receipt")
-            })?;
-        let root = path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("Inspection requires a file path"))?;
-        let (checksum, size) =
-            crate::download::file::inspect_integrity_fingerprint(root, &path).await?;
-        let token = format!("{checksum}:{size}");
-        println!("Path: {}", path.display());
-        println!("Fingerprint: {token}");
-        if let Some(confirmed) = args.confirm_damage {
-            anyhow::ensure!(
-                confirmed == token,
-                "File changed since inspection; confirmation refused"
-            );
-            anyhow::ensure!(
-                inspected.preserved
-                    || inspected.confirmed.is_some()
-                    || inspected.local_checksum.as_deref() != Some(checksum.as_str()),
-                "File matches its recorded local checksum; no damage to confirm"
-            );
-            let replacing = inspected.confirmed.is_some();
-            db.confirm_integrity_damage(inspected, (checksum, size))
-                .await?;
-            println!(
-                "Confirmed damage queued for this destination. Run `{}` to attempt repair.",
-                cli::command_for_config("sync", globals.config_source.recovery_path())
-            );
-            if replacing {
-                println!("Replaced the previous pending damage confirmation.");
-            }
-        } else if let Some((checksum, size)) = &inspected.confirmed {
-            println!(
-                "Damage is already confirmed for fingerprint {checksum}:{size}. To replace it with the current bytes, repeat with --confirm-damage {token}"
-            );
-        } else if inspected.preserved {
-            println!(
-                "Locally preserved copy. Confirm this fingerprint only to replace these bytes with the selected provider rendition."
-            );
-        } else if inspected.local_checksum.as_deref() == Some(checksum.as_str()) {
-            println!("Matches the recorded local checksum.");
-        } else {
-            println!(
-                "DIFFERENT: this may be an intentional edit. To confirm damage, repeat with --confirm-damage {token}"
-            );
+    let mut missing = Vec::new();
+    for file in state
+        .list_files(&[crate::sync_core::state::FileState::Done])
+        .await?
+    {
+        if !file.wanted {
+            continue;
         }
+        match tokio::fs::symlink_metadata(directory.join(&file.path)).await {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => missing.push(file.path),
+            Err(error) => anyhow::bail!("Could not check {}: {error}", file.path),
+            Ok(_) => {}
+        }
+    }
+    for path in missing.iter().take(LISTING_CAP) {
+        println!("MISSING: {}", directory.join(path).display());
+    }
+    print_truncation_tail(missing.len(), missing.len().min(LISTING_CAP));
+    if args.dry_run {
+        println!(
+            "Dry run: {} missing files would be downloaded again by the next sync.",
+            missing.len()
+        );
         return Ok(());
     }
-    let summary = db.get_summary().await?;
-
-    if args.dry_run {
-        println!(
-            "Reconciling {} downloaded assets (dry run - no changes will be written)...",
-            summary.downloaded
-        );
-    } else {
-        println!("Reconciling {} downloaded assets...", summary.downloaded);
-    }
-    println!();
-
-    // Shared cell so both callbacks can bump the same counter under the
-    // FnMut + FnMut constraint. Single-threaded; Cell is cheap here.
-    let printed: Cell<usize> = Cell::new(0);
-
-    let (counts, drifted) = scan_local_drift(
-        &db,
-        |m| {
-            if printed.get() < LISTING_CAP {
-                match m.kind {
-                    LocalDriftKind::Missing => println!(
-                        "MISSING: {} ({}, {})",
-                        m.local_path.display(),
-                        m.id,
-                        m.version_size.as_str(),
-                    ),
-                    LocalDriftKind::Truncated {
-                        actual_size,
-                        expected_size,
-                    } => println!(
-                        "SHORTER: {} ({}, {}) - {actual_size} < {expected_size} bytes; may be an intentional edit",
-                        m.local_path.display(),
-                        m.id,
-                        m.version_size.as_str(),
-                    ),
-                }
-                printed.set(printed.get() + 1);
-            }
-        },
-        |id| {
-            if printed.get() < LISTING_CAP {
-                println!("NO PATH: {id} - no local path recorded");
-                printed.set(printed.get() + 1);
-            }
-        },
-    )
-    .await?;
-
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "scan counts come from pagination over the state DB; well under usize::MAX on supported targets"
-    )]
-    let total_issues = (counts.missing + counts.damaged + counts.no_path) as usize;
-    if total_issues > printed.get() {
-        println!();
-        print_truncation_tail(total_issues, printed.get());
-    }
-
-    let protected = db.get_protected_legacy_ids().await?;
-    let mut protected_drift = 0u64;
-    let mut marked_failed = 0u64;
-    let mut mark_errors = 0u64;
-    if !args.dry_run {
-        for m in &drifted {
-            // A shortened file alone does not establish damage. Only explicit
-            // per-destination fingerprint confirmation authorizes replacement.
-            if matches!(m.kind, LocalDriftKind::Truncated { .. }) {
-                continue;
-            }
-            if protected.contains(&(m.library.to_string(), m.id.to_string())) {
-                protected_drift += 1;
-                continue;
-            }
-            match db
-                .mark_failed(&m.library, &m.id, m.version_size.as_str(), m.kind.reason())
-                .await
-            {
-                Ok(()) => marked_failed += 1,
-                Err(e) => {
-                    #[allow(
-                        clippy::print_stderr,
-                        reason = "reconcile is a CLI subcommand that reports to the user via stdout/stderr"
-                    )]
-                    {
-                        eprintln!(
-                            "  failed to mark {}:{} as failed: {e}",
-                            m.id,
-                            m.version_size.as_str()
-                        );
-                    }
-                    mark_errors += 1;
-                }
-            }
+    for path in &missing {
+        if let Some(row) = state.file_at(path).await? {
+            state.owe_again(row.id, None).await?;
         }
     }
+    println!(
+        "{} missing files will be downloaded again by the next sync.",
+        missing.len()
+    );
+    Ok(())
+}
 
-    println!();
-    if mark_errors > 0 {
-        // Print before "Results:" so stdout-scraping scripts don't see a
-        // success-looking summary right before the non-zero exit.
-        println!("FAILED: {mark_errors} state updates errored - see stderr above for details.");
-        println!();
-    }
-    println!("Results:");
-    println!("  Present:  {}", counts.present);
-    println!("  Missing:  {}", counts.missing);
-    if counts.damaged > 0 {
-        println!("  Shorter:  {}", counts.damaged);
-        println!(
-            "Inspect changed copies with `{}`; shorter size alone does not authorize replacement.",
-            cli::command_for_config(
-                "reconcile --inspect-path PATH",
-                globals.config_source.recovery_path()
-            )
-        );
-    }
-    if counts.no_path > 0 {
-        println!("  No path:  {}", counts.no_path);
-    }
-    if args.dry_run {
-        println!();
-        println!(
-            "Dry run - no changes written. Re-run without --dry-run to mark drifted assets as failed."
-        );
-    } else {
-        println!("  Marked failed: {marked_failed}");
-        if protected_drift > 0 {
-            println!(
-                "  Protected legacy records needing inspection: {protected_drift}; original receipts retained"
-            );
-        }
-        if mark_errors > 0 {
-            println!("  Mark errors:   {mark_errors}");
-        }
-    }
-
-    if mark_errors > 0 {
-        anyhow::bail!(
-            "Reconcile found {mark_errors} drifted files that could not be marked failed in the state database."
-        );
-    }
-
+/// Print one copy's fingerprint and, when confirmed, owe it again so the
+/// next sync replaces exactly these bytes.
+async fn inspect(
+    state: &crate::sync_core::State,
+    directory: &std::path::Path,
+    path: &std::path::Path,
+    confirm: Option<&str>,
+) -> anyhow::Result<()> {
+    let path = std::path::absolute(path)?;
+    let relative = path
+        .strip_prefix(directory)
+        .map_err(|_outside| {
+            anyhow::anyhow!("{} is outside the download directory", path.display())
+        })?
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
+    let row = state.file_at(&relative).await?.ok_or_else(|| {
+        anyhow::anyhow!("Path has no current independently verified destination receipt")
+    })?;
+    let (size, sha256) = crate::download::core_io::hash_file(&path)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("{} does not exist", path.display()))?;
+    let token = format!("{sha256}:{size}");
+    println!("Path: {}", path.display());
+    println!("Fingerprint: {token}");
+    println!(
+        "Recorded: {}",
+        row.sha256.as_deref().unwrap_or("no checksum recorded")
+    );
+    let Some(confirmed) = confirm else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        confirmed == token,
+        "File changed since inspection; confirmation refused"
+    );
+    anyhow::ensure!(
+        row.sha256.as_deref() != Some(sha256.as_str()),
+        "File matches its recorded local checksum; no damage to confirm"
+    );
+    state.owe_again(row.id, Some(&sha256)).await?;
+    println!("Damage confirmed. The next sync replaces this copy if it still has these bytes.");
     Ok(())
 }
 

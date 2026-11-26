@@ -1008,6 +1008,228 @@ impl State {
     }
 }
 
+/// One row of a command listing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct ListedFile {
+    pub(crate) path: String,
+    pub(crate) zone: String,
+    pub(crate) asset: String,
+    pub(crate) rendition: String,
+    /// Album record name, `smart:<name>` for a smart folder, or empty for unfiled.
+    pub(crate) album: String,
+    pub(crate) size: u64,
+    pub(crate) sha256: Option<String>,
+    pub(crate) state: &'static str,
+    /// Still selected; copies that stopped being wanted keep their files.
+    pub(crate) wanted: bool,
+    pub(crate) last_error: Option<String>,
+}
+
+/// The most recent cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunRow {
+    pub(crate) started_at: i64,
+    pub(crate) finished_at: Option<i64>,
+    pub(crate) outcome: Option<String>,
+    pub(crate) downloaded: u64,
+    pub(crate) failed: u64,
+}
+
+/// A zone's resume point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ZoneRow {
+    pub(crate) zone: String,
+    pub(crate) has_position: bool,
+    pub(crate) listed: bool,
+}
+
+impl State {
+    /// File rows, optionally only those in `states`, ordered by path.
+    pub(crate) async fn list_files(&self, states: &[FileState]) -> anyhow::Result<Vec<ListedFile>> {
+        let states: Vec<&'static str> = states.iter().map(|state| state.as_str()).collect();
+        self.with(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT path, zone, asset, rendition, album, size, sha256, state, wanted, last_error
+                 FROM files ORDER BY path",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, i64>(8)? != 0,
+                        row.get::<_, Option<String>>(9)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut out = Vec::new();
+            for (path, zone, asset, rendition, album, size, sha256, state, wanted, last_error) in
+                rows
+            {
+                let state = FileState::parse(&state)?.as_str();
+                if !states.is_empty() && !states.contains(&state) {
+                    continue;
+                }
+                out.push(ListedFile {
+                    path,
+                    zone,
+                    asset,
+                    rendition,
+                    album,
+                    size: u64::try_from(size)?,
+                    sha256,
+                    state,
+                    wanted,
+                    last_error,
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Copies carried over from the previous engine that no row has taken
+    /// over yet.
+    pub(crate) async fn list_imported(&self) -> anyhow::Result<Vec<ImportedCopy>> {
+        self.with(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT path, zone, master, rendition, size, sha256, checksum FROM imported ORDER BY path",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter()
+                .map(|(path, zone, master, rendition, size, sha256, checksum)| {
+                    Ok(ImportedCopy {
+                        path,
+                        zone,
+                        master,
+                        rendition,
+                        size: u64::try_from(size)?,
+                        sha256,
+                        checksum,
+                    })
+                })
+                .collect()
+        })
+        .await
+    }
+
+    pub(crate) async fn zones(&self) -> anyhow::Result<Vec<ZoneRow>> {
+        self.with(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT zone, position IS NOT NULL, listed FROM zones ORDER BY zone")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(ZoneRow {
+                        zone: row.get(0)?,
+                        has_position: row.get::<_, i64>(1)? != 0,
+                        listed: row.get::<_, i64>(2)? != 0,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    pub(crate) async fn last_run(&self) -> anyhow::Result<Option<RunRow>> {
+        self.with(|conn| {
+            let row = conn
+                .query_row(
+                    "SELECT started_at, finished_at, outcome, downloaded, failed FROM runs
+                     ORDER BY id DESC LIMIT 1",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            row.map(|(started_at, finished_at, outcome, downloaded, failed)| {
+                Ok(RunRow {
+                    started_at,
+                    finished_at,
+                    outcome,
+                    downloaded: u64::try_from(downloaded)?,
+                    failed: u64::try_from(failed)?,
+                })
+            })
+            .transpose()
+        })
+        .await
+    }
+
+    /// Photos the catalog knows, across zones.
+    pub(crate) async fn asset_count(&self) -> anyhow::Result<u64> {
+        self.with(|conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM assets WHERE purged = 0 AND sparse = 0",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok(u64::try_from(count)?)
+        })
+        .await
+    }
+
+    /// Forget every zone's position so the next sync lists each again.
+    pub(crate) async fn forget_positions(&self) -> anyhow::Result<u64> {
+        self.with(|conn| {
+            Ok(u64::try_from(conn.execute(
+                "UPDATE zones SET position = NULL, listed = 0 WHERE position IS NOT NULL OR listed = 1",
+                [],
+            )?)?)
+        })
+        .await
+    }
+
+    /// The file row at a relative path.
+    pub(crate) async fn file_at(&self, path: &str) -> anyhow::Result<Option<FileRow>> {
+        let path = path.to_owned();
+        self.with(move |conn| {
+            let mut stmt = conn.prepare(&format!("{FILE_COLUMNS} WHERE path = ?1"))?;
+            let row = stmt.query_row([path], file_row).optional()?;
+            row.transpose()
+        })
+        .await
+    }
+
+    /// Owe a done copy again, replacing it only while it still has `sha256`.
+    pub(crate) async fn owe_again(&self, id: i64, sha256: Option<&str>) -> anyhow::Result<()> {
+        let sha256 = sha256.map(ToOwned::to_owned);
+        self.with(move |conn| {
+            conn.execute(
+                "UPDATE files SET state = 'pending', sha256 = ?2, last_error = NULL WHERE id = ?1",
+                params![id, sha256],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+}
+
 const FILE_COLUMNS: &str = "SELECT id, zone, asset, rendition, album, path, size, checksum, sha256, state, attempts FROM files";
 
 fn file_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<anyhow::Result<FileRow>> {

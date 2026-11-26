@@ -223,6 +223,7 @@ impl Harness {
                 base_delay_secs: 0,
                 max_delay_secs: 0,
             },
+            transfer: Transfer::All,
         };
         if let Some(tweak) = *self.tweak.lock().unwrap() {
             tweak(&mut config);

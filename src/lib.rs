@@ -555,14 +555,8 @@ use commands::{
 };
 
 /// Get the independent owner expected by offline commands.
-fn get_account_owner(
-    globals: &config::GlobalArgs,
-    toml: Option<&TomlConfig>,
-) -> state::db::account::AccountOwner {
-    let (username, domain) = config::resolve_account(globals, toml);
-    state::db::account::AccountOwner::configured(&username, domain.as_str())
-}
-
+// Used by previous-engine tests until that engine is removed.
+#[cfg(test)]
 async fn get_db_path(
     globals: &config::GlobalArgs,
     toml: Option<&TomlConfig>,

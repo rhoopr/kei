@@ -2,6 +2,10 @@
     clippy::print_stdout,
     reason = "CLI subcommand whose primary purpose is to print import-existing progress to stdout"
 )]
+#![allow(
+    dead_code,
+    reason = "previous-engine code kept compiled for its remaining callers and tests until that engine is removed (docs/sync-core.md, delivery step 6)"
+)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -23,11 +27,7 @@ use crate::state;
 use crate::state::{ImportStateStore, VersionSizeKey};
 use crate::systemd::SystemdNotifier;
 
-use super::service::{
-    build_collection_context, collection_libraries, init_photos_service, pass_scope_for_zone,
-    resolve_cross_zone_libraries_for_album_hydration, resolve_libraries, resolve_passes_for_scope,
-    zone_name_set,
-};
+use super::service::{init_photos_service, resolve_libraries};
 
 /// Value of the `stage` field on the one-shot tracing event emitted by
 /// [`collect_import_assets`] when the first asset is dequeued. Operators (and the
@@ -85,6 +85,7 @@ fn record_strict_refusal(stats: &mut ImportStats, heartbeat_state: &HeartbeatSta
 
 /// Default cadence for the `import-existing` heartbeat log line.
 const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(test)]
 const STRICT_IMPORT_PREFIX_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,11 +123,13 @@ impl std::fmt::Debug for ImportRunOptions<'_> {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct HttpStrictImportVerifier {
     client: reqwest::Client,
 }
 
+#[cfg(test)]
 impl HttpStrictImportVerifier {
     fn new() -> Self {
         Self {
@@ -135,6 +138,7 @@ impl HttpStrictImportVerifier {
     }
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl StrictImportVerifier for HttpStrictImportVerifier {
     async fn verify(
@@ -147,6 +151,7 @@ impl StrictImportVerifier for HttpStrictImportVerifier {
     }
 }
 
+#[cfg(test)]
 async fn verify_strict_prefix(
     client: &reqwest::Client,
     local_path: &Path,
@@ -746,6 +751,7 @@ impl ImportPreflight {
 /// `photo_stream` -- after the stream is drained, we check it and bail
 /// loudly if any fetcher task panicked, since a panicked fetcher closes
 /// the stream early and would otherwise read as a clean enumeration.
+#[cfg(test)]
 fn record_import_summary(stats: &ImportStats, dry_run: bool) {
     crate::support::observe(
         "support_import_v1",
@@ -1150,27 +1156,20 @@ pub(crate) async fn run_import_existing(
     toml: Option<&config::TomlConfig>,
     input_mode: crate::InputMode,
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        args.recent.is_none(),
+        "`--recent` is no longer supported: import-existing now checks the whole selected library in one listing."
+    );
+    anyhow::ensure!(
+        !resolve_import_strict(&args, toml),
+        "`--strict` is not supported by this build yet. Run import-existing without it; files are adopted only at their planned paths with the expected size."
+    );
     let shutdown_token = crate::shutdown::install_signal_handler(
         SystemdNotifier::new(false),
         crate::personality::Mode::Off,
     )?;
-    let db_path = super::super::get_db_path(globals, toml).await?;
     let path_config = build_import_path_config(toml)?;
-    let directory = Arc::clone(&path_config.directory);
-    let strict_import = resolve_import_strict(&args, toml);
-    let strict_verifier = strict_import.then(HttpStrictImportVerifier::new);
-    crate::support::observe(
-        "support_import_v1",
-        serde_json::json!({
-            "phase": "initialization", "dry_run": args.dry_run, "strict": strict_import,
-            "recent_limit_present": args.recent.is_some(),
-        }),
-    );
-
-    let recent_count = args.recent;
-
-    // Bail clearly on missing/non-dir; `dir_cache::read_dir_entries`
-    // swallows read errors and would otherwise report "0 files matched".
+    let directory = path_config.directory.to_path_buf();
     match tokio::fs::metadata(&directory).await {
         Ok(m) if m.is_dir() => {}
         Ok(_) => anyhow::bail!("Download path is not a directory: {}", directory.display()),
@@ -1182,7 +1181,15 @@ pub(crate) async fn run_import_existing(
 
     let (username, password, domain, cookie_directory) =
         config::resolve_auth(globals, &args.password, toml)?;
-
+    let location =
+        crate::sync_core::access::Location::resolve(&cookie_directory, &username, domain.as_str())
+            .await?;
+    // Refuse another account's state before signing in.
+    crate::sync_core::access::check_existing(
+        &location,
+        &state::db::account::AccountOwner::configured(&username, domain.as_str()),
+    )
+    .await?;
     let password_provider = super::super::make_provider_from_auth(
         &args.password,
         password,
@@ -1192,7 +1199,6 @@ pub(crate) async fn run_import_existing(
         toml,
         input_mode,
     );
-
     let auth_result = auth::authenticate_in_input_mode(
         &cookie_directory,
         &username,
@@ -1204,171 +1210,118 @@ pub(crate) async fn run_import_existing(
         input_mode,
     )
     .await?;
-
     let owner = state::db::account::AccountOwner::authenticated(
         &username,
         domain.as_str(),
         &auth_result.data,
     )?;
-    let db = Arc::new(
-        state::db::account::open_sync_state(
-            &cookie_directory,
-            &username,
-            domain.as_str(),
-            &owner,
-            &globals.config_source,
-        )
-        .await?,
-    );
-    tracing::debug!(path = %db_path.display(), "State database opened");
-
-    // `kei import-existing` runs without the friendly download bar; off-mode
-    // keeps the existing diagnostic warn line for journals.
-    let (_shared_session, mut photos_service) = init_photos_service(
+    let (shared_session, mut photos_service) = init_photos_service(
         auth_result,
         retry::RetryConfig::default(),
         crate::personality::Mode::Off,
     )
     .await?;
-
-    // Resolve library selection (CLI > TOML > default `primary`)
     let toml_filters = toml.and_then(|t| t.filters.as_ref());
     let selector = config::resolve_library_selector(args.libraries.clone(), toml_filters)?;
     let libraries = resolve_libraries(&selector, &mut photos_service).await?;
-
-    // Album / smart-folder / unfiled selection comes from TOML for
-    // import-existing (which has no per-pass CLI flags of its own). The
-    // resulting `Selection` drives `resolve_passes` below so import iterates
-    // the same passes sync would, and each pass uses its own
-    // `folder_structure_*` template when deriving expected paths.
     let selection = build_import_selection(toml_filters, &selector)?;
-    let all_libraries = photos_service.all_libraries().await?;
-    let cross_zone_libraries =
-        resolve_cross_zone_libraries_for_album_hydration(&selection, async {
-            Ok::<_, anyhow::Error>(all_libraries.clone())
-        })
-        .await?;
-    let collection_libraries = collection_libraries(&selection, &libraries, &all_libraries);
-    let collection_context = build_collection_context(&selection, collection_libraries).await?;
-    let selected_zones = zone_name_set(&libraries);
-    let collection_zones = zone_name_set(collection_libraries);
 
-    let prior_db_total = db.get_summary().await?.total_assets;
-    if prior_db_total > 0 && !args.force_empty {
-        use futures_util::{StreamExt, TryStreamExt};
-        let counts: Vec<u64> = futures_util::stream::iter(libraries.iter())
-            .map(|library| async move {
-                library.all().len().await.with_context(|| {
-                    format!("Could not count assets in library {}", library.zone_name())
-                })
-            })
-            .buffered(libraries.len().max(1))
-            .try_collect()
-            .await?;
-        let empty_zones: Vec<&str> = libraries
-            .iter()
-            .zip(&counts)
-            .filter(|&(_, &count)| count == 0)
-            .map(|(library, _)| library.zone_name())
-            .collect();
-        validate_non_empty_libraries(&empty_zones, prior_db_total)?;
+    // A preview plans into a throwaway state file and transfers nothing.
+    let scratch = args
+        .dry_run
+        .then(|| location.current.with_extension("preview.db"));
+    if let Some(scratch) = &scratch {
+        remove_scratch(scratch).await?;
     }
-
-    if !args.no_progress_bar {
-        println!("Scanning iCloud assets and matching with local files...");
+    let state = match &scratch {
+        Some(scratch) => crate::sync_core::State::open(scratch).await?,
+        None => match crate::sync_core::access::open(&location, &owner, Some(&directory)).await? {
+            Some(state) => state,
+            None => crate::sync_core::access::create(&location, &owner).await?,
+        },
+    };
+    let core = crate::sync_core::CoreConfig {
+        directory: directory.clone(),
+        paths: path_config,
+        albums: selection.albums.clone(),
+        smart_folders: selection.smart_folders.clone(),
+        unfiled: selection.unfiled,
+        temp_suffix: ".kei-part".to_owned(),
+        concurrency: 4,
+        retry: retry::RetryConfig::default(),
+        transfer: if args.dry_run {
+            crate::sync_core::Transfer::None
+        } else {
+            crate::sync_core::Transfer::AdoptOnly
+        },
+    };
+    let client = shared_session.read().await.download_client().clone();
+    let report =
+        crate::sync_core::run_cycle(&state, &libraries, &core, &client, &shutdown_token).await?;
+    if let Some(zone) = report
+        .zones
+        .iter()
+        .find(|zone| zone.error.is_some() || !zone.caught_up)
+    {
+        anyhow::bail!(
+            "Could not list {} completely{}; nothing was adopted from the incomplete part. Run import-existing again.",
+            zone.zone,
+            zone.error
+                .as_deref()
+                .map(|error| format!(": {error}"))
+                .unwrap_or_default()
+        );
     }
-
-    let mut totals = ImportStats::default();
-    let mut preflight = ImportPreflight::default();
-    // Hoisted across passes: a multi-album asset's parent dir is read_dir'd
-    // once per library scan, not once per pass.
-    let mut dir_cache = DirCache::new();
-
-    for library in &all_libraries {
-        let zone = library.zone_name();
-        let pass_scope = pass_scope_for_zone(&selection, zone, &selected_zones, &collection_zones);
-        if pass_scope.is_empty() {
-            continue;
-        }
-        tracing::debug!(zone = %zone, "Scanning library");
-        let library_config = path_config.with_library(zone);
-
-        let plan = resolve_passes_for_scope(
-            library,
-            &selection,
-            pass_scope,
-            &collection_context,
-            &cross_zone_libraries,
-        )
-        .await?;
-        if plan.passes.is_empty() {
-            tracing::debug!(zone = %zone, "No passes resolved; nothing to import");
-            continue;
-        }
-
-        for pass in &plan.passes {
-            let pass_config = library_config.with_pass(pass);
-            tracing::debug!(
-                zone = %zone,
-                kind = ?pass.kind,
-                template = %pass_config.folder_structure,
-                "Importing pass"
-            );
-            let (stream, panic_rx) = pass.album.photo_stream(recent_count, None, 1);
-            let stats = collect_import_assets(
-                stream,
-                panic_rx,
-                db.as_ref(),
-                &pass_config,
-                zone,
-                &mut dir_cache,
-                ImportRunOptions {
-                    dry_run: args.dry_run,
-                    show_progress: !args.no_progress_bar,
-                    strict_verifier: strict_verifier
-                        .as_ref()
-                        .map(|v| v as &dyn StrictImportVerifier),
-                    shutdown_token: Some(&shutdown_token),
-                },
-                &mut preflight,
-            )
-            .await?;
-            totals += stats;
-        }
-    }
-
-    totals += preflight
-        .adopt(
-            db.as_ref(),
-            ImportRunOptions {
-                dry_run: args.dry_run,
-                show_progress: !args.no_progress_bar,
-                strict_verifier: strict_verifier
-                    .as_ref()
-                    .map(|v| v as &dyn StrictImportVerifier),
-                shutdown_token: Some(&shutdown_token),
-            },
-        )
-        .await?;
-
-    record_import_summary(&totals, args.dry_run);
-    println!();
-    if args.dry_run {
-        println!("Import complete (DRY RUN - no changes written to state DB):");
-    } else {
-        println!("Import complete:");
-    }
-    println!("  Total assets scanned: {}", totals.total);
-    println!("  Files matched:        {}", totals.matched);
-    println!(
-        "  ... skipped re-hash:  {}",
-        totals.skipped_already_imported
+    let listed = state.asset_count().await?;
+    anyhow::ensure!(
+        listed > 0 || args.force_empty,
+        "iCloud returned no photos for the selected libraries. If the library really is empty, rerun with --force-empty."
     );
-    println!("  Unmatched versions:   {}", totals.unmatched);
-    println!("  Filtered (no path):   {}", totals.filtered);
-    println!("  Strict refusals:      {}", totals.strict_refused);
-    println!("  Hash errors:          {}", totals.hash_errors);
 
+    let files = state.list_files(&[]).await?;
+    let count = |state: &str| {
+        files
+            .iter()
+            .filter(|file| file.wanted && file.state == state)
+            .count()
+    };
+    if let Some(scratch) = &scratch {
+        state.close().await?;
+        remove_scratch(scratch).await?;
+        println!("Dry run: no state was written.");
+        println!("  Local files that match a photo: {}", count("adopt"));
+        println!("  Copies with no local file yet:  {}", count("pending"));
+    } else {
+        let adopted: u64 = report.zones.iter().map(|zone| zone.drain.adopted).sum();
+        println!("Adopted {adopted} existing local files.");
+        println!(
+            "  Already recorded:              {}",
+            count("done").saturating_sub(usize::try_from(adopted).unwrap_or(usize::MAX))
+        );
+        println!(
+            "  Copies with no local file yet: {} (run `kei sync` to download them)",
+            count("pending")
+        );
+        if report.completeness.failed > 0 {
+            println!(
+                "  Could not adopt:               {} (a different file is at the planned path)",
+                report.completeness.failed
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Remove a preview's scratch state file and its SQLite companions.
+async fn remove_scratch(path: &std::path::Path) -> anyhow::Result<()> {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        match tokio::fs::remove_file(std::path::PathBuf::from(name)).await {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+            _ => {}
+        }
+    }
     Ok(())
 }
 
@@ -1412,6 +1365,7 @@ fn build_import_selection(
 /// `--force-empty` is the documented escape hatch for that case. Caller
 /// short-circuits when `prior_db_total == 0` or `--force-empty` is set, so
 /// this function only runs when a guard is wanted.
+#[cfg(test)]
 fn validate_non_empty_libraries(empty_zones: &[&str], prior_db_total: u64) -> anyhow::Result<()> {
     let [head, tail @ ..] = empty_zones else {
         return Ok(());

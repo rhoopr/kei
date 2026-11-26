@@ -69,6 +69,21 @@ Auth and session, CloudKit transport, record parsing and validation in `src/iclo
 
 The provider inbox and catalog, selection generations and decisions, rank pages, replay and accepted-replay coverage, checkpoint holds and bridges, provider work obligations, sparse identity tracking (replaced by pending rows), legacy trust and preservation, layout journals and album-directory moves, and the schema migrations they need.
 
+## Commands
+
+Every command that reads state uses `src/sync_core/access.rs`. It resolves `<account>.sync.db`, upgrades a previous-engine file first if one exists, and refuses state bound to another account before reading or changing anything. Offline commands check the configured account; signed-in commands also check, or first record, the provider identity.
+
+| Command | Behavior on the sync core |
+|---|---|
+| `status` | Saved, owed, failed and locally modified copies, copies carried over from the previous state, each library's resume point, and the last run. `--failed`, `--pending` and `--downloaded` list paths. |
+| `verify` | Checks every saved copy exists; `--checksums` compares it with its recorded SHA-256. |
+| `manifest` | Exports every copy row as JSON or CSV: library, photo, version, relative path, album, size, SHA-256, state and whether it is still selected. |
+| `reconcile` | Owes again every saved, selected copy whose file is missing (`--dry-run` only lists them). `--inspect-path` prints a copy's fingerprint; `--confirm-damage` owes it again so the next sync replaces exactly those bytes. |
+| `reset state` | Deletes the previous and current state files after checking ownership of each. |
+| `reset sync-token` | Forgets every library's position, so the next sync lists each again. Saved copies stay. |
+| `import-existing` | Runs one cycle that adopts local files at planned paths with the expected size and downloads nothing. `--dry-run` plans into a scratch file and reports matches without writing state. |
+| `doctor` | Reports whether the state opens and its saved, owed and failed counts. |
+
 ## Upgrade
 
 The upgrade establishes the new state, validates it, then removes the old history. Users report oversized state databases, so the upgrade must end with a compact database, not only a new schema. It is implemented in `src/sync_core/upgrade.rs` and runs before the first cycle when `<account>.sync.db` does not exist yet but the old `<account>.db` does.
@@ -105,4 +120,4 @@ Acceptance tests in `src/sync_core/tests.rs` drive whole cycles against a fake z
 - **Missing files.** Normal sync does not yet re-check that done copies still exist.
 - **Session expiry.** A session that expires mid-run is not re-authenticated yet; the next cycle fails until restart.
 - **Old-engine behavioral tests.** Seven `account_ownership` tests drive `kei sync` and assert previous-engine state (provider inbox, catalog, rank pages, sparse identity, legacy metadata keys and retired checkpoint tables). They go with that engine.
-- **Other commands.** `status`, `verify`, `manifest`, `import-existing`, `doctor` and `reset` still read the previous state file. After the upgrade cleanup they find no state until they are moved to the sync core.
+- **Strict import.** `import-existing --strict`, which checked a cloud prefix before adopting a same-name, same-size file, is refused by this build. `--recent` is retired.

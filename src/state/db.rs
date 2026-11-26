@@ -10,6 +10,10 @@
 //! Tests formerly under `state::db::tests` now use each owner's `tests` module,
 //! or `connection_tests` for connection lifecycle. Test names are unchanged.
 //! `cargo test state::` includes every relocated test.
+#![allow(
+    dead_code,
+    reason = "previous-engine code kept compiled for its remaining callers and tests until that engine is removed (docs/sync-core.md, delivery step 6)"
+)]
 
 pub(crate) mod account;
 mod asset_writes;

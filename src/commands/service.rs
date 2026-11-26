@@ -757,6 +757,10 @@ pub(crate) fn pass_scope_for_zone(
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "previous-engine code kept compiled for its remaining callers and tests until that engine is removed (docs/sync-core.md, delivery step 6)"
+)]
 pub(crate) async fn build_collection_context(
     selection: &crate::selection::Selection,
     collection_libraries: &[icloud::photos::PhotoLibrary],

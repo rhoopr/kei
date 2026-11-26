@@ -56,7 +56,7 @@ pub(crate) async fn drain_zone(
         for row in rows {
             if row.state == FileState::Adopt {
                 adopt(state, config, &row, &mut stats).await?;
-            } else {
+            } else if config.transfer == super::Transfer::All {
                 downloads.push(row);
             }
         }

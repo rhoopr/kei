@@ -52,23 +52,24 @@ pub(crate) async fn prepare(
     if exists(target).await? || !exists(legacy).await? {
         return Ok(None);
     }
-    let provider = owner
-        .provider_key()
-        .context("The iCloud account identity is unavailable")?
-        .to_owned();
     let (legacy, owner_check, directory) =
         (legacy.to_path_buf(), owner.clone(), directory.to_path_buf());
     let legacy_for_read = legacy.clone();
-    let (copies, mut report) = tokio::task::spawn_blocking(move || {
+    let (copies, mut report, provider) = tokio::task::spawn_blocking(move || {
         let conn = open_verified_read_only(&legacy_for_read, &owner_check)?;
-        read_copies(&conn, &directory)
+        let provider: String =
+            conn.query_row("SELECT provider_key FROM account_owner", [], |row| {
+                row.get(0)
+            })?;
+        let (copies, report) = read_copies(&conn, &directory)?;
+        anyhow::Ok((copies, report, provider))
     })
     .await??;
 
     let building = building_path(target);
     remove_sqlite_files(&building).await?;
     let state = State::open(&building).await?;
-    state.set_kv(super::runner::ACCOUNT_KEY, &provider).await?;
+    super::access::bind(&state, owner.key(), Some(&provider)).await?;
     report.imported = state.insert_imported(copies).await?;
     state.set_kv(LEGACY_KEY, &legacy.to_string_lossy()).await?;
     state.validate().await?;
