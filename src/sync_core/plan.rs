@@ -42,7 +42,16 @@ pub(crate) async fn plan_zone(
     let smart = selected_smart_folders(&config.smart_folders);
     let mut stats = PlanStats::default();
     let mut after = String::new();
+    let mut progress = super::progress::Progress::start();
     loop {
+        if progress.due() && stats != PlanStats::default() {
+            tracing::info!(
+                zone,
+                planned = stats.planned,
+                waiting = stats.waiting,
+                "Planning copies"
+            );
+        }
         let batch = state.dirty_assets(zone, &after, BATCH).await?;
         let Some(last) = batch.last() else {
             break;

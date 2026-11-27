@@ -43,6 +43,8 @@ Existing account-owner, temp-file ownership and migration-backup behavior is kep
 4. **Metadata.** If a writer is enabled, update saved copies whose metadata may be stale; see [metadata write boundaries](architecture/metadata.md).
 5. **Report.** Record the run, completeness and failures, and update the health file, metrics, notifications, the JSON report and support history.
 
+Long steps log progress at most every 30 seconds: pages and records listed (each page is already saved, so a restart resumes there), copies planned, copies downloaded, adopted or failed with bytes and the number still owed, and metadata written. A quiet cycle logs only its summary.
+
 When iCloud refuses the session, the runner signs in again, with the existing attempt limit and the 2FA wait in watch mode, and repeats the cycle from the saved positions. Between watch cycles it releases the session lock and checks the session again on waking.
 
 A missing master, an unknown identity or an absent record keeps the row pending. Absence from a listing never deletes anything, on disk or in the catalog.

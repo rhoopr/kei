@@ -8,6 +8,7 @@ pub(crate) mod access;
 pub(crate) mod drain;
 pub(crate) mod metadata;
 pub(crate) mod plan;
+mod progress;
 pub(crate) mod runner;
 pub(crate) mod state;
 mod support;
@@ -269,7 +270,15 @@ async fn observe(
     let zone = library.zone_name();
     let mut position = state.position(zone).await?;
     report.full_listing = position.is_none();
+    if report.full_listing {
+        tracing::info!(
+            zone,
+            "Listing the whole library; a first listing of a large library can take a while"
+        );
+    }
     let mut reset = false;
+    let mut records = 0_usize;
+    let mut progress = progress::Progress::start();
     for _ in 0..MAX_PAGES_PER_CYCLE {
         if cancel.is_cancelled() {
             return Ok(());
@@ -277,7 +286,7 @@ async fn observe(
         let page = match library.feed_page(position.as_deref()).await {
             Ok(page) => page,
             Err(FeedError::PositionRejected(reason)) if !reset => {
-                tracing::warn!(zone, reason = %reason, "iCloud rejected the saved sync position; listing the library again");
+                tracing::warn!(zone, reason = %reason, "iCloud rejected the saved sync position; listing the whole library again");
                 state.reset_position(zone).await?;
                 position = None;
                 reset = true;
@@ -293,6 +302,7 @@ async fn observe(
         );
         let caught_up = !page.more_coming;
         let next = page.sync_token.clone();
+        records += page.observations.len();
         state
             .commit_page(zone, page.observations, page.sync_token, caught_up)
             .await?;
@@ -301,6 +311,15 @@ async fn observe(
         if caught_up {
             report.caught_up = true;
             return Ok(());
+        }
+        if progress.due() {
+            // Each page is saved before this line, so a restart resumes here.
+            tracing::info!(
+                zone,
+                pages = report.pages,
+                records,
+                "Listing library: progress saved"
+            );
         }
     }
     Ok(())

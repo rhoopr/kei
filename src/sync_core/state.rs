@@ -802,6 +802,21 @@ impl State {
         .await
     }
 
+    /// Wanted copies of `zone` that still need work.
+    pub(crate) async fn owed(&self, zone: &str) -> anyhow::Result<u64> {
+        let zone = zone.to_owned();
+        self.with(move |conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM files WHERE zone = ?1 AND wanted = 1
+                 AND state IN ('pending', 'adopt', 'failed')",
+                [zone],
+                |row| row.get(0),
+            )?;
+            Ok(u64::try_from(count)?)
+        })
+        .await
+    }
+
     /// Wanted copies that still need work, in id order after `after`.
     pub(crate) async fn work(
         &self,

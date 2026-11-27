@@ -58,6 +58,7 @@ pub(crate) async fn run_zone(
 ) -> anyhow::Result<MetadataStats> {
     let mut stats = MetadataStats::default();
     let mut after = 0;
+    let mut progress = super::progress::Progress::start();
     loop {
         if cancel.is_cancelled() {
             break;
@@ -72,6 +73,16 @@ pub(crate) async fn run_zone(
                 break;
             }
             visit(state, directory, settings, row, &mut stats).await?;
+            if progress.due() {
+                tracing::info!(
+                    zone,
+                    written = stats.written,
+                    unchanged = stats.unchanged,
+                    locally_modified = stats.modified,
+                    failed = stats.failed,
+                    "Updating metadata"
+                );
+            }
         }
     }
     Ok(stats)

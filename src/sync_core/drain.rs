@@ -43,7 +43,7 @@ pub(crate) async fn drain_zone(
     cancel: &CancellationToken,
 ) -> anyhow::Result<DrainStats> {
     let zone = library.zone_name().to_owned();
-    let mut stats = DrainStats::default();
+    let mut stats = Tally::start(&zone, state.owed(&zone).await?);
     let mut after = 0;
     loop {
         if cancel.is_cancelled() {
@@ -81,7 +81,72 @@ pub(crate) async fn drain_zone(
             }
         }
     }
-    Ok(stats)
+    stats.finish();
+    Ok(stats.stats)
+}
+
+/// Drain counters plus periodic progress lines for one zone.
+struct Tally {
+    stats: DrainStats,
+    zone: String,
+    /// Copies owed when the step started.
+    owed: u64,
+    progress: super::progress::Progress,
+}
+
+impl Tally {
+    fn start(zone: &str, owed: u64) -> Self {
+        if owed > 0 {
+            tracing::info!(zone, owed, "Saving owed copies");
+        }
+        Self {
+            stats: DrainStats::default(),
+            zone: zone.to_owned(),
+            owed,
+            progress: super::progress::Progress::start(),
+        }
+    }
+
+    /// Report progress when a line is due.
+    fn tick(&mut self) {
+        if self.progress.due() {
+            self.report("Saving copies");
+        }
+    }
+
+    fn finish(&self) {
+        if self.owed > 0 {
+            self.report("Saved copies");
+        }
+    }
+
+    fn report(&self, message: &'static str) {
+        let s = self.stats;
+        let settled = s.downloaded + s.adopted + s.failed + s.modified;
+        tracing::info!(
+            zone = %self.zone,
+            downloaded = s.downloaded,
+            adopted = s.adopted,
+            failed = s.failed,
+            locally_modified = s.modified,
+            bytes = s.bytes,
+            remaining = self.owed.saturating_sub(settled),
+            "{message}"
+        );
+    }
+}
+
+impl std::ops::Deref for Tally {
+    type Target = DrainStats;
+    fn deref(&self) -> &DrainStats {
+        &self.stats
+    }
+}
+
+impl std::ops::DerefMut for Tally {
+    fn deref_mut(&mut self) -> &mut DrainStats {
+        &mut self.stats
+    }
 }
 
 /// Hash a file already at a new copy's path and take ownership of it.
@@ -89,12 +154,13 @@ async fn adopt(
     state: &State,
     config: &CoreConfig,
     row: &FileRow,
-    stats: &mut DrainStats,
+    stats: &mut Tally,
 ) -> anyhow::Result<()> {
     match core_io::hash_file(&config.directory.join(&row.path)).await {
         Ok(Some((size, sha256))) if size == row.size => {
             state.mark_done(row.id, &sha256).await?;
             stats.adopted += 1;
+            stats.tick();
         }
         Ok(Some(_)) => {
             state
@@ -144,7 +210,7 @@ async fn download_batch(
     client: &Client,
     cancel: &CancellationToken,
     rows: Vec<FileRow>,
-    stats: &mut DrainStats,
+    stats: &mut Tally,
 ) -> anyhow::Result<Vec<FileRow>> {
     let zone = library.zone_name();
     let mut assets: Vec<String> = rows.iter().map(|row| row.asset.clone()).collect();
@@ -272,6 +338,7 @@ async fn download_batch(
                 state.mark_done(row.id, &fetched.sha256).await?;
                 stats.downloaded += 1;
                 stats.bytes += fetched.bytes;
+                stats.tick();
             }
             Err(FetchError::Expired) => expired.push(row),
             Err(FetchError::Interrupted) => {}
@@ -279,6 +346,7 @@ async fn download_batch(
                 tracing::warn!(path = %row.path, error = %format!("{error:#}"), "Download failed; it will be retried");
                 state.mark_failed(row.id, &format!("{error:#}")).await?;
                 stats.failed += 1;
+                stats.tick();
             }
         }
     }

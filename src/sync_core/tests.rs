@@ -1417,3 +1417,53 @@ async fn a_replacement_published_before_a_crash_is_not_downloaded_again() {
         .unwrap();
     assert_eq!(row.sha256, Some(sha256_hex(&jpeg("one v2"))));
 }
+
+#[tokio::test]
+async fn long_steps_report_progress_with_what_is_saved_and_what_remains() {
+    let (capture, _guard) = crate::test_helpers::TracingCapture::install();
+    let h = Harness::new().await;
+    library_with_album(&h).await;
+    let report = h.run().await;
+    assert!(report.complete(), "{report:?}");
+    let lines = capture.events();
+    let messages: Vec<&str> = lines.iter().filter_map(|e| e.message()).collect();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.starts_with("Listing the whole library")),
+        "{messages:?}"
+    );
+    let listing = lines
+        .iter()
+        .find(|e| e.message() == Some("Listing library: progress saved"))
+        .expect("a multi-page listing reports its saved pages");
+    assert_eq!(listing.field("pages"), Some("1"));
+    let owed = lines
+        .iter()
+        .find(|e| e.message() == Some("Saving owed copies"))
+        .expect("downloads report what is owed");
+    assert_eq!(owed.field("owed"), Some("2"));
+    let saved = lines
+        .iter()
+        .find(|e| e.message() == Some("Saved copies"))
+        .expect("downloads report what was saved");
+    assert_eq!(saved.field("downloaded"), Some("2"));
+    assert_eq!(saved.field("remaining"), Some("0"));
+
+    // A quiet cycle lists one page and owes nothing, so it stays quiet.
+    let (capture, _guard) = crate::test_helpers::TracingCapture::install();
+    h.run().await;
+    let quiet: Vec<String> = capture
+        .events()
+        .iter()
+        .filter_map(|e| e.message().map(ToOwned::to_owned))
+        .collect();
+    assert!(
+        !quiet
+            .iter()
+            .any(|m| m.starts_with("Listing the whole library")
+                || m == "Saving owed copies"
+                || m == "Saved copies"),
+        "{quiet:?}"
+    );
+}
