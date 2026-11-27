@@ -1,6 +1,6 @@
 # Trusted Legacy Files
 
-Run `kei sync` instead. Legacy coverage certification is retired, so adding a local-trust declaration no longer helps sync complete or advance a checkpoint.
+Run `kei sync` instead. Legacy coverage certification belonged to the engine that v0.30 replaced, so a local-trust declaration no longer has any effect.
 
 These command spellings remain available in help, but both refuse the operation before authentication, state opening or media work:
 
@@ -9,10 +9,8 @@ kei reconcile trust-legacy-files plan --library <zone> --output <new-file.json>
 kei reconcile trust-legacy-files apply --plan <file.json>
 ```
 
-Neither command creates a plan, accepts files or writes a new trust declaration. Existing declarations, plans, legacy records and media remain unchanged. The refusal performs no schema migration or file rewrite. Do not reset state or remove protected originals to get past it.
+Neither command creates a plan, accepts files or writes a trust declaration, and neither changes state or media.
 
 ## Existing declarations
 
-Older versions recorded explicit local-file trust separately from provider verification. Those declarations remain historical evidence. `kei status` reports their stored count; it can include obsolete bindings and is not a count of currently verified provider files. A declaration does not supply a missing provider source receipt, confer ownership or authorize adoption, overwrite or checkpoint advancement.
-
-Normal sync retains ownership, protected-path, current identity, transfer, metadata and publication guards. Missing historical coverage certificates alone no longer force an inventory, fail a cycle or make the process unhealthy. Status lists unresolved historical attribution separately from the current sync outcome. See [Backup maintenance](backup-maintenance.md#historical-legacy-evidence) for the counters and remaining recovery limits.
+Declarations recorded by earlier versions are not carried over by the [v0.30 upgrade](upgrade.md). The upgrade carries over the local copies the previous state recorded as verified, and the first sync takes them over without downloading them again. The old state file, and the declarations in it, are removed after the first cycle in which every library finished its listing. See [retired maintenance](backup-maintenance.md#retired-maintenance).

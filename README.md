@@ -138,9 +138,9 @@ If a sync fails, check that kei can write to the destination, that there is enou
 
 For a bug or confusing result, open an [issue](https://github.com/rhoopr/kei/issues) with your kei version, what you expected and what happened. When available, run `kei support-export --output kei-support.json` with the same configuration and data directory. It collects details already saved by kei without another sync and uploads nothing automatically. Review the file before attaching it. You can still report a problem if you're using an older version or the export is incomplete. See [Support export](docs/support-export.md) for details and Docker instructions.
 
-Some repair commands change kei's saved state or replace files. Read [Backup maintenance](docs/backup-maintenance.md) first. Don't delete state or conflicting files just to clear a warning. When preserving older files, kei normally refuses files with hardlinks, where several paths refer to the same file. The [hardlink waiver](docs/backup-maintenance.md#legacy-preservation-and-hardlinks) allows this case, but a change through one path can affect the others. It does not prevent kei from writing to files.
+Some repair commands change kei's saved state or replace files. Read [Backup maintenance](docs/backup-maintenance.md) first. Don't delete state or conflicting files just to clear a warning. Sync never deletes files, and it replaces a file only while the file still holds the bytes kei recorded for it.
 
-Historical legacy coverage certificates are no longer required for current sync or process health. Status lists unresolved historical attribution separately from the current sync outcome. The old `reconcile trust-legacy-files plan/apply` commands refuse without changing state or media; use `kei sync` instead. Ownership, protected files and current retry work remain guarded. See [historical legacy evidence](docs/backup-maintenance.md#historical-legacy-evidence) for the distinction and remaining limits.
+v0.30 replaces the sync engine. The first sync carries over the copies your previous state recorded and lists every library from the start; see [Upgrade and compatibility](docs/upgrade.md). Legacy coverage certificates, trust declarations and the hardlink waiver no longer apply; see [retired maintenance](docs/backup-maintenance.md#retired-maintenance).
 
 ## What kei gives you
 

@@ -911,8 +911,12 @@ impl Command {
             doctor.has_env_password = true;
             return;
         }
+        // An explicit `--password-file` or `--password-command` wins over
+        // the ambient environment variable, as clap's conflict rules imply.
         if let Some(args) = self.password_args_mut()
             && args.password.is_none()
+            && args.password_file.is_none()
+            && args.password_command.is_none()
         {
             args.password = Some(pw);
         }
@@ -1165,6 +1169,29 @@ mod tests {
     }
 
     // ── Global args ───────────────────────────────────────────────
+
+    #[test]
+    fn an_explicit_password_source_wins_over_the_environment_password() {
+        for (flag, value) in [
+            ("--password-file", "/tmp/pw"),
+            ("--password-command", "pass show icloud"),
+        ] {
+            let mut cli = parse(&["kei", "login", flag, value]);
+            let command = &mut cli.command;
+            command.inject_env_password(Some("from-env".into()));
+            let Command::Login { password, .. } = command else {
+                panic!("expected login");
+            };
+            assert_eq!(password.password, None, "{flag}");
+        }
+        let mut cli = parse(&["kei", "login"]);
+        let command = &mut cli.command;
+        command.inject_env_password(Some("from-env".into()));
+        let Command::Login { password, .. } = command else {
+            panic!("expected login");
+        };
+        assert_eq!(password.password.as_deref(), Some("from-env"));
+    }
 
     #[test]
     fn test_username_global_removed() {

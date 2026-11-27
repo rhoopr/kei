@@ -95,6 +95,9 @@ pub(super) fn directory_path(target: &Path) -> Result<PathBuf> {
     Ok(target.with_file_name(format!("{JOURNAL_PREFIX}{digest}")))
 }
 
+// CONTRACT: TEMP_FILE_DELETE_REQUIRES_DURABLE_OWNERSHIP
+// A prepared file is removed only while it is the exact inode kei created
+// and still holds the bytes kei wrote; its folder is synced afterwards.
 #[cfg(feature = "xmp")]
 pub(super) fn cleanup_prepared(
     path: &Path,
@@ -111,17 +114,6 @@ pub(super) fn cleanup_prepared(
     unlink(&path, 0)?;
     path.sync_parent()?;
     Ok(())
-}
-
-fn journal_name(name: &std::ffi::OsStr) -> bool {
-    name.as_bytes()
-        .strip_prefix(JOURNAL_PREFIX.as_bytes())
-        .is_some_and(|digest| {
-            digest.len() == 64
-                && digest
-                    .iter()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
-        })
 }
 
 fn read_fingerprint(path: &ConfinedPath) -> Result<Option<Fingerprint>> {
@@ -151,12 +143,6 @@ fn same_entry(left: &ConfinedPath, right: &ConfinedPath) -> Result<bool> {
 }
 
 fn unlink(path: &ConfinedPath, flags: libc::c_int) -> std::io::Result<()> {
-    #[cfg(test)]
-    if flags == libc::AT_REMOVEDIR
-        && let Some(result) = tests::terminal_rmdir_fault(path)
-    {
-        return result;
-    }
     // SAFETY: retained directory descriptors and NUL-terminated names outlive
     // the call; unlinkat does not follow the leaf, including directory removal.
     let result = unsafe { libc::unlinkat(path.parent_fd(), path.name_cstr().as_ptr(), flags) };
@@ -540,67 +526,6 @@ pub(super) fn publish_with_mtime(
         .map_err(|error| retain_recovery_error(error, &journal, part))
 }
 
-/// The managed layout owner supplies retained no-follow parent capabilities;
-/// use the same conditional replacement journal and recovery as truncated repair.
-pub(super) fn publish_confined(
-    part: &ConfinedPath,
-    target: &ConfinedPath,
-    expected: ExistingFileFingerprint,
-    replacement: ExistingFileFingerprint,
-    modified: Option<std::time::SystemTime>,
-) -> Result<()> {
-    let target = target.sibling(target.path())?;
-    let mut journal = Journal::create(part, target, expected, replacement)?;
-    if let Err(error) = publish_journal_with_mtime(&journal, modified, |_| Ok(())) {
-        if let Err(recovery_error) = journal.recover() {
-            return Err(retain_recovery_error(
-                error.context(format!(
-                    "Replacement recovery incomplete: {recovery_error:#}"
-                )),
-                &journal,
-                part.path(),
-            ));
-        }
-        return Err(error);
-    }
-    finish_publication(&mut journal, part.path())
-        .map_err(|error| retain_recovery_error(error, &journal, part.path()))
-}
-
-/// Resume only the exact temporary two-name link left by no-replace or the
-/// committed fallback journal. The layout's durable prepared receipt supplies
-/// custody, identity and bytes; unknown links never receive this authorization.
-pub(in crate::download) fn finish_owned_prepared_link(
-    part: &ConfinedPath,
-    target: &ConfinedPath,
-    expected: ExistingFileFingerprint,
-    expected_identity: FileIdentity,
-) -> Result<()> {
-    let Some(file) = part.open_optional_regular()? else {
-        return Ok(());
-    };
-    let links = crate::fs_util::file_link_count(&file)?;
-    if links == 1 {
-        return Ok(());
-    }
-    anyhow::ensure!(
-        links == 2
-            && file_identity(&file)? == expected_identity
-            && same_entry(part, target)?
-            && read_fingerprint(part)? == Some(expected.into())
-            && read_fingerprint(target)? == Some(expected.into()),
-        "Unexpected prepared hardlink; retaining all bytes"
-    );
-    // CONTRACT: TEMP_FILE_DELETE_REQUIRES_DURABLE_OWNERSHIP
-    // This is the existing publication cleanup, with the additional persisted
-    // prepared identity and exact two-entry boundary required by layout recovery.
-    part.validate_identity(expected_identity)?;
-    unlink(part, 0)?;
-    part.sync_parent()?;
-    target.sync_parent()?;
-    Ok(())
-}
-
 fn retain_recovery_error(error: anyhow::Error, journal: &Journal, part: &Path) -> anyhow::Error {
     error
         .context(ConditionalPublishMustRetainPaths {
@@ -700,109 +625,6 @@ pub(super) fn recover_target(target: &Path) -> Result<()> {
     }
     if let Some(mut journal) = Journal::open(&directory)? {
         journal.recover()?;
-    }
-    Ok(())
-}
-
-/// Recover journals before discovery or checksum checks can misclassify an
-/// interrupted displacement as a missing or changed media file. The configured
-/// root is resolved first; descendant links are not traversed, and mutations
-/// use retained, no-follow directory capabilities.
-pub(super) async fn recover_tree(
-    root: &Path,
-    protected_paths: &[std::path::PathBuf],
-) -> Result<()> {
-    let root = root.to_path_buf();
-    let protected_paths = protected_paths.to_vec();
-    tokio::task::spawn_blocking(move || {
-        recover_tree_blocking_with_protection(&root, &protected_paths)
-    })
-    .await??;
-    Ok(())
-}
-
-#[cfg(test)]
-fn recover_tree_blocking(root: &Path) -> Result<()> {
-    recover_tree_blocking_with_protection(root, &[])
-}
-
-fn recover_tree_blocking_with_protection(
-    root: &Path,
-    protected_paths: &[std::path::PathBuf],
-) -> Result<()> {
-    if !root.try_exists()? {
-        return Ok(());
-    }
-    anyhow::ensure!(
-        !root
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir)),
-        "Replacement recovery root contains a parent component"
-    );
-    // The configured root is a trusted anchor and may be an alias. Descendants
-    // and journals still undergo no-follow traversal from its resolved path.
-    let mut protected_journals = std::collections::HashSet::new();
-    for path in protected_paths {
-        let journal = directory_path(path)?;
-        let parent = journal
-            .parent()
-            .context("Protected replacement has no parent")?;
-        // Keep absent suffixes reserved while resolving existing root aliases.
-        let mut ancestor = crate::fs_util::absolute_confined_path(parent)?;
-        let mut missing = PathBuf::new();
-        let resolved = loop {
-            match std::fs::canonicalize(&ancestor) {
-                Ok(existing) => break existing.join(&missing),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    match std::fs::symlink_metadata(&ancestor) {
-                        Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {}
-                        _ => return Err(error.into()),
-                    }
-                    missing = PathBuf::from(
-                        ancestor
-                            .file_name()
-                            .context("Protected replacement has no ancestor")?,
-                    )
-                    .join(missing);
-                    ancestor.pop();
-                }
-                Err(error) => return Err(error.into()),
-            }
-        };
-        protected_journals.insert(
-            resolved.join(
-                journal
-                    .file_name()
-                    .context("Protected replacement has no name")?,
-            ),
-        );
-    }
-    let mut directories = vec![std::fs::canonicalize(root)?];
-    while let Some(directory) = directories.pop() {
-        let capability = confined(&directory.join(".kei-recovery-probe"))?;
-        for entry in std::fs::read_dir(format!("/proc/self/fd/{}", capability.parent_fd()))? {
-            let entry = entry?;
-            if journal_name(&entry.file_name()) {
-                // Opening an incomplete journal can clean it up; reject before
-                // open, including originals belonging to unselected libraries.
-                anyhow::ensure!(
-                    !protected_journals.contains(&directory.join(entry.file_name())),
-                    "Replacement recovery intersects protected legacy evidence; all bytes retained"
-                );
-                if let Some(mut journal) = Journal::open(&directory.join(entry.file_name()))
-                    .with_context(|| {
-                        format!(
-                            "Could not open replacement journal {}",
-                            directory.join(entry.file_name()).display()
-                        )
-                    })?
-                {
-                    journal.recover().with_context(|| format!("Could not recover replacement journal {}; all ambiguous bytes are retained", directory.join(entry.file_name()).display()))?;
-                }
-            } else if entry.file_type()?.is_dir() {
-                directories.push(directory.join(entry.file_name()));
-            }
-        }
     }
     Ok(())
 }

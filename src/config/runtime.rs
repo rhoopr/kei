@@ -216,31 +216,6 @@ impl CreatedDateFilter {
                 + chrono::Duration::seconds(Self::WIDEST_OFFSET_SECONDS),
         )
     }
-
-    /// Midnight UTC on a capture date, or the instant itself.
-    fn comparable_instant(self) -> DateTime<Utc> {
-        match self {
-            Self::Instant(boundary) => boundary,
-            Self::CaptureDate(boundary) => boundary.and_time(chrono::NaiveTime::MIN).and_utc(),
-        }
-    }
-
-    pub(crate) fn conservative_utc_lower_bound(self) -> DateTime<Utc> {
-        match self {
-            Self::Instant(boundary) => boundary,
-            Self::CaptureDate(_) => self.comparable_instant() - chrono::Duration::days(1),
-        }
-    }
-
-    /// Durable identity used by the config and coverage hashes. Keep it
-    /// separate from [`std::fmt::Display`], so rewording a diagnostic cannot
-    /// invalidate every user's incremental state.
-    pub(crate) fn fingerprint(self) -> String {
-        match self {
-            Self::Instant(boundary) => boundary.to_rfc3339(),
-            Self::CaptureDate(boundary) => format!("capture-date:{boundary}"),
-        }
-    }
 }
 
 /// Diagnostic rendering only. Each bound names its form, because the two forms
@@ -426,7 +401,7 @@ mod tests {
     use super::{Config, CreatedDateFilter, parse_created_date_filter};
     use crate::config::input::TomlConfig;
     use crate::config::test_support::{default_globals, default_password, default_sync};
-    use chrono::{Local, NaiveDate, Utc};
+    use chrono::{Local, NaiveDate};
 
     #[test]
     fn test_parse_date_marks_calendar_boundaries() {
@@ -438,15 +413,6 @@ mod tests {
             parse_created_date_filter("2025-01-15T00:00:00").unwrap(),
             CreatedDateFilter::Instant(_)
         ));
-    }
-    #[test]
-    fn date_only_filter_bound_is_host_timezone_independent() {
-        assert_eq!(
-            parse_created_date_filter("2025-01-15")
-                .unwrap()
-                .fingerprint(),
-            "capture-date:2025-01-15"
-        );
     }
     /// The contradictory-window warning reads back to whoever wrote the
     /// config, so each bound has to name the form it took rather than leaning
@@ -470,40 +436,6 @@ mod tests {
         );
     }
     #[test]
-    fn conservative_utc_lower_bound_covers_filter_forms_and_maximum_offsets() {
-        let capture_date = NaiveDate::from_ymd_opt(2025, 2, 1).unwrap();
-        let utc_midnight = capture_date.and_time(chrono::NaiveTime::MIN).and_utc();
-        let instant = utc_midnight + chrono::Duration::hours(6);
-
-        for (name, filter, expected) in [
-            (
-                "capture date",
-                CreatedDateFilter::CaptureDate(capture_date),
-                utc_midnight - chrono::Duration::days(1),
-            ),
-            ("instant", CreatedDateFilter::Instant(instant), instant),
-        ] {
-            assert_eq!(filter.conservative_utc_lower_bound(), expected, "{name}");
-        }
-
-        let lower_bound =
-            CreatedDateFilter::CaptureDate(capture_date).conservative_utc_lower_bound();
-        for (name, offset_seconds, expected_clearance) in [
-            ("UTC+14", 50_400, chrono::Duration::hours(10)),
-            ("chrono east limit", 86_399, chrono::Duration::seconds(1)),
-        ] {
-            let offset = chrono::FixedOffset::east_opt(offset_seconds).unwrap();
-            let asset_utc = capture_date
-                .and_time(chrono::NaiveTime::MIN)
-                .and_local_timezone(offset)
-                .single()
-                .unwrap()
-                .with_timezone(&Utc);
-            assert_eq!(asset_utc - lower_bound, expected_clearance, "{name}");
-            assert!(asset_utc >= lower_bound, "{name} asset was truncated");
-        }
-    }
-    #[test]
     fn test_parse_datetime_iso() {
         let CreatedDateFilter::Instant(dt) =
             parse_created_date_filter("2025-06-15T14:30:00").unwrap()
@@ -516,30 +448,6 @@ mod tests {
             naive.time(),
             chrono::NaiveTime::from_hms_opt(14, 30, 0).unwrap()
         );
-    }
-    #[test]
-    fn test_parse_relative_days_rejected_with_resolution() {
-        for value in ["10d", "0d", "999999999999999999999d"] {
-            let err = parse_created_date_filter(value).unwrap_err().to_string();
-            assert!(
-                err.contains("Relative date windows are no longer supported"),
-                "{err}"
-            );
-            assert!(
-                err.contains("Remove this date limit from [filters] or omit its CLI flag"),
-                "{err}"
-            );
-            assert!(err.contains("YYYY-MM-DD"), "{err}");
-            assert!(
-                err.contains("host-local datetime (YYYY-MM-DDTHH:MM:SS)"),
-                "{err}"
-            );
-        }
-    }
-    #[test]
-    fn test_parse_invalid_date() {
-        assert!(parse_created_date_filter("not-a-date").is_err());
-        assert!(parse_created_date_filter("").is_err());
     }
     #[test]
     fn test_parse_negative_interval_rejected() {

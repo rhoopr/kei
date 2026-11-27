@@ -1,23 +1,29 @@
 # Choose which rendition gets the original filename
 
-Set `edited_as_primary = true` under `[photos]` to give the edit the original filename and use `_original` for the original. With `false` (the default), the original keeps its name and the edit uses `_edited`. Without an edit, the original keeps its name in both modes. When upgrading from `edited_naming = "primary"`, replace it with `edited_as_primary = true`. Existing managed families keep their recorded layout.
+Set `edited_as_primary = true` under `[photos]` to give the edit the original filename and use `_original` for the original. With `false` (the default), the original keeps its name and the edit uses `_edited`. Without an edit, the original keeps its name in both modes. When upgrading from `edited_naming = "primary"`, replace it with `edited_as_primary = true`.
 
 With `edited_as_primary = true` and both renditions selected, `IMG.HEIC` contains adjusted bytes and `IMG_original.HEIC` contains the original. Each uses its actual provider extension, so an adjusted JPEG can be `IMG.JPG`. Selection settings still control which renditions download.
 
-Primary layouts manage only paths kei proves it owns. Before replacing a current path, kei preserves its exact media and associated sidecar as an independent copy. Further edits in these established families retain earlier versions beneath `.kei-history/<family>/<revision>/`; history is never pruned automatically. A confirmed revert restores verified original bytes to the ordinary path and keeps an existing `_original` archive. Unknown files, symlinks, hardlinks, locally changed contents and conflicting ownership prevent a handover.
+## When a photo is edited or reverted
 
-If sync reports `Ambiguous legacy primary path owner`, keep the full error when reporting it. `expected_receipt_matched=false` means the catalog has no exact owner for that path and rendition. A `conflicting_owner_ref` other than `none` means another asset also claims the path. The hashed references let you compare reports without sharing filenames or provider IDs. A discrepancy between catalog paths alone does not tell you which file to move or which receipt to delete.
+The plain filename belongs to whichever rendition is current. kei never moves or renames a file; it changes what the plain filename holds:
 
-For an Immich External Library, exclude both `**/*_original.*` and `**/.kei-history/**`. Extra alternative or preview selections remain visible. An edited current path takes the time Apple recorded for the edit as its modification time when the edit is downloaded, and a revert takes the time of replacement, so a library rescan after a successful sync detects both. First downloads keep the capture time. This implementation does not establish Immich's pairing or deduplication behavior.
+- **Edited after kei saved it.** `IMG.HEIC` is replaced with the edit, and the original is downloaded as `IMG_original.HEIC`.
+- **Edited again.** `IMG.HEIC` is replaced with the new edit. `IMG_original.HEIC` stays as it is.
+- **Reverted.** `IMG.HEIC` is replaced with the original. `IMG_original.HEIC` stays on disk, because sync never deletes; if the photo is edited again, kei uses it again instead of downloading the original a second time.
 
-With the suffix MOV policy, a complete adjusted Live Photo pair uses `IMG.HEIC` and `IMG_HEVC.MOV`; original members use `IMG_original.HEIC` and `IMG_HEVC_original.MOV`. The original MOV policy uses `IMG.MOV` and `IMG_original.MOV`. Missing adjusted motion does not make original motion part of the adjusted still's visible family. Separate files cannot publish simultaneously on every supported filesystem; an interrupted family remains pending and resumes from its journal.
+`IMG.HEIC` is replaced only while it still holds the bytes kei recorded for it. If you changed the file locally, it is kept, reported as locally modified, and no longer follows edits. Earlier edits are not kept: an edit replaces the previous one, as in iCloud.
 
-Recorded bindings retain their naming policy during sync, previews and explicit metadata refresh. An interrupted operation retains its journaled policy, including a reverse transition already started by an older binary. History remains retained. Preserve the state database with the media: filenames alone do not prove historical ownership. Import can establish owned receipts but does not relocate files by itself.
+A Live Photo's motion file follows the same rule as its still. With the suffix MOV policy, a complete adjusted pair uses `IMG.HEIC` and `IMG_HEVC.MOV`; original members use `IMG_original.HEIC` and `IMG_HEVC_original.MOV`. The original MOV policy uses `IMG.MOV` and `IMG_original.MOV`.
 
-Schema 35 retains layout state and history receipts. Older binaries refuse the newer schema. For downgrade, restore a matching cold backup of the database and media or use a supported migration; never force `PRAGMA user_version` backwards.
+When an unrelated file already occupies a name kei wants, kei picks another name for the new copy as it does for any collision, and the copy keeps that name.
 
-When an unrelated file occupies the ordinary family, kei chooses a deterministic family hash qualifier. The qualifier precedes the terminal `_original` role, so every archive-original member still matches `*_original.*`. The whole still/motion family uses the same qualifier; a conflicting qualified slot holds the operation rather than selecting an unstable ordinal.
+## Library scanners such as Immich
 
-`status` and JSON reports expose the durable number of bound families, independently preserved files, pending operations and held operations. These are inventory counts, separate from each cycle's network download counters. `manifest` adds `preserved_files` provenance only when history exists, including native path encoding, provider and local checksums, source checksum, sidecar checksum, family, operation, generation and phase. CSV adds that JSON column only for an export containing preserved files. A superseded rendition no longer advertises the reused primary as its `local_path`.
+For an Immich External Library, exclude `**/*_original.*`. When the plain filename takes an edit, the file gets the time Apple recorded for the edit as its modification time; a revert gets the time of the replacement, so a library rescan after a sync notices both. First downloads keep the capture time. This does not establish Immich's pairing or deduplication behavior.
 
-On Linux, an owned current-path replacement uses kei's existing recovery journal when atomic exchange is unavailable. Filesystems that also reject exclusive alias retirement hold migration or extension-change work with all contents retained. This condition requires supported exclusive rename semantics to finish; it is not an archive-pruning permission.
+## Switching the setting and upgrading
+
+Changing `edited_as_primary` does not rename existing files. A photo saved without an edit follows the new setting from its next edit. A photo that already had both renditions saved keeps both names, and later edits and reverts update the file that held the current rendition.
+
+Upgrading from a previous release carries over the copies it recorded, including an existing `IMG.HEIC` and `IMG_original.HEIC` layout. Earlier releases kept replaced edits under `.kei-history/`. This release neither writes nor reads that folder; you can keep it, or delete it once you no longer need those versions.

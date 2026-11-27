@@ -12,7 +12,7 @@
 
 use std::sync::OnceLock;
 
-use indicatif::{MultiProgress, ProgressBar};
+use indicatif::MultiProgress;
 
 /// Process-wide MultiProgress. Lazily initialised so test binaries that never
 /// touch the bar surface don't pay the cost.
@@ -21,14 +21,6 @@ static MULTI: OnceLock<MultiProgress> = OnceLock::new();
 /// Return the singleton MultiProgress, initialising on first call.
 pub fn multi() -> &'static MultiProgress {
     MULTI.get_or_init(MultiProgress::new)
-}
-
-/// Register a freshly-built bar with the singleton MultiProgress and return
-/// the registered handle. The returned bar shares the multi's draw target,
-/// so its updates serialise with `with_suspended` calls from tracing writes.
-#[must_use]
-pub fn register(pb: ProgressBar) -> ProgressBar {
-    multi().add(pb)
 }
 
 /// Run `f` with all registered bars temporarily hidden. Used by the stderr
@@ -77,15 +69,5 @@ mod tests {
     fn with_suspended_returns_closure_value() {
         let v: u32 = with_suspended(|| 42);
         assert_eq!(v, 42);
-    }
-
-    #[test]
-    fn register_returns_a_usable_bar() {
-        let pb = register(ProgressBar::hidden());
-        // MultiProgress::add() may override the draw target (depending on
-        // whether stdout is a terminal), so don't assert on is_hidden().
-        // Just verify the returned handle is functional.
-        pb.set_message("hello");
-        assert_eq!(pb.message(), "hello");
     }
 }

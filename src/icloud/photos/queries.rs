@@ -144,6 +144,22 @@ pub(crate) static IDENTITY_LOOKUP_KEYS_VALUES: LazyLock<Vec<Value>> = LazyLock::
         .collect()
 });
 
+/// Keys the change feed asks for: every photo field kei stores, the
+/// sparse-share evidence, and the album fields. iCloud returns only the
+/// fields a request names, so an album without these arrives without its
+/// name, kind or parent.
+pub(crate) static FEED_KEYS_VALUES: LazyLock<Vec<Value>> = LazyLock::new(|| {
+    IDENTITY_LOOKUP_KEYS_VALUES
+        .iter()
+        .cloned()
+        .chain(
+            ["albumNameEnc", "albumName", "albumType", "parentId"]
+                .into_iter()
+                .map(|key| Value::String(key.to_owned())),
+        )
+        .collect()
+});
+
 pub(crate) fn item_type_from_str(s: &str) -> Option<AssetItemType> {
     match s {
         "public.heic"
@@ -264,16 +280,6 @@ pub(crate) fn encode_params(params: &HashMap<String, Value>) -> String {
     url::form_urlencoded::Serializer::new(String::new())
         .extend_pairs(pairs)
         .finish()
-}
-
-/// Build the request body for `/changes/database`.
-/// If `sync_token` is `None`, requests full zone listing (bootstrap).
-/// If `Some`, requests only zones with changes since the token.
-pub(crate) fn build_changes_database_request(sync_token: Option<&str>) -> Value {
-    match sync_token {
-        Some(token) => json!({"syncToken": token}),
-        None => json!({}),
-    }
 }
 
 /// Build the request body for `/changes/zone`.
@@ -516,18 +522,6 @@ mod tests {
             .expect("Adjusted must be mapped");
         assert_eq!(*res_field, "resVidFullRes");
         assert_eq!(*type_field, "resVidFullFileType");
-    }
-
-    #[test]
-    fn test_build_changes_database_request_none() {
-        let body = build_changes_database_request(None);
-        assert_eq!(body, json!({}));
-    }
-
-    #[test]
-    fn test_build_changes_database_request_some() {
-        let body = build_changes_database_request(Some("token123"));
-        assert_eq!(body, json!({"syncToken": "token123"}));
     }
 
     #[test]

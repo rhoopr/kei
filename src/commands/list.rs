@@ -9,7 +9,7 @@ use crate::config;
 use crate::retry;
 use std::collections::BTreeSet;
 
-use super::service::{init_photos_service, resolve_libraries, retry_on_lock_contention};
+use super::service::{init_photos_service, retry_on_lock_contention};
 
 /// Run the list command: list albums or libraries.
 pub(crate) async fn run_list(
@@ -73,21 +73,21 @@ pub(crate) async fn run_list(
             print!("{}", format_libraries(private, shared));
         }
         cli::ListCommand::Albums => {
-            let selector = config::resolve_library_selector(
-                cli_libraries,
-                toml.and_then(|t| t.filters.as_ref()),
-            )?;
-            let libraries = resolve_libraries(&selector, &mut photos_service).await?;
-            for library in &libraries {
-                println!("Library: {}", library.zone_name());
-                let albums = library.albums().await?;
-                let mut entries: Vec<_> = albums.iter().collect();
-                entries.sort_by_key(|(name, _)| *name);
-                for (name, matches) in entries {
-                    for _album in matches {
-                        println!("  {name}");
-                    }
+            // Album names come from the local catalog, which every sync keeps
+            // current; listing them needs no extra iCloud queries.
+            let _ = cli_libraries;
+            let (_location, state) = super::core_state(globals, toml).await?;
+            let Some(state) = state else {
+                println!("No albums are known yet. Run `kei sync` once, then list them again.");
+                return Ok(());
+            };
+            let mut current: Option<String> = None;
+            for (zone, path) in crate::sync_core::plan::album_paths(state.albums().await?) {
+                if current.as_deref() != Some(zone.as_str()) {
+                    println!("Library: {zone}");
+                    current = Some(zone);
                 }
+                println!("  {path}");
             }
         }
     }

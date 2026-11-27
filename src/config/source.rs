@@ -1,7 +1,6 @@
 //! Exact startup input retained privately for pre-migration recovery.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 #[derive(Clone, Default)]
 pub(crate) enum ConfigSource {
@@ -9,7 +8,6 @@ pub(crate) enum ConfigSource {
     Unavailable,
     File {
         path: PathBuf,
-        bytes: Arc<[u8]>,
     },
     Absent {
         path: PathBuf,
@@ -45,10 +43,9 @@ mod tests {
     use super::ConfigSource;
 
     #[test]
-    fn startup_config_source_debug_never_exposes_bytes_or_paths() {
+    fn startup_config_source_debug_never_exposes_paths() {
         let source = ConfigSource::File {
             path: "private-account/config.toml".into(),
-            bytes: std::sync::Arc::from(&b"password=private-secret"[..]),
         };
         assert_eq!(format!("{source:?}"), "ConfigSource::File(<private>)");
         assert_eq!(

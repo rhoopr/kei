@@ -57,7 +57,7 @@ fn maintenance_refresh_example_accepts_complete_sweep() {
             .success();
         let report: serde_json::Value =
             serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
-        assert_eq!(report["version"], "3");
+        assert_eq!(report["version"], "5");
         assert_eq!(report["options"]["library"], "all");
     }
 }

@@ -33,7 +33,9 @@ use predicates::prelude::*;
 use std::time::Duration;
 use tempfile::tempdir;
 
-const TIMEOUT_SECS: u64 = 180;
+/// A first sync lists the whole library, whatever the date bounds; that
+/// takes about six minutes on a 40k-record account.
+const TIMEOUT_SECS: u64 = 1800;
 const TIMEOUT_META: u64 = 90;
 
 #[derive(Debug, Default)]
@@ -77,8 +79,8 @@ fn library_cmd_with_toml(
         .env("KEI_DATA_DIR", cookie_dir);
     cmd.args([
         "sync",
-        "--password",
-        password,
+        "--password-file",
+        &common::password_file(password),
         "--config",
         config_path.to_str().unwrap(),
         "--no-progress-bar",
@@ -523,8 +525,8 @@ fn sync_explicit_invocation_works() {
             .env("KEI_DATA_DIR", &cookie_dir)
             .args([
                 "sync",
-                "--password",
-                &password,
+                "--password-file",
+                &common::password_file(&password),
                 "--config",
                 config_path.to_str().unwrap(),
                 "--no-progress-bar",
@@ -559,8 +561,8 @@ fn sync_without_directory_fails() {
         .env("KEI_DATA_DIR", &cookie_dir)
         .args([
             "sync",
-            "--password",
-            &password,
+            "--password-file",
+            &common::password_file(&password),
             "--config",
             config_path.to_str().unwrap(),
             "--no-progress-bar",
@@ -596,8 +598,8 @@ fn sync_nonexistent_album_fails() {
             .env("KEI_DATA_DIR", &cookie_dir)
             .args([
                 "sync",
-                "--password",
-                &password,
+                "--password-file",
+                &common::password_file(&password),
                 "--config",
                 config_path.to_str().unwrap(),
                 "--no-progress-bar",
@@ -628,8 +630,8 @@ fn sync_nonexistent_library_fails() {
             .env("KEI_DATA_DIR", &cookie_dir)
             .args([
                 "sync",
-                "--password",
-                &password,
+                "--password-file",
+                &common::password_file(&password),
                 "--config",
                 config_path.to_str().unwrap(),
                 "--no-progress-bar",
@@ -656,7 +658,11 @@ fn login_authenticates_successfully() {
         common::cmd()
             .env("ICLOUD_USERNAME", &username)
             .env("KEI_DATA_DIR", &cookie_dir)
-            .args(["login", "--password", &password])
+            .args([
+                "login",
+                "--password-file",
+                &common::password_file(&password),
+            ])
             .timeout(Duration::from_secs(60))
             .assert()
             .success();
@@ -809,8 +815,8 @@ fn sync_watch_runs_multiple_cycles() {
             .env("KEI_DATA_DIR", &cookie_dir)
             .args([
                 "sync",
-                "--password",
-                &password,
+                "--password-file",
+                &common::password_file(&password),
                 "--config",
                 config_path.to_str().unwrap(),
                 "--no-progress-bar",
@@ -846,9 +852,9 @@ fn sync_watch_runs_multiple_cycles() {
             accum
         });
 
-        // Watch the channel for 2 marker hits, bounded by 150 s wall time.
-        // 60 s * 2 cycles + buffer for one cycle of download work.
-        let deadline = Instant::now() + Duration::from_secs(150);
+        // Watch the channel for 2 marker hits. The first cycle lists the
+        // whole library on fresh state, then one 60 s wait and a quiet cycle.
+        let deadline = Instant::now() + Duration::from_secs(TIMEOUT_SECS + 150);
         let mut markers = 0_usize;
         let mut snippet = String::new();
         while Instant::now() < deadline {
@@ -1075,8 +1081,8 @@ fn zz_bad_credentials_fails() {
         .env("KEI_DATA_DIR", cookie_dir.path())
         .args([
             "sync",
-            "--password",
-            "wrong-password",
+            "--password-file",
+            &common::password_file("wrong-password"),
             "--config",
             config_path.to_str().unwrap(),
             "--no-progress-bar",

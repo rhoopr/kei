@@ -1,56 +1,22 @@
-//! Asset filtering, version selection, and download task derivation.
+//! Which versions of an asset kei saves and the paths the path rules give
+//! them.
 //!
 //! Ownership:
-//! - `config`: shared sync/import path and filter settings.
-//! - `eligibility`: content/date/filename filters and media classification.
-//! - `versions`: RAW alignment, version/companion selection, and metadata keys.
-//! - `metadata`: task metadata payloads and album/people enrichment.
-//! - `expected_paths`: bare paths shared by sync and import.
-//! - `collisions`: normalized claims and collision path resolution.
-//! - `tasks`: composition of paths, collision results, and metadata into tasks.
+//! - `config`: path and filter settings shared by sync and import.
+//! - `eligibility`: content, date and filename filters and media classification.
+//! - `versions`: RAW alignment and version and companion selection.
+//! - `metadata`: album and people groupings for metadata writers.
+//! - `expected_paths`: the paths a set of path rules gives an asset.
 //!
-//! Production dependencies point from tasks to expected paths, collisions, and
-//! metadata; expected paths use version selection. Configuration is shared.
-//! Children do not depend on task construction. Path rendering stays in
-//! `crate::download::paths`; filter policy stays here.
-//!
-//! Tests retain their names and assertions. Their paths change from
-//! `download::filter::tests::<name>` to
-//! `download::filter::<owner>::tests::<name>`. Shared fixtures are test-only.
-//!
-//! This facade retains the existing paths and effective visibility.
+//! Path rendering stays in `crate::download::paths`; filter policy stays here.
 
-mod collisions;
 mod config;
 mod eligibility;
 mod expected_paths;
 mod metadata;
-mod tasks;
 mod versions;
 
-#[cfg(test)]
-mod test_support;
-
-pub(super) use collisions::{NormalizedPath, PathPlanningMode, pre_ensure_asset_dir};
-pub(super) use config::folder_structure_for_pass;
-pub(crate) use config::{PathDerivationConfig, PathDerivationSource};
-pub(crate) use eligibility::{FilterReason, determine_media_type, is_asset_filtered};
-pub(super) use expected_paths::{
-    DerivationContext, DerivedPath, MalformedTaskResource, derive_alternative_extra,
-    derive_edited_extra, derive_expected_paths, derive_live_edited_extra, derive_mov_companion,
-    derive_primary, malformed_no_task_resource, stored_path_matches_current_collision_family,
-    stored_path_matches_download_family,
-};
-pub(crate) use expected_paths::{
-    ExpectedAssetPath, NamingRole, expected_paths_for, import_collision_family_match,
-    import_collision_family_prefixes,
-};
-pub(crate) use metadata::AssetGroupings;
-pub(super) use metadata::{MetadataPayload, build_selected_payload};
-pub(super) use tasks::selected_resource_tasks;
-pub(super) use tasks::{DownloadTask, filter_asset_to_tasks, filter_asset_to_tasks_with_primary};
-pub(super) use versions::{VersionsView, extract_skip_candidates};
-pub(crate) use versions::{
-    metadata_capture, metadata_for_selected_version, provider_version_for_frozen_resource,
-    provider_version_for_selected,
-};
+pub(crate) use config::PathDerivationConfig;
+pub(crate) use eligibility::is_asset_filtered;
+pub(super) use expected_paths::derive_expected_paths;
+pub(super) use metadata::MetadataPayload;

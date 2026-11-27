@@ -10,13 +10,8 @@
 //! than re-detecting at each call site.
 
 pub mod active_bar;
-pub mod album_divider;
 pub mod narration;
-pub(crate) mod progress;
-pub(crate) mod progress_card;
-pub mod summary;
 pub mod tracing;
-pub mod tty_echo;
 
 use std::env;
 use std::io::IsTerminal;

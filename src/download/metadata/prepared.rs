@@ -150,34 +150,6 @@ pub(in crate::download) struct PreparedMetadataFile {
 }
 
 impl PreparedMetadataFile {
-    pub(in crate::download) async fn require_mtime(
-        mut self,
-        modified: std::time::SystemTime,
-    ) -> Result<Self> {
-        tokio::task::spawn_blocking(move || {
-            let path = std::path::absolute(&self.guard.path)?;
-            let parent = path.parent().context("Metadata output has no parent")?;
-            let confined = crate::fs_util::ConfinedPath::open(
-                parent,
-                &path,
-                crate::fs_util::ConfinedParents::Existing,
-            )?;
-            let file = confined.open_regular()?;
-            let identity = crate::fs_util::file_identity(&file)?;
-            let file = confined.validate_for_metadata(identity)?;
-            file.set_modified(modified)?;
-            anyhow::ensure!(
-                file.metadata()?.modified()? == modified,
-                "Metadata output cannot retain local modification time"
-            );
-            #[cfg(not(windows))]
-            file.sync_all()?;
-            confined.validate_identity(identity)?;
-            self.required_mtime = Some(modified);
-            Ok(self)
-        })
-        .await?
-    }
     pub(in crate::download) fn output_fingerprint(
         &self,
     ) -> crate::download::file::ExistingFileFingerprint {

@@ -8,7 +8,6 @@ use serde_json::{Value, json};
 
 #[derive(Debug)]
 pub(crate) struct FolderDef {
-    pub(crate) obj_type: &'static str,
     pub(crate) list_type: &'static str,
     pub(crate) query_filter: Option<Arc<Value>>,
     /// True for folders that the iOS Photos app gates behind a separate UI
@@ -47,7 +46,6 @@ pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
         (
             "Time-lapse",
             FolderDef {
-                obj_type: "CPLAssetInSmartAlbumByAssetDate:Timelapse",
                 list_type: "CPLAssetAndMasterInSmartAlbumByAssetDate",
                 query_filter: Some(Arc::new(smart_folder_filter("smartAlbum", "TIMELAPSE"))),
                 is_sensitive: false,
@@ -56,7 +54,6 @@ pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
         (
             "Videos",
             FolderDef {
-                obj_type: "CPLAssetInSmartAlbumByAssetDate:Video",
                 list_type: "CPLAssetAndMasterInSmartAlbumByAssetDate",
                 query_filter: Some(Arc::new(smart_folder_filter("smartAlbum", "VIDEO"))),
                 is_sensitive: false,
@@ -65,7 +62,6 @@ pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
         (
             "Slo-mo",
             FolderDef {
-                obj_type: "CPLAssetInSmartAlbumByAssetDate:Slomo",
                 list_type: "CPLAssetAndMasterInSmartAlbumByAssetDate",
                 query_filter: Some(Arc::new(smart_folder_filter("smartAlbum", "SLOMO"))),
                 is_sensitive: false,
@@ -74,7 +70,6 @@ pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
         (
             "Bursts",
             FolderDef {
-                obj_type: "CPLAssetBurstStackAssetByAssetDate",
                 list_type: "CPLBurstStackAssetAndMasterByAssetDate",
                 query_filter: None,
                 is_sensitive: false,
@@ -83,7 +78,6 @@ pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
         (
             "Favorites",
             FolderDef {
-                obj_type: "CPLAssetInSmartAlbumByAssetDate:Favorite",
                 list_type: "CPLAssetAndMasterInSmartAlbumByAssetDate",
                 query_filter: Some(Arc::new(smart_folder_filter("smartAlbum", "FAVORITE"))),
                 is_sensitive: false,
@@ -92,7 +86,6 @@ pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
         (
             "Panoramas",
             FolderDef {
-                obj_type: "CPLAssetInSmartAlbumByAssetDate:Panorama",
                 list_type: "CPLAssetAndMasterInSmartAlbumByAssetDate",
                 query_filter: Some(Arc::new(smart_folder_filter("smartAlbum", "PANORAMA"))),
                 is_sensitive: false,
@@ -101,7 +94,6 @@ pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
         (
             "Screenshots",
             FolderDef {
-                obj_type: "CPLAssetInSmartAlbumByAssetDate:Screenshot",
                 list_type: "CPLAssetAndMasterInSmartAlbumByAssetDate",
                 query_filter: Some(Arc::new(smart_folder_filter("smartAlbum", "SCREENSHOT"))),
                 is_sensitive: false,
@@ -110,7 +102,6 @@ pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
         (
             "Live",
             FolderDef {
-                obj_type: "CPLAssetInSmartAlbumByAssetDate:Live",
                 list_type: "CPLAssetAndMasterInSmartAlbumByAssetDate",
                 query_filter: Some(Arc::new(smart_folder_filter("smartAlbum", "LIVE"))),
                 is_sensitive: false,
@@ -119,7 +110,6 @@ pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
         (
             "Recently Deleted",
             FolderDef {
-                obj_type: "CPLAssetDeletedByExpungedDate",
                 list_type: "CPLAssetAndMasterDeletedByExpungedDate",
                 query_filter: None,
                 is_sensitive: true,
@@ -128,7 +118,6 @@ pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
         (
             "Hidden",
             FolderDef {
-                obj_type: "CPLAssetHiddenByAssetDate",
                 list_type: "CPLAssetAndMasterHiddenByAssetDate",
                 query_filter: None,
                 is_sensitive: true,
@@ -200,7 +189,6 @@ mod tests {
             .find(|(name, _)| *name == "Recently Deleted")
             .unwrap();
         assert!(deleted.1.query_filter.is_none());
-        assert_eq!(deleted.1.obj_type, "CPLAssetDeletedByExpungedDate");
     }
 
     #[test]
@@ -218,11 +206,10 @@ mod tests {
     }
 
     #[test]
-    fn test_all_smart_folders_have_nonempty_types() {
+    fn test_all_smart_folders_have_list_types() {
         let folders = smart_folders();
         assert!(!folders.is_empty(), "smart_folders() must not be empty");
         for (name, def) in &folders {
-            assert!(!def.obj_type.is_empty(), "{name} has empty obj_type");
             assert!(!def.list_type.is_empty(), "{name} has empty list_type");
         }
     }

@@ -38,13 +38,6 @@ pub enum ICloudError {
 }
 
 impl ICloudError {
-    pub(crate) fn indexing_unavailable(error: &anyhow::Error) -> bool {
-        matches!(
-            error.downcast_ref::<Self>(),
-            Some(Self::IndexingUnavailable(_))
-        )
-    }
-
     /// True if the error means kei should invalidate the session cache, force
     /// SRP re-authentication, and retry. Both `SessionExpired` (CloudKit
     /// 401/403) and `MisdirectedRequest` (persistent CloudKit 421) typically

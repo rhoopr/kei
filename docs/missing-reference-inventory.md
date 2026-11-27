@@ -1,5 +1,7 @@
 # Missing-reference inventory diagnostic
 
+> **Retired in v0.30.** The sync engine no longer tracks missing parent references, and `kei doctor --missing-reference-inventory` now refuses with that explanation. This page describes the earlier releases that offered it.
+
 `kei doctor --live --json --missing-reference-inventory` scans the qualified
 private PrimarySync inventory and reports missing parent-reference shapes.
 It downloads no media, opens no catalogue, saves no checkpoint and performs no

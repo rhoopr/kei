@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use rustc_hash::FxHashSet;
 
-use crate::download::{DownloadConfig, paths};
 use crate::types::{FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, RawPolicy};
 
 pub(crate) trait PathDerivationSource {
@@ -92,67 +91,6 @@ impl PathDerivationConfig {
             exclude_asset_ids: Arc::new(FxHashSet::default()),
         }
     }
-
-    /// Clone this path config for one resolved album/smart-folder/unfiled
-    /// pass, mirroring [`DownloadConfig::with_pass`] without pulling in
-    /// download-pipeline fields.
-    pub(crate) fn with_pass(&self, pass: &crate::commands::AlbumPass) -> Self {
-        let folder_structure = folder_structure_for_pass(
-            &self.folder_structure,
-            &self.folder_structure_albums,
-            &self.folder_structure_smart_folders,
-            &self.library,
-            pass,
-        );
-        Self {
-            album_name: Some(Arc::clone(&pass.album.name)),
-            folder_structure,
-            exclude_asset_ids: Arc::clone(&pass.exclude_ids),
-            ..self.clone()
-        }
-    }
-
-    /// Clone this config with a different CloudKit zone for `{library}` path
-    /// expansion.
-    pub(crate) fn with_library(&self, library: &str) -> Self {
-        Self {
-            library: Arc::from(library),
-            ..self.clone()
-        }
-    }
-}
-
-/// Pick and expand the active template for one album/smart-folder/unfiled
-/// pass. Shared by sync's [`DownloadConfig`] and import's
-/// [`PathDerivationConfig`] so `{album}`, `{smart-folder}`, and `{library}`
-/// expansion cannot drift between matching and downloading.
-pub(in crate::download) fn folder_structure_for_pass(
-    folder_structure: &str,
-    folder_structure_albums: &str,
-    folder_structure_smart_folders: &str,
-    library: &str,
-    pass: &crate::commands::AlbumPass,
-) -> String {
-    let template: &str = match pass.kind {
-        crate::commands::PassKind::Album => folder_structure_albums,
-        crate::commands::PassKind::SmartFolder => folder_structure_smart_folders,
-        crate::commands::PassKind::Unfiled => folder_structure,
-    };
-    let name_ref = Some(pass.album.name.as_ref()).filter(|n: &&str| !n.is_empty());
-    let category_expanded = if pass.kind == crate::commands::PassKind::Album {
-        paths::expand_album_components(template, pass.album.selector_components())
-    } else {
-        paths::expand_named_token(template, pass.kind.token(), name_ref)
-    };
-    // Apply `{library}` last with the path-friendly truncated zone name,
-    // so callers see `SharedSync-A1B2C3D4/...` instead of the full UUID.
-    // The state-DB key still uses the full zone name.
-    let library_for_path = paths::truncate_library_zone(library);
-    paths::expand_named_token(
-        &category_expanded,
-        paths::TOKEN_LIBRARY,
-        Some(library_for_path),
-    )
 }
 
 impl PathDerivationSource for PathDerivationConfig {
@@ -206,106 +144,5 @@ impl PathDerivationSource for PathDerivationConfig {
 
     fn exclude_asset_ids(&self) -> &FxHashSet<String> {
         &self.exclude_asset_ids
-    }
-}
-
-impl PathDerivationSource for DownloadConfig {
-    fn album_bound_parent(&self, library: Option<&str>, child: &str) -> Option<std::path::PathBuf> {
-        let container = self.primary_layout_source.as_ref()?.container_id()?;
-        self.selection_context.as_ref()?.album_parent(
-            container,
-            library.unwrap_or(&self.library),
-            child,
-        )
-    }
-    fn album_bound_path(
-        &self,
-        library: Option<&str>,
-        child: &str,
-        version: &str,
-    ) -> Option<std::path::PathBuf> {
-        let container = self.primary_layout_source.as_ref()?.container_id()?;
-        self.selection_context.as_ref()?.album_file(
-            container,
-            library.unwrap_or(&self.library),
-            child,
-            version,
-        )
-    }
-    fn directory(&self) -> &Path {
-        &self.directory
-    }
-
-    fn folder_structure(&self) -> &str {
-        &self.folder_structure
-    }
-
-    fn media(&self) -> &crate::config::MediaSelection {
-        &self.media
-    }
-
-    fn skip_created_before(&self) -> Option<crate::config::CreatedDateFilter> {
-        self.skip_created_before
-    }
-
-    fn skip_created_after(&self) -> Option<crate::config::CreatedDateFilter> {
-        self.skip_created_after
-    }
-
-    fn live_photo_mode(&self) -> LivePhotoMode {
-        self.live_photo_mode
-    }
-
-    fn live_photo_mov_filename_policy(&self) -> LivePhotoMovFilenamePolicy {
-        self.live_photo_mov_filename_policy
-    }
-
-    fn edited_naming(&self) -> crate::types::EditedNaming {
-        self.edited_naming
-    }
-
-    fn raw_policy(&self) -> RawPolicy {
-        self.raw_policy
-    }
-
-    fn file_match_policy(&self) -> FileMatchPolicy {
-        self.file_match_policy
-    }
-
-    fn keep_unicode_in_filenames(&self) -> bool {
-        self.keep_unicode_in_filenames
-    }
-
-    fn album_name(&self) -> Option<&str> {
-        self.album_name.as_deref()
-    }
-
-    fn exclude_asset_ids(&self) -> &FxHashSet<String> {
-        &self.exclude_asset_ids
-    }
-}
-
-#[cfg(test)]
-mod hierarchy_tests {
-    use super::folder_structure_for_pass;
-    use crate::commands::{AlbumPass, PassKind};
-    use crate::icloud::photos::PhotoAlbum;
-    use std::sync::Arc;
-
-    #[test]
-    fn album_hierarchy_renders_components_without_inventing_separators() {
-        let pass = AlbumPass {
-            kind: PassKind::Album,
-            album: PhotoAlbum::stub_for_test(Arc::from("unused-rendered-name"))
-                .with_selector_components(vec![
-                    "Family/Work".into(),
-                    "..".into(),
-                    "100% Trips".into(),
-                ]),
-            exclude_ids: Arc::default(),
-        };
-        let template = folder_structure_for_pass("", "{album}/%Y", "", "PrimarySync", &pass);
-        assert_eq!(template, "Family_Work/_/100%% Trips/%Y");
-        assert_eq!(pass.album.selector_components()[0], "Family/Work");
     }
 }

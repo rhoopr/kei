@@ -2,7 +2,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex, OnceLock,
+    Arc, OnceLock,
     atomic::{AtomicU64, Ordering},
     mpsc,
 };
@@ -33,41 +33,6 @@ pub(super) struct History {
     pub groups_omitted: u64,
     pub previous_history_unavailable: bool,
     pub cycles: Vec<Cycle>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub(super) struct StorageReuse {
-    pub inbox: ReuseCounters,
-    pub catalogue: ReuseCounters,
-    pub selection: ReuseCounters,
-    pub work: ReuseCounters,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub(super) struct ReuseCounters {
-    /// False also covers older histories without storage observations.
-    pub observed: bool,
-    pub new: u64,
-    pub exact: u64,
-    pub equivalent: u64,
-    pub capacity_rejected: u64,
-    pub single_item_limit: u64,
-    pub last_reason: ReuseReason,
-    /// Last observed pre-admission logical budget, not current usage. `None`
-    /// means no capacity admission has reported a budget in this cycle.
-    pub last_observed_used: Option<u64>,
-    pub last_observed_limit: Option<u64>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum ReuseReason {
-    #[default]
-    None,
-    Capacity,
-    SingleItemLimit,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,70 +67,6 @@ pub(super) struct TransportCompactionEvidence {
     pub committed_reclaim: Option<u64>,
 }
 
-impl StorageReuse {
-    fn record(
-        &mut self,
-        component: StorageComponent,
-        outcome: StorageOutcome,
-        budget: Option<(u64, u64)>,
-    ) {
-        let counters = match component {
-            StorageComponent::Inbox => &mut self.inbox,
-            StorageComponent::Catalogue => &mut self.catalogue,
-            #[cfg(test)]
-            StorageComponent::Selection => &mut self.selection,
-            #[cfg(test)]
-            StorageComponent::Work => &mut self.work,
-        };
-        counters.record(outcome, budget);
-    }
-}
-
-impl ReuseCounters {
-    fn record(&mut self, outcome: StorageOutcome, budget: Option<(u64, u64)>) {
-        self.observed = true;
-        match outcome {
-            StorageOutcome::New => self.new = self.new.saturating_add(1),
-            StorageOutcome::Exact => self.exact = self.exact.saturating_add(1),
-            StorageOutcome::Equivalent => {
-                self.equivalent = self.equivalent.saturating_add(1);
-            }
-            StorageOutcome::CapacityRejected => {
-                self.capacity_rejected = self.capacity_rejected.saturating_add(1);
-                self.last_reason = ReuseReason::Capacity;
-            }
-            StorageOutcome::SingleItemLimit => {
-                self.single_item_limit = self.single_item_limit.saturating_add(1);
-                self.last_reason = ReuseReason::SingleItemLimit;
-            }
-        }
-        if let Some((used, limit)) = budget {
-            self.last_observed_used = Some(used);
-            self.last_observed_limit = Some(limit);
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StorageComponent {
-    Inbox,
-    Catalogue,
-    // Historical diagnostic compatibility; current admission has no shadow writer.
-    #[cfg(test)]
-    Selection,
-    #[cfg(test)]
-    Work,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StorageOutcome {
-    New,
-    Exact,
-    Equivalent,
-    CapacityRejected,
-    SingleItemLimit,
-}
-
 #[derive(Serialize, Deserialize)]
 pub(super) struct Cycle {
     pub id: String,
@@ -179,8 +80,6 @@ pub(super) struct Cycle {
     pub build_dirty: Option<bool>,
     pub configuration: Value,
     pub stats: Value,
-    #[serde(default)]
-    pub storage_reuse: StorageReuse,
     #[serde(default)]
     pub transport_compaction: TransportCompactionEvidence,
     pub diagnostics: Vec<Diagnostic>,
@@ -337,7 +236,6 @@ enum Message {
     #[cfg(test)]
     Observe(&'static str, Map<String, Value>),
     Event(String, Map<String, Value>),
-    Storage(StorageComponent, StorageOutcome, Option<(u64, u64)>),
     Stop,
 }
 
@@ -346,8 +244,6 @@ pub(crate) struct Recorder {
     sender: mpsc::SyncSender<Message>,
     generation: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
-    aliases: Arc<Mutex<std::collections::HashMap<String, String>>>,
-    alias_namespace: uuid::Uuid,
 }
 
 impl Recorder {
@@ -368,16 +264,6 @@ impl Recorder {
 }
 
 static ACTIVE: OnceLock<Recorder> = OnceLock::new();
-
-pub(crate) fn record_storage(
-    component: StorageComponent,
-    outcome: StorageOutcome,
-    budget: Option<(u64, u64)>,
-) {
-    if let Some(recorder) = ACTIVE.get() {
-        recorder.send(Message::Storage(component, outcome, budget));
-    }
-}
 
 pub(crate) fn begin(configuration: Value) {
     if let Some(recorder) = ACTIVE.get() {
@@ -403,64 +289,6 @@ pub(crate) fn observe(kind: &'static str, fields: Value) {
         let fields = Value::Object(fields);
         tracing::debug!(diagnostic = kind, support_fields = %fields);
     }
-}
-
-/// Correlation identities live only in a bounded process-local map. Saved
-/// aliases contain a random namespace and ordinal, never a provider-derived hash.
-/// A restart starts a new namespace; the export renumbers aliases locally.
-pub(crate) fn observe_scoped(
-    scope: &str,
-    item: Option<(&str, &str)>,
-    kind: &'static str,
-    mut fields: Value,
-) {
-    let Some(recorder) = ACTIVE.get() else {
-        if let Some(map) = fields.as_object_mut() {
-            map.insert("correlation_unavailable".into(), Value::Bool(true));
-        }
-        observe(kind, fields);
-        return;
-    };
-    let key = if let Some((id, version)) = item {
-        format!("item:{scope}:{id}:{version}")
-    } else {
-        format!("scope:{scope}")
-    };
-    if let Ok(mut aliases) = recorder.aliases.lock() {
-        let ordinal = aliases.len() + 1;
-        let alias = if let Some(alias) = aliases.get(&key) {
-            Some(alias.clone())
-        } else if aliases.len() < MAX_GROUPS
-            && (item.is_none()
-                || fields.get("operation").and_then(Value::as_str) != Some("publication")
-                || fields
-                    .get("publication_time_retained")
-                    .and_then(Value::as_bool)
-                    == Some(true))
-        {
-            let alias = format!("{}/{ordinal}", recorder.alias_namespace);
-            aliases.insert(key, alias.clone());
-            Some(alias)
-        } else {
-            None
-        };
-        if let Some(map) = fields.as_object_mut() {
-            if let Some(alias) = alias {
-                map.insert(
-                    if item.is_some() {
-                        "item_alias"
-                    } else {
-                        "scope_alias"
-                    }
-                    .into(),
-                    Value::String(alias),
-                );
-            } else if map.get("operation").and_then(Value::as_str) != Some("publication") {
-                map.insert("correlation_unavailable".into(), Value::Bool(true));
-            }
-        }
-    }
-    observe(kind, fields);
 }
 
 pub(crate) struct Guard {
@@ -489,8 +317,6 @@ pub(crate) fn start(path: PathBuf, configuration: Value) -> Option<(Recorder, Gu
         sender,
         generation: Arc::new(AtomicU64::new(0)),
         dropped: Arc::new(AtomicU64::new(0)),
-        aliases: Arc::new(Mutex::new(std::collections::HashMap::new())),
-        alias_namespace: uuid::Uuid::new_v4(),
     };
     let dropped = Arc::clone(&recorder.dropped);
     let worker = std::thread::Builder::new()
@@ -582,11 +408,6 @@ fn apply(history: &mut History, message: Message) -> bool {
                 cycle.stats = stats;
             }
         }
-        Message::Storage(component, outcome, budget) => {
-            if let Some(cycle) = history.cycles.last_mut() {
-                cycle.storage_reuse.record(component, outcome, budget);
-            }
-        }
         #[cfg(test)]
         Message::Observe(kind, fields) => add(history, kind, fields),
         Message::Event(kind, fields) => add(history, &kind, fields),
@@ -637,7 +458,6 @@ fn begin_record(history: &mut History, configuration: Value, complete_startup: b
         build_dirty: option_env!("KEI_BUILD_DIRTY").and_then(|v| v.parse().ok()),
         configuration,
         stats: Value::Object(Map::new()),
-        storage_reuse: StorageReuse::default(),
         transport_compaction: TransportCompactionEvidence::default(),
         diagnostics: Vec::new(),
         observations_total: Some(0),
@@ -879,8 +699,6 @@ pub(crate) fn test_layer() -> (Recorder, impl Fn() -> Vec<Value>) {
         sender,
         generation: Arc::new(AtomicU64::new(0)),
         dropped: Arc::new(AtomicU64::new(0)),
-        aliases: Arc::new(Mutex::new(std::collections::HashMap::new())),
-        alias_namespace: uuid::Uuid::new_v4(),
     };
     (recorder, move || {
         receiver
@@ -899,29 +717,4 @@ pub(crate) fn test_layer() -> (Recorder, impl Fn() -> Vec<Value>) {
             })
             .collect()
     })
-}
-
-/// The same sanitized reader used by offline collection, exposed only to tests
-/// that exercise a production owner through the real persistent worker.
-#[cfg(test)]
-pub(crate) fn test_retained_events(path: &Path) -> Vec<Value> {
-    let (history, status) = read(path);
-    assert_eq!(status, "available");
-    history
-        .cycles
-        .into_iter()
-        .flat_map(|cycle| {
-            cycle
-                .diagnostics
-                .into_iter()
-                .map(|d| serde_json::json!({"kind":d.kind,"fields":d.fields}))
-        })
-        .collect()
-}
-
-#[cfg(test)]
-pub(crate) fn test_retained_snapshot(path: &Path) -> Value {
-    let (history, status) = read(path);
-    assert_eq!(status, "available");
-    serde_json::to_value(history).expect("support history snapshot")
 }

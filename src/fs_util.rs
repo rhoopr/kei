@@ -77,19 +77,6 @@ pub(crate) fn move_file_no_replace_blocking(
     }
 }
 
-/// Count directory entries referring to this opened file, without path lookup.
-pub(crate) fn file_link_count(file: &std::fs::File) -> std::io::Result<u64> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Ok(file.metadata()?.nlink())
-    }
-    #[cfg(windows)]
-    {
-        Ok(u64::from(windows_file_information(file)?.nNumberOfLinks))
-    }
-}
-
 pub(crate) fn file_identity(file: &std::fs::File) -> std::io::Result<FileIdentity> {
     #[cfg(unix)]
     {
@@ -194,8 +181,6 @@ pub(crate) enum ConfinedParents {
 #[derive(Clone, Copy)]
 enum ConfinedAccess {
     Read,
-    #[cfg(windows)]
-    StableRead,
     Metadata,
     Append,
 }
@@ -215,11 +200,6 @@ pub(crate) struct ConfinedPath {
     directory_handles: Vec<std::fs::File>,
     #[cfg(unix)]
     parent_identity: FileIdentity,
-}
-
-pub(crate) enum RemovalKind {
-    File,
-    EmptyDirectory,
 }
 
 impl ConfinedPath {
@@ -308,126 +288,9 @@ impl ConfinedPath {
         self.open_regular_with_access(ConfinedAccess::Read)
     }
 
-    /// Hold a Windows writer-output snapshot without sharing writes or deletion.
-    #[cfg(windows)]
-    pub(crate) fn open_stable_read(&self) -> std::io::Result<std::fs::File> {
-        self.validate_namespace()?;
-        self.open_regular_with_access(ConfinedAccess::StableRead)
-    }
-
-    /// Identity of the entry itself, including a user-owned symbolic link.
-    pub(crate) fn entry_identity(&self) -> std::io::Result<FileIdentity> {
-        self.validate_namespace()?;
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-            // SAFETY: the retained parent descriptor and NUL-terminated leaf
-            // are live; stat points to writable storage of the required size.
-            if unsafe {
-                libc::fstatat(
-                    self.parent_dir.as_raw_fd(),
-                    self.name.as_ptr(),
-                    stat.as_mut_ptr(),
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            } != 0
-            {
-                return Err(std::io::Error::last_os_error());
-            }
-            // SAFETY: successful fstatat initialized the complete stat value.
-            let stat = unsafe { stat.assume_init() };
-            // libc device/inode widths and signedness differ across Unix hosts.
-            #[allow(
-                clippy::useless_conversion,
-                reason = "libc device and inode types are platform-dependent"
-            )]
-            let identity = FileIdentity {
-                device: stat
-                    .st_dev
-                    .try_into()
-                    .map_err(|_error| std::io::Error::other("invalid device identity"))?,
-                inode: stat
-                    .st_ino
-                    .try_into()
-                    .map_err(|_error| std::io::Error::other("invalid inode identity"))?,
-            };
-            self.validate_namespace()?;
-            Ok(identity)
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            use windows_sys::Win32::Storage::FileSystem::{
-                FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-                FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            };
-            let file = std::fs::OpenOptions::new()
-                .access_mode(FILE_READ_ATTRIBUTES)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-                .open(&self.path)?;
-            file_identity(&file)
-        }
-    }
-
-    /// Open the directory entry itself without following a link. The returned
-    /// identity remains usable across a no-replace directory rename.
-    pub(crate) fn open_directory(&self) -> std::io::Result<std::fs::File> {
-        self.validate_namespace()?;
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            Ok(std::fs::File::from(openat_owned(
-                self.parent_dir.as_raw_fd(),
-                &self.name,
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0,
-            )?))
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            use windows_sys::Win32::Storage::FileSystem::{
-                FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-                FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-                FILE_SHARE_READ, FILE_SHARE_WRITE,
-            };
-            let file = std::fs::OpenOptions::new()
-                .access_mode(FILE_READ_ATTRIBUTES)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-                .open(&self.path)?;
-            let attributes = windows_file_attributes(&file)?;
-            if attributes & FILE_ATTRIBUTE_DIRECTORY == 0
-                || attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotADirectory,
-                    "album entry is not a directory",
-                ));
-            }
-            Ok(file)
-        }
-    }
-
-    pub(crate) fn create_new_directory(&self) -> std::io::Result<std::fs::File> {
-        self.validate_namespace()?;
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            // SAFETY: the retained parent descriptor and NUL-terminated leaf
-            // name are live for this call. mkdirat never replaces an entry.
-            if unsafe { libc::mkdirat(self.parent_dir.as_raw_fd(), self.name.as_ptr(), 0o777) } != 0
-            {
-                return Err(std::io::Error::last_os_error());
-            }
-        }
-        #[cfg(windows)]
-        std::fs::create_dir(&self.path)?;
-        self.open_directory()
-    }
-
+    // Linux replacement journals and XMP sidecar reconciliation read
+    // optional entries.
+    #[cfg(any(target_os = "linux", feature = "xmp"))]
     pub(crate) fn open_optional_regular(&self) -> std::io::Result<Option<std::fs::File>> {
         // A missing namespace is not a missing leaf in the retained parent.
         self.validate_namespace()?;
@@ -449,6 +312,7 @@ impl ConfinedPath {
         }
     }
 
+    #[cfg(any(test, target_os = "linux"))]
     pub(crate) fn create_new_regular(&self) -> std::io::Result<std::fs::File> {
         self.validate_namespace()?;
         #[cfg(unix)]
@@ -519,6 +383,7 @@ impl ConfinedPath {
         Ok(file)
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn entry_exists(&self) -> std::io::Result<bool> {
         #[cfg(unix)]
         {
@@ -555,6 +420,7 @@ impl ConfinedPath {
         }
     }
 
+    #[cfg(any(test, target_os = "linux"))]
     pub(crate) fn sync_parent(&self) -> std::io::Result<()> {
         #[cfg(unix)]
         {
@@ -567,60 +433,15 @@ impl ConfinedPath {
         }
     }
 
-    /// Remove a known leaf (or an empty directory), never a subtree.
-    pub(crate) fn remove_verified(
-        &self,
-        expected: FileIdentity,
-        kind: RemovalKind,
-    ) -> std::io::Result<()> {
-        if self.entry_identity()? != expected {
-            return Err(confined_identity_changed_error(&self.path));
-        }
-        #[cfg(unix)]
-        {
-            let flags = match kind {
-                RemovalKind::EmptyDirectory => libc::AT_REMOVEDIR,
-                RemovalKind::File => 0,
-            };
-            // SAFETY: the retained parent descriptor and NUL-terminated leaf
-            // remain live. unlinkat never follows the leaf or removes a tree.
-            if unsafe { libc::unlinkat(self.parent_fd(), self.name_cstr().as_ptr(), flags) } != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            use windows_sys::Win32::Storage::FileSystem::{
-                DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-                FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            };
-            let flags = FILE_FLAG_OPEN_REPARSE_POINT
-                | match kind {
-                    RemovalKind::EmptyDirectory => FILE_FLAG_BACKUP_SEMANTICS,
-                    RemovalKind::File => 0,
-                };
-            let file = std::fs::OpenOptions::new()
-                .access_mode(DELETE | FILE_READ_ATTRIBUTES)
-                .custom_flags(flags)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-                .open(&self.path)?;
-            if file_identity(&file)? != expected {
-                return Err(confined_identity_changed_error(&self.path));
-            }
-            delete_windows_handle(&file)
-        }
-    }
-
-    #[cfg(unix)]
+    // Only Linux replacement recovery works relative to the parent directory.
+    #[cfg(target_os = "linux")]
     pub(crate) fn parent_fd(&self) -> std::os::fd::RawFd {
         use std::os::fd::AsRawFd;
 
         self.parent_dir.as_raw_fd()
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     pub(crate) fn name_cstr(&self) -> &std::ffi::CStr {
         &self.name
     }
@@ -665,17 +486,11 @@ impl ConfinedPath {
             drop(probe);
             let file = std::fs::OpenOptions::new()
                 .access_mode(match access {
-                    ConfinedAccess::Read | ConfinedAccess::StableRead => {
-                        FILE_GENERIC_READ | FILE_READ_ATTRIBUTES
-                    }
+                    ConfinedAccess::Read => FILE_GENERIC_READ | FILE_READ_ATTRIBUTES,
                     ConfinedAccess::Metadata => FILE_GENERIC_READ | FILE_WRITE_ATTRIBUTES,
                     ConfinedAccess::Append => FILE_GENERIC_READ | FILE_APPEND_DATA,
                 })
-                .share_mode(if matches!(access, ConfinedAccess::StableRead) {
-                    FILE_SHARE_READ
-                } else {
-                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
-                })
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
                 .open(&self.path)?;
             ensure_windows_regular(&file, &self.path)?;
@@ -920,371 +735,6 @@ fn ensure_windows_regular(file: &std::fs::File, path: &Path) -> std::io::Result<
     Ok(())
 }
 
-pub(crate) enum ConfinedFileOpen {
-    Regular(ConfinedRegularFile),
-    Retire,
-    OutsideRoot,
-}
-
-pub(crate) struct ConfinedRegularFile {
-    modified_secs: i64,
-    #[cfg(unix)]
-    parent: std::os::fd::OwnedFd,
-    #[cfg(unix)]
-    name: std::ffi::CString,
-    #[cfg(windows)]
-    file: std::fs::File,
-}
-
-impl ConfinedRegularFile {
-    pub(crate) fn modified_secs(&self) -> i64 {
-        self.modified_secs
-    }
-
-    pub(crate) fn remove(self) -> std::io::Result<()> {
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-
-            // SAFETY: `parent` is a live directory descriptor, `name` is
-            // NUL-terminated, and both remain valid for the syscall.
-            let result = unsafe { libc::unlinkat(self.parent.as_raw_fd(), self.name.as_ptr(), 0) };
-            if result == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
-        }
-        #[cfg(windows)]
-        {
-            delete_windows_handle(&self.file)
-        }
-    }
-}
-
-#[cfg(windows)]
-fn delete_windows_handle(file: &std::fs::File) -> std::io::Result<()> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
-    };
-
-    let disposition = FILE_DISPOSITION_INFO { DeleteFile: 1 };
-    // SAFETY: the file handle is live and was opened with DELETE
-    // access. `disposition` has the layout and size required by
-    // FileDispositionInfo and outlives the call.
-    let result = unsafe {
-        SetFileInformationByHandle(
-            file.as_raw_handle() as isize,
-            FileDispositionInfo,
-            std::ptr::from_ref(&disposition).cast(),
-            std::mem::size_of_val(&disposition) as u32,
-        )
-    };
-    if result != 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-/// Open a regular file beneath `root` without allowing a directory-link swap
-/// to redirect a later removal. The returned guard retains the verified
-/// directory or file handle through [`ConfinedRegularFile::remove`].
-pub(crate) fn open_confined_regular_file(
-    root: &Path,
-    path: &Path,
-) -> std::io::Result<ConfinedFileOpen> {
-    let Ok(relative) = path.strip_prefix(root) else {
-        return Ok(ConfinedFileOpen::OutsideRoot);
-    };
-    let components = relative
-        .components()
-        .map(|component| match component {
-            std::path::Component::Normal(value) => Some(value),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>();
-    let Some(components) = components else {
-        return Ok(ConfinedFileOpen::Retire);
-    };
-    if components.is_empty() {
-        return Ok(ConfinedFileOpen::Retire);
-    }
-
-    open_confined_regular_file_platform(root, &components)
-}
-
-#[cfg(unix)]
-fn open_confined_regular_file_platform(
-    root: &Path,
-    components: &[&std::ffi::OsStr],
-) -> std::io::Result<ConfinedFileOpen> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::os::unix::ffi::OsStrExt;
-
-    fn owned_fd(raw: libc::c_int) -> std::io::Result<OwnedFd> {
-        if raw < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: a nonnegative descriptor returned by open/openat is newly
-        // owned by this function and is transferred exactly once.
-        Ok(unsafe { OwnedFd::from_raw_fd(raw) })
-    }
-
-    fn path_target_changed(error: &std::io::Error) -> bool {
-        matches!(
-            error.kind(),
-            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-        ) || error.raw_os_error() == Some(libc::ELOOP)
-    }
-
-    fn cstring(value: &std::ffi::OsStr) -> std::io::Result<std::ffi::CString> {
-        std::ffi::CString::new(value.as_bytes())
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
-    }
-
-    let root = cstring(root.as_os_str())?;
-    // SAFETY: `root` is a live NUL-terminated path. No borrowed pointer is
-    // retained after the syscall.
-    let raw = unsafe {
-        libc::open(
-            root.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    let mut parent = match owned_fd(raw) {
-        Ok(fd) => fd,
-        Err(error) if path_target_changed(&error) => return Ok(ConfinedFileOpen::Retire),
-        Err(error) => return Err(error),
-    };
-
-    let Some((file_name, parent_components)) = components.split_last() else {
-        return Ok(ConfinedFileOpen::Retire);
-    };
-    for component in parent_components {
-        let component = cstring(component)?;
-        // SAFETY: `parent` is live and `component` is NUL-terminated. The
-        // returned descriptor, when successful, is newly owned.
-        let raw = unsafe {
-            libc::openat(
-                parent.as_raw_fd(),
-                component.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        parent = match owned_fd(raw) {
-            Ok(fd) => fd,
-            Err(error) if path_target_changed(&error) => return Ok(ConfinedFileOpen::Retire),
-            Err(error) => return Err(error),
-        };
-    }
-
-    let name = cstring(file_name)?;
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: `parent` and `name` are live, and `stat` points to writable
-    // storage of the exact type the kernel initializes on success.
-    let result = unsafe {
-        libc::fstatat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            stat.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if result != 0 {
-        let error = std::io::Error::last_os_error();
-        return if path_target_changed(&error) {
-            Ok(ConfinedFileOpen::Retire)
-        } else {
-            Err(error)
-        };
-    }
-    // SAFETY: successful fstatat initialized every field of `stat`.
-    let stat = unsafe { stat.assume_init() };
-    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
-        return Ok(ConfinedFileOpen::Retire);
-    }
-
-    Ok(ConfinedFileOpen::Regular(ConfinedRegularFile {
-        modified_secs: stat.st_mtime.max(0),
-        parent,
-        name,
-    }))
-}
-
-#[cfg(windows)]
-fn open_confined_regular_file_platform(
-    root: &Path,
-    components: &[&std::ffi::OsStr],
-) -> std::io::Result<ConfinedFileOpen> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, GetFileInformationByHandle,
-    };
-
-    fn open(path: &Path, directory: bool) -> std::io::Result<std::fs::File> {
-        use windows_sys::Win32::Storage::FileSystem::{
-            DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        };
-
-        let access = FILE_READ_ATTRIBUTES | if directory { 0 } else { DELETE };
-        let flags = FILE_FLAG_OPEN_REPARSE_POINT
-            | if directory {
-                FILE_FLAG_BACKUP_SEMANTICS
-            } else {
-                0
-            };
-        std::fs::OpenOptions::new()
-            .access_mode(access)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-            .custom_flags(flags)
-            .open(path)
-    }
-
-    fn info(file: &std::fs::File) -> std::io::Result<u32> {
-        let mut info = std::mem::MaybeUninit::uninit();
-        // SAFETY: the handle is live and `info` points to writable storage of
-        // the exact structure initialized by GetFileInformationByHandle.
-        let result =
-            unsafe { GetFileInformationByHandle(file.as_raw_handle() as isize, info.as_mut_ptr()) };
-        if result == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: the successful call initialized the full structure.
-        Ok(unsafe { info.assume_init() }.dwFileAttributes)
-    }
-
-    fn final_path(file: &std::fs::File) -> std::io::Result<std::path::PathBuf> {
-        use std::os::windows::ffi::OsStringExt;
-        use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
-
-        let mut buffer = vec![0_u16; 512];
-        loop {
-            // SAFETY: the handle and buffer are live, and the buffer length
-            // matches the writable UTF-16 storage supplied to Windows.
-            let written = unsafe {
-                GetFinalPathNameByHandleW(
-                    file.as_raw_handle() as isize,
-                    buffer.as_mut_ptr(),
-                    buffer.len() as u32,
-                    0,
-                )
-            } as usize;
-            if written == 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if written < buffer.len() {
-                buffer.truncate(written);
-                return Ok(std::ffi::OsString::from_wide(&buffer).into());
-            }
-            buffer.resize(written + 1, 0);
-        }
-    }
-
-    let root_file = match open(root, true) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ConfinedFileOpen::Retire);
-        }
-        Err(error) => return Err(error),
-    };
-    let root_attributes = info(&root_file)?;
-    if root_attributes & FILE_ATTRIBUTE_DIRECTORY == 0
-        || root_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    {
-        return Ok(ConfinedFileOpen::Retire);
-    }
-    let root_final = final_path(&root_file)?;
-    let path = components
-        .iter()
-        .fold(root.to_path_buf(), |mut path, part| {
-            path.push(part);
-            path
-        });
-    let file = match open(&path, false) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ConfinedFileOpen::Retire);
-        }
-        Err(error) => return Err(error),
-    };
-    let attributes = info(&file)?;
-    if attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-        return Ok(ConfinedFileOpen::Retire);
-    }
-    let file_final = final_path(&file)?;
-    let expected_final = components.iter().fold(root_final, |mut path, part| {
-        path.push(part);
-        path
-    });
-    if file_final != expected_final {
-        return Ok(ConfinedFileOpen::Retire);
-    }
-    let modified_secs = file
-        .metadata()?
-        .modified()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0);
-    Ok(ConfinedFileOpen::Regular(ConfinedRegularFile {
-        modified_secs,
-        file,
-    }))
-}
-
-/// Normalize path spelling for platform-specific collision checks.
-pub(crate) fn normalized_path(path: &Path) -> std::borrow::Cow<'_, str> {
-    let s = path.to_string_lossy();
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    {
-        std::borrow::Cow::Owned(s.to_ascii_lowercase())
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        s
-    }
-}
-
-/// Build the shared absolute ownership key without accepting parent traversal.
-pub(crate) fn confined_path_key(path: &Path) -> std::io::Result<String> {
-    Ok(normalized_path(&absolute_confined_path(path)?).into_owned())
-}
-
-/// Rebase a reserved destination using platform ownership-key component rules.
-/// Parent traversal is rejected before comparison; filesystem opens still use
-/// the existing no-follow policy beneath the current root spelling.
-pub(crate) fn reserved_path_under_root(root: &Path, path: &Path) -> std::io::Result<PathBuf> {
-    let absolute_root = absolute_confined_path(root)?;
-    let absolute_path = absolute_confined_path(path)?;
-    let root_key = confined_path_key(&absolute_root)?;
-    let path_key = confined_path_key(&absolute_path)?;
-    if Path::new(&path_key)
-        .strip_prefix(Path::new(&root_key))
-        .is_err()
-        || absolute_path.components().count() <= absolute_root.components().count()
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "Reserved destination is outside the current download root",
-        ));
-    }
-    let relative: PathBuf = absolute_path
-        .components()
-        .skip(absolute_root.components().count())
-        .collect();
-    let rebased = root.join(relative);
-    if confined_path_key(&rebased)? != path_key {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "Rebased destination does not match its reservation",
-        ));
-    }
-    Ok(rebased)
-}
-
 /// Resolve a confined path without changing parent-component semantics.
 ///
 /// Returns `InvalidInput` for any `..` component: removing it lexically can
@@ -1497,116 +947,6 @@ where
 mod tests {
     use super::*;
     use std::io;
-
-    #[test]
-    fn issue_770_recovery_reserved_rebase_preserves_component_confinement() {
-        let root = tempfile::tempdir().unwrap();
-        let saved = root.path().join("Album/pending.jpg");
-        let current = root.path().join(".");
-        let replay = reserved_path_under_root(&current, &saved).unwrap();
-        assert_eq!(
-            confined_path_key(&replay).unwrap(),
-            confined_path_key(&saved).unwrap()
-        );
-        assert!(reserved_path_under_root(root.path(), root.path()).is_err());
-        assert!(
-            reserved_path_under_root(root.path(), &root.path().join("../outside.jpg")).is_err()
-        );
-        let outside = root.path().with_extension("sibling").join("pending.jpg");
-        assert!(reserved_path_under_root(root.path(), &outside).is_err());
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    #[test]
-    fn issue_770_recovery_reserved_rebase_accepts_case_equivalent_root_only() {
-        let root = tempfile::tempdir().unwrap();
-        let current = root.path().join("Photos");
-        let saved = root.path().join("pHOTOS/Album/Pending.jpg");
-        let replay = reserved_path_under_root(&current, &saved).unwrap();
-        assert_eq!(replay, current.join("Album/Pending.jpg"));
-        assert_eq!(
-            confined_path_key(&replay).unwrap(),
-            confined_path_key(&saved).unwrap()
-        );
-        assert!(
-            reserved_path_under_root(&current, &root.path().join("Photos-other/pending.jpg"))
-                .is_err()
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn confined_identity_pin_allows_exclusive_replacement_access() {
-        use std::os::windows::fs::OpenOptionsExt;
-
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("replacement.part");
-        std::fs::write(&path, b"replacement").unwrap();
-        let confined = ConfinedPath::open(root.path(), &path, ConfinedParents::Existing).unwrap();
-        let reader = confined.open_regular().unwrap();
-        let identity = file_identity(&reader).unwrap();
-        let mut exclusive = std::fs::OpenOptions::new();
-        exclusive.read(true).write(true).share_mode(0);
-        assert!(exclusive.open(&path).is_err());
-        let pinned = confined.pin_identity(identity).unwrap();
-        drop(reader);
-        let replacement = exclusive.open(&path).unwrap();
-        assert_eq!(file_identity(&replacement).unwrap(), identity);
-        assert_eq!(file_identity(&pinned).unwrap(), identity);
-    }
-
-    #[test]
-    fn confined_append_requires_regular_file_and_preserves_prefix() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("resume.part");
-        let confined = ConfinedPath::open(root.path(), &path, ConfinedParents::Existing).unwrap();
-        assert!(confined.open_optional_append().unwrap().is_none());
-        std::fs::create_dir(&path).unwrap();
-        assert!(confined.open_optional_append().is_err());
-        std::fs::remove_dir(&path).unwrap();
-        std::fs::write(&path, b"prefix").unwrap();
-        let mut file = confined.open_optional_append().unwrap().unwrap();
-        assert_eq!(file.metadata().unwrap().len(), 6);
-        std::io::Write::write_all(&mut file, b" suffix").unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"prefix suffix");
-    }
-
-    #[test]
-    fn confined_path_rejects_parent_components() {
-        let root = tempfile::tempdir().unwrap();
-        let ambiguous_root = root.path().join("child/..");
-        let path = root.path().join("file.jpg");
-        for (root_path, file_path) in [
-            (ambiguous_root.as_path(), path.as_path()),
-            (root.path(), root.path().join("child/../file.jpg").as_path()),
-        ] {
-            let error =
-                ConfinedPath::open(root_path, file_path, ConfinedParents::Create).unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        }
-        let confined = ConfinedPath::open(root.path(), &path, ConfinedParents::Existing).unwrap();
-        assert_eq!(
-            confined
-                .sibling(&root.path().join("child/../sibling.jpg"))
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidInput
-        );
-        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn confined_path_rejects_outside_root() {
-        let root = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let destination = outside.path().join("nested/file.jpg");
-
-        let error =
-            ConfinedPath::open(root.path(), &destination, ConfinedParents::Create).unwrap_err();
-
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(!destination.exists());
-    }
 
     #[test]
     fn confined_path_creates_missing_nested_parents() {

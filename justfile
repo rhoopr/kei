@@ -356,12 +356,12 @@ cov MODE="" BASE="main":
             cargo llvm-cov report --summary-only
             ;;
         patch)
-            cargo llvm-cov --all-features --lcov --output-path head.lcov -- --skip download::orchestration::queue_projection::tests::private_600_independent_album_writers_finish_through_reseeds_without_repeated_writes
+            cargo llvm-cov --all-features --lcov --output-path head.lcov -- --skip sync_core::tests::copies_stress
             # --detach so the base worktree doesn't collide with any
             # existing checkout of the base branch (e.g. the main repo
             # already sitting on main).
             git worktree add --detach ../.kei-cov-base "{{BASE}}" >/dev/null
-            (cd ../.kei-cov-base && cargo llvm-cov --all-features --lcov --output-path "$OLDPWD/base.lcov" -- --skip download::orchestration::queue_projection::tests::private_600_independent_album_writers_finish_through_reseeds_without_repeated_writes --skip download::orchestration::queue_projection::tests::private_300_current_writers_and_600_aliases_finish_through_reseeds_without_repeated_writes)
+            (cd ../.kei-cov-base && cargo llvm-cov --all-features --lcov --output-path "$OLDPWD/base.lcov" -- --skip download::orchestration::queue_projection::tests::private_600_independent_album_writers_finish_through_reseeds_without_repeated_writes --skip sync_core::tests::copies_stress)
             git worktree remove ../.kei-cov-base >/dev/null
             python3 .github/scripts/patch_coverage.py \
                 --lcov head.lcov \

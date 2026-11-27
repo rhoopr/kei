@@ -1,0 +1,2088 @@
+//! Catalog and work queue for the sync core.
+//!
+//! One SQLite file holds what iCloud reported (assets, masters, albums,
+//! memberships), where each zone resumes (zones), the local copies kei owes
+//! (files) and a run log (runs). A zone's position is written in the same
+//! transaction as the page that produced it.
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use anyhow::Context;
+use rusqlite::{Connection, OptionalExtension, params};
+
+use crate::icloud::photos::feed::Observation;
+
+pub(crate) const SCHEMA_VERSION: i64 = 4;
+
+const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS kv (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS zones (
+    zone TEXT PRIMARY KEY,
+    position TEXT,
+    listed INTEGER NOT NULL DEFAULT 0
+) STRICT;
+CREATE TABLE IF NOT EXISTS assets (
+    zone TEXT NOT NULL,
+    name TEXT NOT NULL,
+    master TEXT,
+    body TEXT NOT NULL,
+    deleted INTEGER NOT NULL,
+    hidden INTEGER NOT NULL,
+    purged INTEGER NOT NULL DEFAULT 0,
+    sparse INTEGER NOT NULL DEFAULT 0,
+    link_zone TEXT,
+    link_name TEXT,
+    dirty INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (zone, name)
+) STRICT;
+CREATE INDEX IF NOT EXISTS assets_by_master ON assets (zone, master);
+CREATE INDEX IF NOT EXISTS assets_by_link ON assets (link_zone, link_name);
+CREATE INDEX IF NOT EXISTS assets_dirty ON assets (zone) WHERE dirty = 1;
+CREATE TABLE IF NOT EXISTS masters (
+    zone TEXT NOT NULL,
+    name TEXT NOT NULL,
+    body TEXT NOT NULL,
+    purged INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (zone, name)
+) STRICT;
+CREATE TABLE IF NOT EXISTS albums (
+    zone TEXT NOT NULL,
+    name TEXT NOT NULL,
+    parent TEXT,
+    title TEXT,
+    is_folder INTEGER NOT NULL,
+    deleted INTEGER NOT NULL,
+    folder TEXT,
+    PRIMARY KEY (zone, name)
+) STRICT;
+CREATE TABLE IF NOT EXISTS memberships (
+    zone TEXT NOT NULL,
+    relation TEXT NOT NULL,
+    album TEXT NOT NULL,
+    asset TEXT NOT NULL,
+    present INTEGER NOT NULL,
+    PRIMARY KEY (zone, relation)
+) STRICT;
+CREATE INDEX IF NOT EXISTS memberships_by_asset ON memberships (zone, asset);
+CREATE INDEX IF NOT EXISTS memberships_by_album ON memberships (zone, album);
+CREATE TABLE IF NOT EXISTS smart_members (
+    zone TEXT NOT NULL,
+    folder TEXT NOT NULL,
+    asset TEXT NOT NULL,
+    PRIMARY KEY (zone, folder, asset)
+) STRICT;
+";
+
+/// `files` as of schema 3. A copy in a primary-naming slot keeps its path
+/// while the rendition that fills it changes, so `slot` is part of its key.
+const FILES_TABLE: &str = "
+CREATE TABLE IF NOT EXISTS files (
+    id INTEGER PRIMARY KEY,
+    zone TEXT NOT NULL,
+    asset TEXT NOT NULL,
+    rendition TEXT NOT NULL,
+    album TEXT NOT NULL,
+    slot TEXT NOT NULL DEFAULT '',
+    path TEXT NOT NULL UNIQUE,
+    size INTEGER NOT NULL,
+    checksum TEXT NOT NULL,
+    sha256 TEXT,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'adopt', 'done', 'failed', 'modified')),
+    wanted INTEGER NOT NULL DEFAULT 1,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    retry_at INTEGER,
+    pending_sha TEXT,
+    pending_fields TEXT,
+    source_sha TEXT,
+    meta_dirty INTEGER NOT NULL DEFAULT 1,
+    meta_hash TEXT,
+    meta_fields TEXT,
+    UNIQUE (zone, asset, rendition, album, slot)
+) STRICT;
+";
+
+const SCHEMA_TAIL: &str = "
+CREATE INDEX IF NOT EXISTS files_by_state ON files (state) WHERE wanted = 1;
+CREATE INDEX IF NOT EXISTS files_meta_dirty ON files (zone, id)
+    WHERE meta_dirty = 1 AND state = 'done' AND wanted = 1;
+CREATE TABLE IF NOT EXISTS imported (
+    path TEXT PRIMARY KEY,
+    zone TEXT NOT NULL,
+    master TEXT NOT NULL,
+    rendition TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    sha256 TEXT,
+    checksum TEXT NOT NULL,
+    source_sha TEXT
+) STRICT;
+DROP INDEX IF EXISTS imported_by_asset;
+CREATE INDEX IF NOT EXISTS imported_by_identity ON imported (master, rendition);
+CREATE TABLE IF NOT EXISTS runs (
+    id INTEGER PRIMARY KEY,
+    started_at INTEGER NOT NULL,
+    finished_at INTEGER,
+    outcome TEXT,
+    downloaded INTEGER NOT NULL DEFAULT 0,
+    failed INTEGER NOT NULL DEFAULT 0,
+    pending INTEGER NOT NULL DEFAULT 0
+) STRICT;
+";
+
+/// Where a file row stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileState {
+    /// Download owed. With a recorded `sha256`, replace only if the local
+    /// file still matches it.
+    Pending,
+    /// A file already at the path with the expected size; hash and adopt it.
+    Adopt,
+    Done,
+    /// The last attempt failed; retried next cycle.
+    Failed,
+    /// The local file no longer matches what kei wrote. Left untouched.
+    Modified,
+}
+
+impl FileState {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Adopt => "adopt",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Modified => "modified",
+        }
+    }
+
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        Ok(match value {
+            "pending" => Self::Pending,
+            "adopt" => Self::Adopt,
+            "done" => Self::Done,
+            "failed" => Self::Failed,
+            "modified" => Self::Modified,
+            other => anyhow::bail!("Unknown file state {other}"),
+        })
+    }
+}
+
+/// One local copy kei owes or has written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileRow {
+    pub(crate) id: i64,
+    pub(crate) zone: String,
+    pub(crate) asset: String,
+    pub(crate) rendition: String,
+    /// Album record name, or empty for the unfiled copy.
+    pub(crate) album: String,
+    /// Relative to the download directory, with `/` separators.
+    pub(crate) path: String,
+    pub(crate) size: u64,
+    pub(crate) checksum: String,
+    pub(crate) sha256: Option<String>,
+    pub(crate) state: FileState,
+    pub(crate) attempts: i64,
+    /// Bytes kei was about to publish at this path when it last stopped.
+    pub(crate) pending_sha: Option<String>,
+    /// The primary-naming slot this copy fills, or empty.
+    pub(crate) slot: String,
+}
+
+/// A saved copy whose metadata the metadata pass checks.
+#[derive(Debug, Clone)]
+pub(crate) struct MetadataRow {
+    pub(crate) id: i64,
+    pub(crate) asset: String,
+    pub(crate) rendition: String,
+    pub(crate) path: String,
+    pub(crate) sha256: Option<String>,
+    pub(crate) pending_sha: Option<String>,
+    /// The bytes kei downloaded, before any metadata write.
+    pub(crate) source_sha: Option<String>,
+    pub(crate) meta_hash: Option<String>,
+    /// JSON of the embedded fields kei owns in this file.
+    pub(crate) meta_fields: Option<String>,
+    pub(crate) asset_body: String,
+    pub(crate) master_body: Option<String>,
+    /// Titles of the albums the photo is in.
+    pub(crate) albums: Vec<String>,
+}
+
+/// A copy the planner wants for one asset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WantedFile {
+    pub(crate) rendition: String,
+    pub(crate) album: String,
+    /// The primary-naming slot this copy fills, or empty.
+    pub(crate) slot: String,
+    /// The existing row the planner matched; `None` creates a row.
+    pub(crate) row: Option<i64>,
+    pub(crate) path: String,
+    pub(crate) size: u64,
+    pub(crate) checksum: String,
+    /// The path already holds a file of this size that kei does not track.
+    pub(crate) adopt: bool,
+    /// A copy recorded by the previous engine that this row takes over.
+    pub(crate) imported: Option<ImportedCopy>,
+}
+
+/// A verified local copy carried over from the previous engine's state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImportedCopy {
+    pub(crate) path: String,
+    pub(crate) zone: String,
+    /// The photo identity the previous engine recorded: its asset record
+    /// name, or for older rows its master record name.
+    pub(crate) master: String,
+    pub(crate) rendition: String,
+    pub(crate) size: u64,
+    pub(crate) sha256: Option<String>,
+    pub(crate) checksum: String,
+    /// The previous state proved these are the bytes it downloaded, as
+    /// opposed to bytes a metadata write may have changed since.
+    pub(crate) source_sha: Option<String>,
+}
+
+/// An asset whose wanted copies must be recomputed.
+#[derive(Debug, Clone)]
+pub(crate) struct DirtyAsset {
+    pub(crate) name: String,
+    pub(crate) asset_body: String,
+    pub(crate) master_body: Option<String>,
+    pub(crate) deleted: bool,
+    pub(crate) hidden: bool,
+    pub(crate) purged: bool,
+    /// A personal-library stand-in for a photo in the Shared Library.
+    pub(crate) sparse: bool,
+    /// Present album memberships as `(album zone, album)`, including those of
+    /// personal-library stand-ins that link to this photo.
+    pub(crate) albums: Vec<(String, String)>,
+    /// Queried smart folders that contain this photo.
+    pub(crate) smart: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AlbumRow {
+    pub(crate) zone: String,
+    pub(crate) name: String,
+    pub(crate) parent: Option<String>,
+    pub(crate) title: Option<String>,
+    pub(crate) is_folder: bool,
+    pub(crate) deleted: bool,
+    /// Path components fixed when the album's first copy is planned.
+    pub(crate) folder: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Completeness {
+    pub(crate) done: u64,
+    pub(crate) pending: u64,
+    pub(crate) failed: u64,
+    pub(crate) modified: u64,
+    /// Bytes iCloud reports for the copies in each count above, in order.
+    pub(crate) bytes: [u64; 4],
+}
+
+#[derive(Clone)]
+pub(crate) struct State {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl std::fmt::Debug for State {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("State").finish_non_exhaustive()
+    }
+}
+
+impl State {
+    /// The sync core's database file for an account's legacy state path.
+    pub(crate) fn path_for(legacy_state: &Path) -> PathBuf {
+        legacy_state.with_extension("sync.db")
+    }
+
+    pub(crate) async fn open(path: &Path) -> anyhow::Result<Self> {
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&path)
+                .with_context(|| format!("Could not open sync state {}", path.display()))?;
+            Self::init(conn)
+        })
+        .await?
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_in_memory() -> anyhow::Result<Self> {
+        Self::init(Connection::open_in_memory()?)
+    }
+
+    fn init(conn: Connection) -> anyhow::Result<Self> {
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.busy_timeout(std::time::Duration::from_secs(10))?;
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        anyhow::ensure!(
+            version <= SCHEMA_VERSION,
+            "Sync state was written by a newer kei (schema {version})"
+        );
+        if version == 1 {
+            // Schema 2 adds publication receipts and metadata bookkeeping.
+            let tx = conn.unchecked_transaction()?;
+            for column in [
+                "pending_sha TEXT",
+                "pending_fields TEXT",
+                "source_sha TEXT",
+                "meta_dirty INTEGER NOT NULL DEFAULT 1",
+                "meta_hash TEXT",
+                "meta_fields TEXT",
+            ] {
+                tx.execute_batch(&format!("ALTER TABLE files ADD COLUMN {column}"))?;
+            }
+            tx.execute("UPDATE files SET source_sha = sha256", [])?;
+            tx.commit()?;
+        }
+        if (1..=2).contains(&version) {
+            // Schema 3 adds primary-naming slots to the copy key and a retry
+            // time for failed copies. SQLite cannot change a key in place.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch("ALTER TABLE files RENAME TO files_v2")?;
+            tx.execute_batch(FILES_TABLE)?;
+            tx.execute_batch(
+                "INSERT INTO files (id, zone, asset, rendition, album, path, size, checksum,
+                     sha256, state, wanted, attempts, last_error, pending_sha, pending_fields,
+                     source_sha, meta_dirty, meta_hash, meta_fields)
+                 SELECT id, zone, asset, rendition, album, path, size, checksum,
+                     sha256, state, wanted, attempts, last_error, pending_sha, pending_fields,
+                     source_sha, meta_dirty, meta_hash, meta_fields
+                 FROM files_v2;
+                 DROP TABLE files_v2;",
+            )?;
+            tx.commit()?;
+        }
+        if (1..=3).contains(&version)
+            && table_exists(&conn, "imported")?
+            && !has_column(&conn, "imported", "source_sha")?
+        {
+            // Schema 4 keeps whether the previous state proved a carried-over
+            // copy holds the bytes it downloaded.
+            conn.execute_batch("ALTER TABLE imported ADD COLUMN source_sha TEXT")?;
+        }
+        conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(FILES_TABLE)?;
+        conn.execute_batch(SCHEMA_TAIL)?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    async fn with<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut Connection) -> anyhow::Result<T> + Send + 'static,
+    ) -> anyhow::Result<T> {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn
+                .lock()
+                .map_err(|_poisoned| anyhow::anyhow!("Sync state lock was poisoned"))?;
+            f(&mut conn)
+        })
+        .await?
+    }
+
+    pub(crate) async fn get_kv(&self, key: &str) -> anyhow::Result<Option<String>> {
+        let key = key.to_owned();
+        self.with(move |conn| {
+            Ok(conn
+                .query_row("SELECT value FROM kv WHERE key = ?1", [key], |row| {
+                    row.get(0)
+                })
+                .optional()?)
+        })
+        .await
+    }
+
+    pub(crate) async fn set_kv(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        let (key, value) = (key.to_owned(), value.to_owned());
+        self.with(move |conn| {
+            conn.execute(
+                "INSERT INTO kv (key, value) VALUES (?1, ?2)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                [key, value],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn delete_kv(&self, key: &str) -> anyhow::Result<()> {
+        let key = key.to_owned();
+        self.with(move |conn| {
+            conn.execute("DELETE FROM kv WHERE key = ?1", [key])?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Write a consistent copy of the database to `path`.
+    pub(crate) async fn copy_to(&self, path: &Path) -> anyhow::Result<()> {
+        let path = path.to_string_lossy().into_owned();
+        self.with(move |conn| {
+            conn.execute("VACUUM INTO ?1", [path])?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Check the database file's integrity.
+    pub(crate) async fn validate(&self) -> anyhow::Result<()> {
+        self.with(|conn| {
+            let result: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+            anyhow::ensure!(
+                result == "ok",
+                "Sync state failed its integrity check: {result}"
+            );
+            Ok(())
+        })
+        .await
+    }
+
+    /// Close the database, folding the write-ahead log into the main file.
+    pub(crate) async fn close(self) -> anyhow::Result<()> {
+        let conn = Arc::try_unwrap(self.conn)
+            .map_err(|_shared| anyhow::anyhow!("Sync state is still in use"))?
+            .into_inner()
+            .map_err(|_poisoned| anyhow::anyhow!("Sync state lock was poisoned"))?;
+        tokio::task::spawn_blocking(move || {
+            conn.pragma_update(None, "journal_mode", "DELETE")?;
+            conn.close().map_err(|(_conn, error)| error)?;
+            Ok(())
+        })
+        .await?
+    }
+
+    /// Saved position for a zone, or `None` when a full listing is owed.
+    pub(crate) async fn position(&self, zone: &str) -> anyhow::Result<Option<String>> {
+        let zone = zone.to_owned();
+        self.with(move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT position FROM zones WHERE zone = ?1",
+                    [zone],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten())
+        })
+        .await
+    }
+
+    /// Forget a zone's position so the next cycle runs a full listing.
+    /// Catalog rows and files stay; the listing re-observes them.
+    pub(crate) async fn reset_position(&self, zone: &str) -> anyhow::Result<()> {
+        let zone = zone.to_owned();
+        self.with(move |conn| {
+            conn.execute(
+                "INSERT INTO zones (zone, position, listed) VALUES (?1, NULL, 0)
+                 ON CONFLICT (zone) DO UPDATE SET position = NULL, listed = 0",
+                [zone],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Live albums of `zone` the catalog holds without a name.
+    pub(crate) async fn unnamed_albums(&self, zone: &str) -> anyhow::Result<u64> {
+        let zone = zone.to_owned();
+        self.with(move |conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM albums WHERE zone = ?1 AND title IS NULL AND deleted = 0",
+                [zone],
+                |row| row.get(0),
+            )?;
+            Ok(u64::try_from(count)?)
+        })
+        .await
+    }
+
+    /// Forget a zone's position so it is listed again from the start. The
+    /// zone stays listed, so planning carries on with what is recorded.
+    pub(crate) async fn relist(&self, zone: &str) -> anyhow::Result<()> {
+        let zone = zone.to_owned();
+        self.with(move |conn| {
+            conn.execute("UPDATE zones SET position = NULL WHERE zone = ?1", [zone])?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Store one page's observations and the position after it, atomically.
+    // CONTRACT: POSITION_COMMITS_WITH_OBSERVATIONS
+    // The zone position moves only in the transaction that records the page
+    // it covers; downloads stay owed rows that survive a restart.
+    pub(crate) async fn commit_page(
+        &self,
+        zone: &str,
+        observations: Vec<Observation>,
+        position: String,
+        caught_up: bool,
+    ) -> anyhow::Result<()> {
+        let zone = zone.to_owned();
+        self.with(move |conn| {
+            let tx = conn.transaction()?;
+            for observation in observations {
+                apply_observation(&tx, &zone, observation)?;
+            }
+            tx.execute(
+                "INSERT INTO zones (zone, position, listed) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (zone) DO UPDATE SET position = excluded.position,
+                     listed = MAX(zones.listed, excluded.listed)",
+                params![zone, position, i64::from(caught_up)],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Mark every asset for re-planning, for example after a config change.
+    pub(crate) async fn mark_all_dirty(&self) -> anyhow::Result<()> {
+        self.with(|conn| {
+            conn.execute("UPDATE assets SET dirty = 1", [])?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Every album the catalog knows, across zones.
+    pub(crate) async fn albums(&self) -> anyhow::Result<Vec<AlbumRow>> {
+        self.with(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT zone, name, parent, title, is_folder, deleted, folder FROM albums",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)? != 0,
+                        row.get::<_, i64>(5)? != 0,
+                        row.get::<_, Option<String>>(6)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter()
+                .map(|(zone, name, parent, title, is_folder, deleted, folder)| {
+                    Ok(AlbumRow {
+                        zone,
+                        name,
+                        parent,
+                        title,
+                        is_folder,
+                        deleted,
+                        folder: folder
+                            .map(|folder| serde_json::from_str(&folder))
+                            .transpose()
+                            .context("Corrupt stored album folder")?,
+                    })
+                })
+                .collect()
+        })
+        .await
+    }
+
+    /// Replace a queried smart folder's members in a zone, marking photos
+    /// that joined or left it for planning.
+    pub(crate) async fn replace_smart_members(
+        &self,
+        zone: &str,
+        folder: &str,
+        members: std::collections::HashSet<String>,
+    ) -> anyhow::Result<()> {
+        let (zone, folder) = (zone.to_owned(), folder.to_owned());
+        self.with(move |conn| {
+            let tx = conn.transaction()?;
+            let previous: std::collections::HashSet<String> = tx
+                .prepare("SELECT asset FROM smart_members WHERE zone = ?1 AND folder = ?2")?
+                .query_map(params![zone, folder], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            for asset in previous.symmetric_difference(&members) {
+                tx.execute(
+                    "UPDATE assets SET dirty = 1 WHERE zone = ?1 AND name = ?2",
+                    params![zone, asset],
+                )?;
+            }
+            tx.execute(
+                "DELETE FROM smart_members WHERE zone = ?1 AND folder = ?2",
+                params![zone, folder],
+            )?;
+            for asset in &members {
+                tx.execute(
+                    "INSERT INTO smart_members (zone, folder, asset) VALUES (?1, ?2, ?3)",
+                    params![zone, folder, asset],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Fix an album's folder the first time a copy is planned into it.
+    pub(crate) async fn fix_album_folder(
+        &self,
+        zone: &str,
+        album: &str,
+        folder: &[String],
+    ) -> anyhow::Result<()> {
+        let (zone, album, folder) = (
+            zone.to_owned(),
+            album.to_owned(),
+            serde_json::to_string(folder)?,
+        );
+        self.with(move |conn| {
+            conn.execute(
+                "UPDATE albums SET folder = ?3 WHERE zone = ?1 AND name = ?2 AND folder IS NULL",
+                params![zone, album, folder],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Assets awaiting planning after `after`, in name order.
+    pub(crate) async fn dirty_assets(
+        &self,
+        zone: &str,
+        after: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<DirtyAsset>> {
+        let (zone, after) = (zone.to_owned(), after.to_owned());
+        self.with(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT a.name, a.body, m.body, a.deleted, a.hidden,
+                        a.purged OR COALESCE(m.purged, 0), a.sparse
+                 FROM assets a LEFT JOIN masters m ON m.zone = a.zone AND m.name = a.master
+                 WHERE a.zone = ?1 AND a.dirty = 1 AND a.name > ?2 ORDER BY a.name LIMIT ?3",
+            )?;
+            let mut albums = conn.prepare(
+                "SELECT ms.zone, ms.album FROM memberships ms
+                 WHERE ms.present = 1 AND (
+                     (ms.zone = ?1 AND ms.asset = ?2)
+                     OR (ms.zone, ms.asset) IN
+                         (SELECT zone, name FROM assets WHERE link_zone = ?1 AND link_name = ?2))
+                 ORDER BY ms.zone, ms.album",
+            )?;
+            let mut smart = conn.prepare(
+                "SELECT folder FROM smart_members WHERE zone = ?1 AND asset = ?2 ORDER BY folder",
+            )?;
+            let rows = stmt
+                .query_map(params![zone, after, i64::try_from(limit)?], |row| {
+                    Ok(DirtyAsset {
+                        name: row.get(0)?,
+                        asset_body: row.get(1)?,
+                        master_body: row.get(2)?,
+                        deleted: row.get::<_, i64>(3)? != 0,
+                        hidden: row.get::<_, i64>(4)? != 0,
+                        purged: row.get::<_, i64>(5)? != 0,
+                        sparse: row.get::<_, i64>(6)? != 0,
+                        albums: Vec::new(),
+                        smart: Vec::new(),
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter()
+                .map(|mut asset| {
+                    asset.albums = albums
+                        .query_map(params![zone, asset.name], |row| {
+                            Ok((row.get(0)?, row.get(1)?))
+                        })?
+                        .collect::<Result<_, _>>()?;
+                    asset.smart = smart
+                        .query_map(params![zone, asset.name], |row| row.get(0))?
+                        .collect::<Result<_, _>>()?;
+                    Ok(asset)
+                })
+                .collect()
+        })
+        .await
+    }
+
+    /// Whether a zone has finished a full listing since its last reset.
+    pub(crate) async fn listed(&self, zone: &str) -> anyhow::Result<bool> {
+        let zone = zone.to_owned();
+        self.with(move |conn| {
+            Ok(conn
+                .query_row("SELECT listed FROM zones WHERE zone = ?1", [zone], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .optional()?
+                .is_some_and(|listed| listed != 0))
+        })
+        .await
+    }
+
+    /// Master record names for assets, as the catalog last saw them.
+    pub(crate) async fn masters_of(
+        &self,
+        zone: &str,
+        assets: Vec<String>,
+    ) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        let zone = zone.to_owned();
+        self.with(move |conn| {
+            let mut stmt =
+                conn.prepare("SELECT master FROM assets WHERE zone = ?1 AND name = ?2")?;
+            let mut out = std::collections::HashMap::new();
+            for asset in assets {
+                if let Some(Some(master)) = stmt
+                    .query_row(params![zone, asset], |row| row.get::<_, Option<String>>(0))
+                    .optional()?
+                {
+                    out.insert(asset, master);
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Paths already claimed by any file row.
+    /// A carried-over copy not yet taken over holds `path`.
+    pub(crate) async fn imported_at(&self, path: &str) -> anyhow::Result<bool> {
+        let path = path.to_owned();
+        self.with(move |conn| {
+            Ok(conn
+                .query_row("SELECT 1 FROM imported WHERE path = ?1", [path], |_| Ok(()))
+                .optional()?
+                .is_some())
+        })
+        .await
+    }
+
+    pub(crate) async fn path_owner(&self, path: &str) -> anyhow::Result<Option<i64>> {
+        let path = path.to_owned();
+        self.with(move |conn| {
+            Ok(conn
+                .query_row("SELECT id FROM files WHERE path = ?1", [path], |row| {
+                    row.get(0)
+                })
+                .optional()?)
+        })
+        .await
+    }
+
+    pub(crate) async fn files_for_asset(
+        &self,
+        zone: &str,
+        asset: &str,
+    ) -> anyhow::Result<Vec<FileRow>> {
+        let (zone, asset) = (zone.to_owned(), asset.to_owned());
+        self.with(move |conn| {
+            let mut stmt =
+                conn.prepare(&format!("{FILE_COLUMNS} WHERE zone = ?1 AND asset = ?2"))?;
+            let rows = stmt
+                .query_map(params![zone, asset], file_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter().collect()
+        })
+        .await
+    }
+
+    /// Apply the planner's wanted copies for one asset and clear its dirty
+    /// mark. Existing paths never change. A new version of a done copy
+    /// becomes pending with its recorded hash, so it is replaced only if
+    /// the local file is untouched. Copies no longer wanted stay on disk.
+    #[cfg(test)]
+    pub(crate) async fn apply_plan(
+        &self,
+        zone: &str,
+        asset: &str,
+        wanted: Vec<WantedFile>,
+    ) -> anyhow::Result<()> {
+        self.apply_plans(zone, vec![(asset.to_owned(), wanted)])
+            .await
+    }
+
+    /// [`Self::apply_plan`] for several assets in one transaction.
+    pub(crate) async fn apply_plans(
+        &self,
+        zone: &str,
+        plans: Vec<(String, Vec<WantedFile>)>,
+    ) -> anyhow::Result<()> {
+        if plans.is_empty() {
+            return Ok(());
+        }
+        let zone = zone.to_owned();
+        self.with(move |conn| {
+            let tx = conn.transaction()?;
+            for (asset, wanted) in plans {
+                apply_one(&tx, &zone, &asset, wanted)?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Wanted copies of `zone` that still need work.
+    pub(crate) async fn owed(&self, zone: &str) -> anyhow::Result<u64> {
+        let zone = zone.to_owned();
+        self.with(move |conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM files WHERE zone = ?1 AND wanted = 1
+                 AND state IN ('pending', 'adopt', 'failed')",
+                [zone],
+                |row| row.get(0),
+            )?;
+            Ok(u64::try_from(count)?)
+        })
+        .await
+    }
+
+    /// Wanted copies that still need work, in id order after `after`.
+    pub(crate) async fn work(
+        &self,
+        zone: &str,
+        after: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<FileRow>> {
+        let zone = zone.to_owned();
+        let now = chrono::Utc::now().timestamp();
+        self.with(move |conn| {
+            // A failed copy waits until its retry time.
+            let mut stmt = conn.prepare(&format!(
+                "{FILE_COLUMNS} WHERE zone = ?1 AND wanted = 1 AND id > ?2
+                 AND (state IN ('pending', 'adopt')
+                      OR (state = 'failed' AND (retry_at IS NULL OR retry_at <= ?4)))
+                 ORDER BY id LIMIT ?3"
+            ))?;
+            let rows = stmt
+                .query_map(params![zone, after, i64::try_from(limit)?, now], file_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter().collect()
+        })
+        .await
+    }
+
+    /// Update a row whose expected version changed since it was planned.
+    pub(crate) async fn refresh_version(
+        &self,
+        id: i64,
+        size: u64,
+        checksum: &str,
+    ) -> anyhow::Result<()> {
+        let checksum = checksum.to_owned();
+        self.with(move |conn| {
+            conn.execute(
+                "UPDATE files SET size = ?2, checksum = ?3 WHERE id = ?1",
+                params![id, i64::try_from(size)?, checksum],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn mark_done(&self, id: i64, sha256: &str) -> anyhow::Result<()> {
+        let sha256 = sha256.to_owned();
+        self.with(move |conn| {
+            conn.execute(
+                "UPDATE files SET state = 'done', sha256 = ?2, source_sha = ?2, last_error = NULL,
+                     pending_sha = NULL, pending_fields = NULL,
+                     meta_dirty = 1, meta_hash = NULL, meta_fields = NULL
+                 WHERE id = ?1",
+                params![id, sha256],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Take ownership of a file kei found already in place. Its bytes are
+    /// recorded, but not as bytes kei downloaded: kei cannot tell where
+    /// they came from.
+    pub(crate) async fn mark_adopted(&self, id: i64, sha256: &str) -> anyhow::Result<()> {
+        let sha256 = sha256.to_owned();
+        self.with(move |conn| {
+            conn.execute(
+                "UPDATE files SET state = 'done', sha256 = ?2, source_sha = NULL, last_error = NULL,
+                     pending_sha = NULL, pending_fields = NULL,
+                     meta_dirty = 1, meta_hash = NULL, meta_fields = NULL
+                 WHERE id = ?1",
+                params![id, sha256],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn mark_modified(&self, id: i64) -> anyhow::Result<()> {
+        self.with(move |conn| {
+            conn.execute(
+                "UPDATE files SET state = 'modified', last_error = NULL WHERE id = ?1",
+                [id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Record a failed attempt. The copy is retried on the next cycles at
+    /// first, then less often; see [`retry_delay`].
+    pub(crate) async fn mark_failed(&self, id: i64, error: &str) -> anyhow::Result<()> {
+        let error = error.to_owned();
+        let now = chrono::Utc::now().timestamp();
+        self.with(move |conn| {
+            let attempts: i64 = conn.query_row(
+                "SELECT attempts + 1 FROM files WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )?;
+            conn.execute(
+                "UPDATE files SET state = 'failed', attempts = ?3, last_error = ?2, retry_at = ?4
+                 WHERE id = ?1",
+                params![id, error, attempts, now + retry_delay(attempts)],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn mark_pending(&self, id: i64) -> anyhow::Result<()> {
+        self.with(move |conn| {
+            conn.execute("UPDATE files SET state = 'pending' WHERE id = ?1", [id])?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Record why an owed copy could not start, without counting a failure.
+    pub(crate) async fn note_waiting(&self, id: i64, reason: &str) -> anyhow::Result<()> {
+        let reason = reason.to_owned();
+        self.with(move |conn| {
+            conn.execute(
+                "UPDATE files SET last_error = ?2 WHERE id = ?1",
+                params![id, reason],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Store carried-over copies. Existing rows with the same path are kept.
+    pub(crate) async fn insert_imported(&self, copies: Vec<ImportedCopy>) -> anyhow::Result<u64> {
+        self.with(move |conn| {
+            let tx = conn.transaction()?;
+            let mut inserted = 0u64;
+            for copy in copies {
+                inserted += u64::try_from(tx.execute(
+                    "INSERT OR IGNORE INTO imported (path, zone, master, rendition, size, sha256, checksum, source_sha)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        copy.path,
+                        copy.zone,
+                        copy.master,
+                        copy.rendition,
+                        i64::try_from(copy.size)?,
+                        copy.sha256,
+                        copy.checksum,
+                        copy.source_sha
+                    ],
+                )?)?;
+            }
+            tx.commit()?;
+            Ok(inserted)
+        })
+        .await
+    }
+
+    /// A carried-over copy for a new row: the one at `path`, or else one of
+    /// the same photo and rendition in the same folder. Paths already owned
+    /// by a file row are never offered.
+    /// The previous engine keyed a copy by the photo's asset record name, or
+    /// for older rows its master record name, so `ids` names both.
+    pub(crate) async fn imported_copy(
+        &self,
+        zone: &str,
+        ids: [&str; 2],
+        rendition: &str,
+        path: &str,
+    ) -> anyhow::Result<Option<ImportedCopy>> {
+        let (zone, ids, rendition, path) = (
+            zone.to_owned(),
+            ids.map(ToOwned::to_owned),
+            rendition.to_owned(),
+            path.to_owned(),
+        );
+        self.with(move |conn| {
+            let (want_zone, want_rendition) = (zone.clone(), rendition.clone());
+            let parent = path
+                .rsplit_once('/')
+                .map_or("", |(parent, _)| parent)
+                .to_owned();
+            let mut stmt = conn.prepare(
+                "SELECT path, zone, master, rendition, size, sha256, checksum, source_sha FROM imported i
+                 WHERE NOT EXISTS (SELECT 1 FROM files f WHERE f.path = i.path)
+                   AND i.master IN (?3, ?5) AND i.rendition = ?4
+                 ORDER BY i.path = ?1 DESC, i.path",
+            )?;
+            let rows = stmt
+                .query_map(params![path, zone, ids[0], rendition, ids[1]], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (candidate, zone, master, rendition, size, sha256, checksum, source_sha) in rows {
+                let same_folder =
+                    candidate.rsplit_once('/').map_or("", |(parent, _)| parent) == parent;
+                // Only a copy of this photo and rendition is taken over. At
+                // the exact path the zone may differ: schemas without a
+                // library column recorded every copy under the primary one.
+                let same_copy = ids.contains(&master) && rendition == want_rendition;
+                if same_copy && (candidate == path || (same_folder && zone == want_zone)) {
+                    return Ok(Some(ImportedCopy {
+                        path: candidate,
+                        zone,
+                        master,
+                        rendition,
+                        size: u64::try_from(size)?,
+                        sha256,
+                        checksum,
+                        source_sha,
+                    }));
+                }
+            }
+            Ok(None)
+        })
+        .await
+    }
+
+    /// Drop carried-over copies no row took over. Their files stay on disk.
+    pub(crate) async fn clear_imported(&self) -> anyhow::Result<u64> {
+        self.with(|conn| Ok(u64::try_from(conn.execute("DELETE FROM imported", [])?)?))
+            .await
+    }
+
+    /// Personal-library stand-ins whose Shared Library photo no selected
+    /// zone covers. Their photos are not saved.
+    pub(crate) async fn uncovered_stand_ins(&self, zones: Vec<String>) -> anyhow::Result<u64> {
+        self.with(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT link_zone, COUNT(*) FROM assets
+                 WHERE sparse = 1 AND deleted = 0 AND hidden = 0 AND purged = 0
+                 GROUP BY link_zone",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut uncovered = 0u64;
+            for (zone, count) in rows {
+                if zone.is_none_or(|zone| !zones.contains(&zone)) {
+                    uncovered += u64::try_from(count)?;
+                }
+            }
+            Ok(uncovered)
+        })
+        .await
+    }
+
+    pub(crate) async fn completeness(&self) -> anyhow::Result<Completeness> {
+        self.with(|conn| {
+            let mut out = Completeness::default();
+            let mut stmt = conn.prepare(
+                "SELECT state, COUNT(*), TOTAL(size) FROM files WHERE wanted = 1 GROUP BY state",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, f64>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (state, count, bytes) = row?;
+                let count = u64::try_from(count)?;
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "TOTAL of non-negative integer sizes; a metric, not an exact count"
+                )]
+                let bytes = bytes as u64;
+                let [done, pending, failed, modified] = &mut out.bytes;
+                let (count_slot, bytes_slot) = match FileState::parse(&state)? {
+                    FileState::Done => (&mut out.done, done),
+                    FileState::Pending | FileState::Adopt => (&mut out.pending, pending),
+                    FileState::Failed => (&mut out.failed, failed),
+                    FileState::Modified => (&mut out.modified, modified),
+                };
+                *count_slot += count;
+                *bytes_slot += bytes;
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    pub(crate) async fn start_run(&self, now: i64) -> anyhow::Result<i64> {
+        self.with(move |conn| {
+            conn.execute(
+                "UPDATE runs SET outcome = 'interrupted', finished_at = ?1 WHERE finished_at IS NULL",
+                [now],
+            )?;
+            conn.execute("INSERT INTO runs (started_at) VALUES (?1)", [now])?;
+            Ok(conn.last_insert_rowid())
+        })
+        .await
+    }
+
+    pub(crate) async fn finish_run(
+        &self,
+        id: i64,
+        now: i64,
+        outcome: &str,
+        downloaded: u64,
+        failed: u64,
+        pending: u64,
+    ) -> anyhow::Result<()> {
+        let outcome = outcome.to_owned();
+        self.with(move |conn| {
+            conn.execute(
+                "UPDATE runs SET finished_at = ?2, outcome = ?3, downloaded = ?4, failed = ?5, pending = ?6
+                 WHERE id = ?1",
+                params![
+                    id,
+                    now,
+                    outcome,
+                    i64::try_from(downloaded)?,
+                    i64::try_from(failed)?,
+                    i64::try_from(pending)?
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+}
+
+/// One row of a command listing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct ListedFile {
+    pub(crate) path: String,
+    pub(crate) zone: String,
+    pub(crate) asset: String,
+    pub(crate) rendition: String,
+    /// Album record name, `smart:<name>` for a smart folder, or empty for unfiled.
+    pub(crate) album: String,
+    pub(crate) size: u64,
+    pub(crate) sha256: Option<String>,
+    pub(crate) state: &'static str,
+    /// Still selected; copies that stopped being wanted keep their files.
+    pub(crate) wanted: bool,
+    pub(crate) last_error: Option<String>,
+}
+
+/// The most recent cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunRow {
+    pub(crate) started_at: i64,
+    pub(crate) finished_at: Option<i64>,
+    pub(crate) outcome: Option<String>,
+    pub(crate) downloaded: u64,
+    pub(crate) failed: u64,
+}
+
+/// A zone's resume point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ZoneRow {
+    pub(crate) zone: String,
+    pub(crate) has_position: bool,
+    pub(crate) listed: bool,
+}
+
+impl State {
+    /// File rows, optionally only those in `states`, ordered by path.
+    pub(crate) async fn list_files(&self, states: &[FileState]) -> anyhow::Result<Vec<ListedFile>> {
+        let states: Vec<&'static str> = states.iter().map(|state| state.as_str()).collect();
+        self.with(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT path, zone, asset, rendition, album, size, sha256, state, wanted, last_error
+                 FROM files ORDER BY path",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, i64>(8)? != 0,
+                        row.get::<_, Option<String>>(9)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut out = Vec::new();
+            for (path, zone, asset, rendition, album, size, sha256, state, wanted, last_error) in
+                rows
+            {
+                let state = FileState::parse(&state)?.as_str();
+                if !states.is_empty() && !states.contains(&state) {
+                    continue;
+                }
+                out.push(ListedFile {
+                    path,
+                    zone,
+                    asset,
+                    rendition,
+                    album,
+                    size: u64::try_from(size)?,
+                    sha256,
+                    state,
+                    wanted,
+                    last_error,
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Copies carried over from the previous engine that no row has taken
+    /// over yet.
+    pub(crate) async fn list_imported(&self) -> anyhow::Result<Vec<ImportedCopy>> {
+        self.with(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT path, zone, master, rendition, size, sha256, checksum, source_sha FROM imported ORDER BY path",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter()
+                .map(|(path, zone, master, rendition, size, sha256, checksum, source_sha)| {
+                    Ok(ImportedCopy {
+                        path,
+                        zone,
+                        master,
+                        rendition,
+                        size: u64::try_from(size)?,
+                        sha256,
+                        checksum,
+                        source_sha,
+                    })
+                })
+                .collect()
+        })
+        .await
+    }
+
+    pub(crate) async fn zones(&self) -> anyhow::Result<Vec<ZoneRow>> {
+        self.with(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT zone, position IS NOT NULL, listed FROM zones ORDER BY zone")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(ZoneRow {
+                        zone: row.get(0)?,
+                        has_position: row.get::<_, i64>(1)? != 0,
+                        listed: row.get::<_, i64>(2)? != 0,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    pub(crate) async fn last_run(&self) -> anyhow::Result<Option<RunRow>> {
+        self.with(|conn| {
+            let row = conn
+                .query_row(
+                    "SELECT started_at, finished_at, outcome, downloaded, failed FROM runs
+                     ORDER BY id DESC LIMIT 1",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            row.map(|(started_at, finished_at, outcome, downloaded, failed)| {
+                Ok(RunRow {
+                    started_at,
+                    finished_at,
+                    outcome,
+                    downloaded: u64::try_from(downloaded)?,
+                    failed: u64::try_from(failed)?,
+                })
+            })
+            .transpose()
+        })
+        .await
+    }
+
+    /// Photos the catalog knows, across zones.
+    pub(crate) async fn asset_count(&self) -> anyhow::Result<u64> {
+        self.with(|conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM assets WHERE purged = 0 AND sparse = 0",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok(u64::try_from(count)?)
+        })
+        .await
+    }
+
+    /// Forget every zone's position so the next sync lists each again.
+    pub(crate) async fn forget_positions(&self) -> anyhow::Result<u64> {
+        self.with(|conn| {
+            Ok(u64::try_from(conn.execute(
+                "UPDATE zones SET position = NULL, listed = 0 WHERE position IS NOT NULL OR listed = 1",
+                [],
+            )?)?)
+        })
+        .await
+    }
+
+    /// The file row at a relative path.
+    pub(crate) async fn file_at(&self, path: &str) -> anyhow::Result<Option<FileRow>> {
+        let path = path.to_owned();
+        self.with(move |conn| {
+            let mut stmt = conn.prepare(&format!("{FILE_COLUMNS} WHERE path = ?1"))?;
+            let row = stmt.query_row([path], file_row).optional()?;
+            row.transpose()
+        })
+        .await
+    }
+
+    /// Record the bytes kei is about to publish over this copy, and the
+    /// embedded fields they carry, so a restart can tell kei's own write
+    /// from a local edit.
+    pub(crate) async fn set_pending(
+        &self,
+        id: i64,
+        sha256: &str,
+        fields: Option<String>,
+    ) -> anyhow::Result<()> {
+        let sha256 = sha256.to_owned();
+        self.with(move |conn| {
+            conn.execute(
+                "UPDATE files SET pending_sha = ?2, pending_fields = ?3 WHERE id = ?1",
+                params![id, sha256, fields],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// The file holds the bytes kei was publishing when it stopped: take
+    /// them as the copy's recorded bytes.
+    pub(crate) async fn accept_pending(&self, id: i64) -> anyhow::Result<()> {
+        self.with(move |conn| {
+            conn.execute(
+                "UPDATE files SET sha256 = pending_sha,
+                     source_sha = CASE WHEN pending_fields IS NULL THEN pending_sha ELSE source_sha END,
+                     meta_fields = pending_fields, meta_hash = NULL, meta_dirty = 1,
+                     state = 'done', last_error = NULL, pending_sha = NULL, pending_fields = NULL
+                 WHERE id = ?1 AND pending_sha IS NOT NULL",
+                [id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Saved copies whose metadata may be stale, in id order after `after`.
+    pub(crate) async fn metadata_work(
+        &self,
+        zone: &str,
+        after: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MetadataRow>> {
+        let zone = zone.to_owned();
+        self.with(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT f.id, f.asset, f.rendition, f.path, f.sha256, f.pending_sha, f.source_sha,
+                        f.meta_hash, f.meta_fields, a.body, m.body
+                 FROM files f
+                 JOIN assets a ON a.zone = f.zone AND a.name = f.asset
+                 LEFT JOIN masters m ON m.zone = a.zone AND m.name = a.master
+                 WHERE f.zone = ?1 AND f.id > ?2 AND f.meta_dirty = 1
+                   AND f.state = 'done' AND f.wanted = 1
+                 ORDER BY f.id LIMIT ?3",
+            )?;
+            let mut rows = stmt
+                .query_map(params![zone, after, i64::try_from(limit)?], |row| {
+                    Ok(MetadataRow {
+                        id: row.get(0)?,
+                        asset: row.get(1)?,
+                        rendition: row.get(2)?,
+                        path: row.get(3)?,
+                        sha256: row.get(4)?,
+                        pending_sha: row.get(5)?,
+                        source_sha: row.get(6)?,
+                        meta_hash: row.get(7)?,
+                        meta_fields: row.get(8)?,
+                        asset_body: row.get(9)?,
+                        master_body: row.get(10)?,
+                        albums: Vec::new(),
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut albums = conn.prepare(
+                "SELECT DISTINCT al.title FROM memberships ms
+                 JOIN albums al ON al.zone = ms.zone AND al.name = ms.album
+                 WHERE ms.zone = ?1 AND ms.asset = ?2 AND ms.present = 1
+                   AND al.deleted = 0 AND al.title IS NOT NULL
+                 ORDER BY al.title",
+            )?;
+            for row in &mut rows {
+                row.albums = albums
+                    .query_map(params![zone, row.asset], |r| r.get(0))?
+                    .collect::<Result<Vec<String>, _>>()?;
+            }
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Metadata for this copy now matches `hash`; record what kei wrote.
+    pub(crate) async fn metadata_written(
+        &self,
+        id: i64,
+        hash: &str,
+        written: Option<(String, String)>,
+    ) -> anyhow::Result<()> {
+        let hash = hash.to_owned();
+        self.with(move |conn| {
+            match written {
+                Some((sha256, fields)) => conn.execute(
+                    "UPDATE files SET meta_dirty = 0, meta_hash = ?2, sha256 = ?3, meta_fields = ?4,
+                         pending_sha = NULL, pending_fields = NULL
+                     WHERE id = ?1",
+                    params![id, hash, sha256, fields],
+                )?,
+                None => conn.execute(
+                    "UPDATE files SET meta_dirty = 0, meta_hash = ?2 WHERE id = ?1",
+                    params![id, hash],
+                )?,
+            };
+            Ok(())
+        })
+        .await
+    }
+
+    /// JSON of the embedded fields kei owns in this copy.
+    pub(crate) async fn meta_fields(&self, id: i64) -> anyhow::Result<Option<String>> {
+        self.with(move |conn| {
+            Ok(conn
+                .query_row("SELECT meta_fields FROM files WHERE id = ?1", [id], |row| {
+                    row.get(0)
+                })
+                .optional()?
+                .flatten())
+        })
+        .await
+    }
+
+    /// Check every saved copy's metadata again on the next pass.
+    pub(crate) async fn mark_all_metadata_dirty(&self, forget_written: bool) -> anyhow::Result<()> {
+        self.with(move |conn| {
+            if forget_written {
+                conn.execute("UPDATE files SET meta_dirty = 1, meta_hash = NULL", [])?;
+            } else {
+                conn.execute("UPDATE files SET meta_dirty = 1", [])?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Owe a done copy again, replacing it only while it still has `sha256`.
+    pub(crate) async fn owe_again(&self, id: i64, sha256: Option<&str>) -> anyhow::Result<()> {
+        let sha256 = sha256.map(ToOwned::to_owned);
+        self.with(move |conn| {
+            conn.execute(
+                "UPDATE files SET state = 'pending', sha256 = ?2, last_error = NULL WHERE id = ?1",
+                params![id, sha256],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+}
+
+const FILE_COLUMNS: &str = "SELECT id, zone, asset, rendition, album, path, size, checksum, sha256, state, attempts, pending_sha, slot FROM files";
+
+fn file_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<anyhow::Result<FileRow>> {
+    let state: String = row.get(9)?;
+    let size: i64 = row.get(6)?;
+    Ok((|| {
+        Ok(FileRow {
+            id: row.get(0)?,
+            zone: row.get(1)?,
+            asset: row.get(2)?,
+            rendition: row.get(3)?,
+            album: row.get(4)?,
+            path: row.get(5)?,
+            size: u64::try_from(size)?,
+            checksum: row.get(7)?,
+            sha256: row.get(8)?,
+            state: FileState::parse(&state)?,
+            attempts: row.get(10)?,
+            pending_sha: row.get(11)?,
+            slot: row.get(12)?,
+        })
+    })())
+}
+
+/// Apply one asset's wanted copies inside `tx`; see [`State::apply_plan`].
+fn apply_one(
+    tx: &rusqlite::Transaction<'_>,
+    zone: &str,
+    asset: &str,
+    wanted: Vec<WantedFile>,
+) -> anyhow::Result<()> {
+    // CONTRACT: SYNC_NEVER_DELETES
+    // A copy that is no longer planned only stops being wanted; its
+    // row and its file stay.
+    tx.execute(
+        "UPDATE files SET wanted = 0 WHERE zone = ?1 AND asset = ?2",
+        params![zone, asset],
+    )?;
+    for file in wanted {
+        let existing: Option<(i64, String, String, String)> = match file.row {
+            Some(id) => Some(tx.query_row(
+                "SELECT id, checksum, state, rendition FROM files
+                 WHERE id = ?1 AND zone = ?2 AND asset = ?3",
+                params![id, zone, asset],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?),
+            None => None,
+        };
+        match existing {
+            Some((id, checksum, state, rendition)) => {
+                let state = FileState::parse(&state)?;
+                // A new version, or another rendition taking over a
+                // primary-naming slot, makes a saved or adoptable
+                // copy owed again; a locally modified copy stays as
+                // it is.
+                let changed = checksum != file.checksum || rendition != file.rendition;
+                let next = if !changed || state == FileState::Modified {
+                    state
+                } else if matches!(state, FileState::Adopt | FileState::Done) {
+                    FileState::Pending
+                } else {
+                    state
+                };
+                tx.execute(
+                    "UPDATE files SET wanted = 1, rendition = ?2, slot = ?3, size = ?4,
+                         checksum = ?5, state = ?6, meta_dirty = 1,
+                         attempts = CASE WHEN ?7 THEN 0 ELSE attempts END,
+                         retry_at = CASE WHEN ?7 THEN NULL ELSE retry_at END
+                     WHERE id = ?1",
+                    params![
+                        id,
+                        file.rendition,
+                        file.slot,
+                        i64::try_from(file.size)?,
+                        file.checksum,
+                        next.as_str(),
+                        changed
+                    ],
+                )?;
+            }
+            None => {
+                // A carried-over copy keeps its recorded hash: it is
+                // done if iCloud still serves the same version, and
+                // replaced only while untouched if it does not.
+                // Only bytes the previous state proved it downloaded count
+                // as original; a carried-over hash alone does not.
+                let (state, sha256, source_sha) = match &file.imported {
+                    Some(copy) => {
+                        tx.execute("DELETE FROM imported WHERE path = ?1", [&copy.path])?;
+                        let source = copy
+                            .source_sha
+                            .clone()
+                            .filter(|_| copy.sha256 == copy.source_sha);
+                        match &copy.sha256 {
+                            None => (FileState::Adopt, None, None),
+                            Some(_) if copy.checksum == file.checksum => {
+                                (FileState::Done, copy.sha256.clone(), source)
+                            }
+                            Some(_) => (FileState::Pending, copy.sha256.clone(), source),
+                        }
+                    }
+                    None if file.adopt => (FileState::Adopt, None, None),
+                    None => (FileState::Pending, None, None),
+                };
+                tx.execute(
+                    "INSERT INTO files (zone, asset, rendition, album, slot, path, size, checksum, state, sha256, source_sha)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    params![
+                        zone,
+                        asset,
+                        file.rendition,
+                        file.album,
+                        file.slot,
+                        file.path,
+                        i64::try_from(file.size)?,
+                        file.checksum,
+                        state.as_str(),
+                        sha256,
+                        source_sha
+                    ],
+                )?;
+            }
+        }
+    }
+    tx.execute(
+        "UPDATE assets SET dirty = 0 WHERE zone = ?1 AND name = ?2",
+        params![zone, asset],
+    )?;
+    Ok(())
+}
+
+fn table_exists(conn: &Connection, table: &str) -> anyhow::Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+            [table],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> anyhow::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info(\"{table}\")"))?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(names.iter().any(|name| name == column))
+}
+
+/// Seconds before a copy that has failed `attempts` times is tried again.
+/// The first few failures retry every cycle, since most are passing network
+/// trouble. After that the wait doubles from an hour up to a day, so a copy
+/// iCloud keeps refusing costs one attempt a day.
+pub(crate) fn retry_delay(attempts: i64) -> i64 {
+    const RETRIES_EVERY_CYCLE: i64 = 3;
+    const HOUR: i64 = 3600;
+    const DAY: i64 = 24 * HOUR;
+    if attempts <= RETRIES_EVERY_CYCLE {
+        return 0;
+    }
+    let doublings = u32::try_from((attempts - RETRIES_EVERY_CYCLE - 1).min(5)).unwrap_or(5);
+    (HOUR << doublings).min(DAY)
+}
+
+/// Mark the photo a stand-in links to for planning.
+fn mark_linked_dirty(tx: &rusqlite::Transaction<'_>, zone: &str, name: &str) -> anyhow::Result<()> {
+    tx.execute(
+        "UPDATE assets SET dirty = 1 WHERE (zone, name) IN
+             (SELECT link_zone, link_name FROM assets WHERE zone = ?1 AND name = ?2)",
+        params![zone, name],
+    )?;
+    Ok(())
+}
+
+fn apply_observation(
+    tx: &rusqlite::Transaction<'_>,
+    zone: &str,
+    observation: Observation,
+) -> anyhow::Result<()> {
+    match observation {
+        Observation::Asset {
+            name,
+            master,
+            body,
+            deleted,
+            hidden,
+            sparse,
+        } => {
+            // A stand-in's albums belong to its linked photo: re-plan the
+            // photo it linked to before and the one it links to now.
+            mark_linked_dirty(tx, zone, &name)?;
+            let target = sparse.as_ref().and_then(|link| link.target.clone());
+            tx.execute(
+                "INSERT INTO assets (zone, name, master, body, deleted, hidden, purged, sparse,
+                     link_zone, link_name, dirty)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, 1)
+                 ON CONFLICT (zone, name) DO UPDATE SET master = excluded.master,
+                     body = excluded.body, deleted = excluded.deleted,
+                     hidden = excluded.hidden, purged = 0, sparse = excluded.sparse,
+                     link_zone = excluded.link_zone, link_name = excluded.link_name, dirty = 1",
+                params![
+                    zone,
+                    name,
+                    master,
+                    body,
+                    i64::from(deleted),
+                    i64::from(hidden),
+                    i64::from(sparse.is_some()),
+                    target.as_ref().map(|(zone, _)| zone.as_str()),
+                    target.as_ref().map(|(_, name)| name.as_str()),
+                ],
+            )?;
+            mark_linked_dirty(tx, zone, &name)?;
+        }
+        Observation::Master { name, body } => {
+            tx.execute(
+                "INSERT INTO masters (zone, name, body, purged) VALUES (?1, ?2, ?3, 0)
+                 ON CONFLICT (zone, name) DO UPDATE SET body = excluded.body, purged = 0",
+                params![zone, name, body],
+            )?;
+            tx.execute(
+                "UPDATE assets SET dirty = 1 WHERE zone = ?1 AND master = ?2",
+                params![zone, name],
+            )?;
+        }
+        Observation::Album {
+            name,
+            parent,
+            title,
+            is_folder,
+            deleted,
+        } => {
+            tx.execute(
+                "INSERT INTO albums (zone, name, parent, title, is_folder, deleted)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT (zone, name) DO UPDATE SET
+                     parent = COALESCE(excluded.parent, albums.parent),
+                     title = COALESCE(excluded.title, albums.title),
+                     is_folder = CASE WHEN excluded.deleted = 1 THEN albums.is_folder ELSE excluded.is_folder END,
+                     deleted = excluded.deleted",
+                params![zone, name, parent, title, i64::from(is_folder), i64::from(deleted)],
+            )?;
+            tx.execute(
+                "UPDATE assets SET dirty = 1 WHERE zone = ?1 AND name IN
+                     (SELECT asset FROM memberships WHERE zone = ?1 AND album = ?2)",
+                params![zone, name],
+            )?;
+            tx.execute(
+                "UPDATE assets SET dirty = 1 WHERE (zone, name) IN
+                     (SELECT a.link_zone, a.link_name FROM assets a
+                      JOIN memberships ms ON ms.zone = a.zone AND ms.asset = a.name
+                      WHERE ms.zone = ?1 AND ms.album = ?2)",
+                params![zone, name],
+            )?;
+        }
+        Observation::Membership {
+            relation,
+            album,
+            asset,
+            present,
+        } => {
+            tx.execute(
+                "INSERT INTO memberships (zone, relation, album, asset, present)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (zone, relation) DO UPDATE SET present = excluded.present",
+                params![zone, relation, album, asset, i64::from(present)],
+            )?;
+            tx.execute(
+                "UPDATE assets SET dirty = 1 WHERE zone = ?1 AND name = ?2",
+                params![zone, asset],
+            )?;
+            mark_linked_dirty(tx, zone, &asset)?;
+        }
+        Observation::Purged { name } => {
+            tx.execute(
+                "UPDATE assets SET purged = 1, dirty = 1 WHERE zone = ?1 AND name = ?2",
+                params![zone, name],
+            )?;
+            tx.execute(
+                "UPDATE masters SET purged = 1 WHERE zone = ?1 AND name = ?2",
+                params![zone, name],
+            )?;
+            tx.execute(
+                "UPDATE assets SET dirty = 1 WHERE zone = ?1 AND master = ?2",
+                params![zone, name],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn asset(name: &str, master: &str) -> Observation {
+        Observation::Asset {
+            name: name.into(),
+            master: Some(master.into()),
+            body: "{}".into(),
+            deleted: false,
+            hidden: false,
+            sparse: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn schema_one_gains_receipt_metadata_and_slot_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.sync.db");
+        let conn = Connection::open(&path).unwrap();
+        // The files table as schema 1 created it.
+        conn.execute_batch(
+            "CREATE TABLE files (
+                id INTEGER PRIMARY KEY, zone TEXT NOT NULL, asset TEXT NOT NULL,
+                rendition TEXT NOT NULL, album TEXT NOT NULL, path TEXT NOT NULL UNIQUE,
+                size INTEGER NOT NULL, checksum TEXT NOT NULL, sha256 TEXT,
+                state TEXT NOT NULL, wanted INTEGER NOT NULL DEFAULT 1,
+                attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT,
+                UNIQUE (zone, asset, rendition, album)) STRICT;
+             INSERT INTO files (zone, asset, rendition, album, path, size, checksum, sha256, state)
+             VALUES ('Z', 'A', 'original', '', 'a.jpg', 1, 'c', 'abc', 'done');
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        drop(conn);
+        let state = State::open(&path).await.unwrap();
+        let row = state.file_at("a.jpg").await.unwrap().unwrap();
+        assert_eq!(row.sha256.as_deref(), Some("abc"));
+        assert_eq!(row.pending_sha, None);
+        assert_eq!(
+            state
+                .with(|conn| Ok(conn.query_row(
+                    "SELECT source_sha, meta_dirty FROM files",
+                    [],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                )?))
+                .await
+                .unwrap(),
+            ("abc".to_owned(), 1)
+        );
+        // Schema 3 rebuilt the table with slots in the key.
+        assert_eq!(row.slot, "");
+        state
+            .with(|conn| {
+                conn.execute(
+                    "INSERT INTO files (zone, asset, rendition, album, slot, path, size, checksum, state)
+                     VALUES ('Z', 'A', 'original', '', 'still_original', 'b.jpg', 1, 'c', 'pending')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn schema_three_carried_over_copies_gain_an_unproven_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.sync.db");
+        let conn = Connection::open(&path).unwrap();
+        // The imported table as schema 3 created it.
+        conn.execute_batch(
+            "CREATE TABLE imported (path TEXT PRIMARY KEY, zone TEXT NOT NULL,
+                 master TEXT NOT NULL, rendition TEXT NOT NULL, size INTEGER NOT NULL,
+                 sha256 TEXT, checksum TEXT NOT NULL) STRICT;
+             INSERT INTO imported VALUES ('a.jpg', 'Z', 'M', 'original', 1, 'abc', 'c');
+             PRAGMA user_version = 3;",
+        )
+        .unwrap();
+        drop(conn);
+        let state = State::open(&path).await.unwrap();
+        let copies = state.list_imported().await.unwrap();
+        assert_eq!(copies.len(), 1);
+        assert_eq!(copies[0].sha256.as_deref(), Some("abc"));
+        assert_eq!(copies[0].source_sha, None);
+    }
+
+    #[tokio::test]
+    async fn contract_position_commits_with_observations() {
+        let state = State::open_in_memory().unwrap();
+        assert_eq!(state.position("Z").await.unwrap(), None);
+        state
+            .commit_page("Z", vec![asset("A1", "M1")], "t1".into(), false)
+            .await
+            .unwrap();
+        assert_eq!(state.position("Z").await.unwrap().as_deref(), Some("t1"));
+        let dirty = state.dirty_assets("Z", "", 10).await.unwrap();
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].master_body, None);
+        state.reset_position("Z").await.unwrap();
+        assert_eq!(state.position("Z").await.unwrap(), None);
+        assert_eq!(state.dirty_assets("Z", "", 10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn plans_keep_paths_and_replace_only_through_pending() {
+        let state = State::open_in_memory().unwrap();
+        state
+            .commit_page("Z", vec![asset("A1", "M1")], "t1".into(), true)
+            .await
+            .unwrap();
+        let wanted = |checksum: &str, path: &str, row: Option<i64>| WantedFile {
+            rendition: "original".into(),
+            album: String::new(),
+            slot: String::new(),
+            row,
+            path: path.into(),
+            size: 3,
+            checksum: checksum.into(),
+            adopt: false,
+            imported: None,
+        };
+        state
+            .apply_plan("Z", "A1", vec![wanted("c1", "a.jpg", None)])
+            .await
+            .unwrap();
+        let row = state.work("Z", 0, 10).await.unwrap().remove(0);
+        state.mark_done(row.id, "h1").await.unwrap();
+        assert!(state.work("Z", 0, 10).await.unwrap().is_empty());
+
+        // A new version keeps the original path and the recorded hash.
+        state
+            .apply_plan("Z", "A1", vec![wanted("c2", "renamed.jpg", Some(row.id))])
+            .await
+            .unwrap();
+        let row = state.work("Z", 0, 10).await.unwrap().remove(0);
+        assert_eq!(row.path, "a.jpg");
+        assert_eq!(row.checksum, "c2");
+        assert_eq!(row.sha256.as_deref(), Some("h1"));
+        assert_eq!(row.state, FileState::Pending);
+
+        // A copy no longer wanted leaves the queue but keeps its row.
+        state.apply_plan("Z", "A1", Vec::new()).await.unwrap();
+        assert!(state.work("Z", 0, 10).await.unwrap().is_empty());
+        assert_eq!(state.files_for_asset("Z", "A1").await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn failed_copies_retry_every_cycle_at_first_then_up_to_daily() {
+        assert_eq!(
+            (1..=10).map(retry_delay).collect::<Vec<_>>(),
+            [0, 0, 0, 3600, 7200, 14_400, 28_800, 57_600, 86_400, 86_400]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_copy_waits_for_its_retry_time_and_a_new_version_clears_it() {
+        let state = State::open_in_memory().unwrap();
+        state
+            .commit_page("Z", vec![asset("A1", "M1")], "t1".into(), true)
+            .await
+            .unwrap();
+        let wanted = |checksum: &str, row: Option<i64>| WantedFile {
+            rendition: "original".into(),
+            album: String::new(),
+            slot: String::new(),
+            row,
+            path: "a.jpg".into(),
+            size: 3,
+            checksum: checksum.into(),
+            adopt: false,
+            imported: None,
+        };
+        state
+            .apply_plan("Z", "A1", vec![wanted("c1", None)])
+            .await
+            .unwrap();
+        let id = state.work("Z", 0, 10).await.unwrap()[0].id;
+        for _ in 0..3 {
+            state.mark_failed(id, "refused").await.unwrap();
+            assert_eq!(state.work("Z", 0, 10).await.unwrap().len(), 1);
+        }
+        state.mark_failed(id, "refused").await.unwrap();
+        assert!(state.work("Z", 0, 10).await.unwrap().is_empty());
+        assert_eq!(state.owed("Z").await.unwrap(), 1, "it is still owed");
+
+        // iCloud serves a new version: try it right away.
+        state
+            .apply_plan("Z", "A1", vec![wanted("c2", Some(id))])
+            .await
+            .unwrap();
+        let row = state.work("Z", 0, 10).await.unwrap().remove(0);
+        assert_eq!(row.attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn memberships_and_masters_mark_assets_for_planning() {
+        let state = State::open_in_memory().unwrap();
+        state
+            .commit_page("Z", vec![asset("A1", "M1")], "t1".into(), true)
+            .await
+            .unwrap();
+        state.apply_plan("Z", "A1", Vec::new()).await.unwrap();
+        assert!(state.dirty_assets("Z", "", 10).await.unwrap().is_empty());
+        state
+            .commit_page(
+                "Z",
+                vec![
+                    Observation::Album {
+                        name: "AL".into(),
+                        parent: None,
+                        title: Some("Trip".into()),
+                        is_folder: false,
+                        deleted: false,
+                    },
+                    Observation::Membership {
+                        relation: "A1-IN-AL".into(),
+                        album: "AL".into(),
+                        asset: "A1".into(),
+                        present: true,
+                    },
+                ],
+                "t2".into(),
+                true,
+            )
+            .await
+            .unwrap();
+        let dirty = state.dirty_assets("Z", "", 10).await.unwrap();
+        assert_eq!(dirty[0].albums, vec![("Z".to_owned(), "AL".to_owned())]);
+        state.apply_plan("Z", "A1", Vec::new()).await.unwrap();
+        state
+            .commit_page(
+                "Z",
+                vec![Observation::Master {
+                    name: "M1".into(),
+                    body: "{}".into(),
+                }],
+                "t3".into(),
+                true,
+            )
+            .await
+            .unwrap();
+        let dirty = state.dirty_assets("Z", "", 10).await.unwrap();
+        assert_eq!(dirty[0].master_body.as_deref(), Some("{}"));
+    }
+}

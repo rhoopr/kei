@@ -22,18 +22,15 @@ use rusqlite::OptionalExtension;
 /// migration constant directly.
 #[test]
 fn behavioral_helper_schema_matches_production() {
-    // Production version as of this commit. Bump in lockstep with
-    // `pub(crate) const SCHEMA_VERSION` in `src/state/schema.rs` *and*
-    // update the DDL in `create_state_db` in support to match the new
-    // shape. The fresh-DB DDL emitted by a real binary run can be
-    // dumped via `sqlite3 <db> '.schema'` for reference.
+    // The last schema the previous engine wrote. The helper builds that
+    // shape so upgrade paths see what released versions left behind.
     const PRODUCTION_SCHEMA_VERSION: i32 = 49;
-    let production_schema = include_str!("../../src/state/schema.rs");
+    let production_schema = include_str!("../../src/state/db/account.rs");
     assert!(
         production_schema.contains(&format!(
-            "pub(crate) const SCHEMA_VERSION: i32 = {PRODUCTION_SCHEMA_VERSION};"
+            "LAST_LEGACY_SCHEMA_VERSION: i32 = {PRODUCTION_SCHEMA_VERSION};"
         )),
-        "behavioral production-version pin must match the actual schema owner"
+        "behavioral production-version pin must match the upgrade owner"
     );
     assert_eq!(
         HELPER_SCHEMA_VERSION, PRODUCTION_SCHEMA_VERSION,
@@ -50,6 +47,7 @@ fn verify_no_db() {
     clean_cmd()
         .env("ICLOUD_USERNAME", "test@example.com")
         .env("KEI_DATA_DIR", dir.path())
+        .args(super::download_config_args(dir.path()))
         .args(["verify"])
         .assert()
         .success()
@@ -63,6 +61,7 @@ fn reset_state_no_db() {
         clean_cmd()
             .env("ICLOUD_USERNAME", "test@example.com")
             .env("KEI_DATA_DIR", dir.path())
+            .args(super::download_config_args(dir.path()))
             .args(args)
             .assert()
             .success()
@@ -77,6 +76,7 @@ fn reset_sync_token_no_db() {
     clean_cmd()
         .env("ICLOUD_USERNAME", "test@example.com")
         .env("KEI_DATA_DIR", dir.path())
+        .args(super::download_config_args(dir.path()))
         .args(["reset", "sync-token"])
         .assert()
         .success()
@@ -106,6 +106,7 @@ fn verify_all_files_present() {
     let out = clean_cmd()
         .env("ICLOUD_USERNAME", username)
         .env("KEI_DATA_DIR", dir.path())
+        .args(super::download_config_args(dir.path()))
         .args(["verify"])
         .assert()
         .success()
@@ -149,6 +150,7 @@ fn verify_detects_missing_file() {
     let out = clean_cmd()
         .env("ICLOUD_USERNAME", username)
         .env("KEI_DATA_DIR", dir.path())
+        .args(super::download_config_args(dir.path()))
         .args(["verify"])
         .assert()
         .code(1)
@@ -190,6 +192,7 @@ fn verify_checksums_match() {
     let out = clean_cmd()
         .env("ICLOUD_USERNAME", username)
         .env("KEI_DATA_DIR", dir.path())
+        .args(super::download_config_args(dir.path()))
         .args(["verify", "--checksums"])
         .assert()
         .success()
@@ -247,6 +250,7 @@ fn verify_checksums_mismatch() {
     let out = clean_cmd()
         .env("ICLOUD_USERNAME", username)
         .env("KEI_DATA_DIR", dir.path())
+        .args(super::download_config_args(dir.path()))
         .args(["verify", "--checksums"])
         .assert()
         .code(1)
@@ -297,6 +301,7 @@ fn verify_checksums_mismatch_emits_asset_id_in_output() {
     let out = clean_cmd()
         .env("ICLOUD_USERNAME", username)
         .env("KEI_DATA_DIR", dir.path())
+        .args(super::download_config_args(dir.path()))
         .args(["verify", "--checksums"])
         .assert()
         .code(1)
@@ -345,6 +350,7 @@ fn verify_checksums_reports_unreadable_separately_from_different() {
     let out = clean_cmd()
         .env("ICLOUD_USERNAME", username)
         .env("KEI_DATA_DIR", dir.path())
+        .args(super::download_config_args(dir.path()))
         .args(["verify", "--checksums"])
         .assert()
         .code(1)
@@ -399,6 +405,7 @@ fn verify_reports_non_file_as_unreadable_without_checksums() {
     let out = clean_cmd()
         .env("ICLOUD_USERNAME", username)
         .env("KEI_DATA_DIR", dir.path())
+        .args(super::download_config_args(dir.path()))
         .args(["verify"])
         .assert()
         .code(1)
@@ -443,6 +450,7 @@ fn reset_state_deletes_db() {
     let out = clean_cmd()
         .env("ICLOUD_USERNAME", username)
         .env("KEI_DATA_DIR", dir.path())
+        .args(super::download_config_args(dir.path()))
         .args(["reset", "state", "--yes"])
         .assert()
         .success()
@@ -459,81 +467,13 @@ fn reset_state_deletes_db() {
     clean_cmd()
         .env("ICLOUD_USERNAME", username)
         .env("KEI_DATA_DIR", dir.path())
+        .args(super::download_config_args(dir.path()))
         .args(["reset", "state", "--yes"])
         .assert()
         .success()
         .stdout(predicate::str::contains("No state database found"));
     assert_eq!(std::fs::read(&media).unwrap(), b"synthetic media");
 }
-
-#[test]
-fn reset_sync_token_clears_tokens() {
-    let dir = tempfile::tempdir().unwrap();
-    let username = "test@example.com";
-    let conn = create_state_db(dir.path(), username);
-
-    conn.execute(
-        "INSERT INTO metadata (key, value) VALUES ('sync_token:PrimarySync', 'tok-abc')",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO metadata (key, value) VALUES ('db_sync_token', 'db-tok-123')",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO scoped_db_sync_tokens \
-            (provider, account, shape_version, scope_hash, selected_zones_json, scope_json, token, created_at, updated_at) \
-         VALUES ('icloud', 'test@example.com', 1, 'scope-a', '[\"PrimarySync\"]', '{\"scope\":\"a\"}', 'scoped-tok-123', 1, 1)",
-        [],
-    )
-    .unwrap();
-    drop(conn);
-
-    let out = clean_cmd()
-        .env("ICLOUD_USERNAME", username)
-        .env("KEI_DATA_DIR", dir.path())
-        .args(["reset", "sync-token", "--yes"])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Cleared sync tokens"), "stdout: {stdout}");
-
-    // Verify tokens are actually gone
-    let db_path = dir
-        .path()
-        .join(format!("{}.db", sanitize_username(username)));
-    let conn = rusqlite::Connection::open(&db_path).unwrap();
-    let zone_token: Option<String> = conn
-        .query_row(
-            "SELECT value FROM metadata WHERE key = 'sync_token:PrimarySync'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .unwrap();
-    // Zone tokens are deleted by delete_metadata_by_prefix
-    assert!(zone_token.is_none(), "zone token should be deleted");
-    let db_token: String = conn
-        .query_row(
-            "SELECT value FROM metadata WHERE key = 'db_sync_token'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    // db_sync_token is set to empty string, not deleted
-    assert_eq!(db_token, "", "db_sync_token should be cleared to empty");
-    let scoped_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM scoped_db_sync_tokens", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(scoped_count, 0, "scoped db tokens should be deleted");
-}
-
 #[test]
 fn reset_state_without_yes_on_non_tty() {
     assert_reset_state_requires_yes("");
@@ -569,6 +509,7 @@ fn assert_reset_state_requires_yes(input: &str) {
         clean_cmd()
             .env("ICLOUD_USERNAME", username)
             .env("KEI_DATA_DIR", dir.path())
+            .args(super::download_config_args(dir.path()))
             .args(["reset", "state"])
             .write_stdin(input)
             .assert()
@@ -614,6 +555,7 @@ fn reset_sync_token_without_yes_on_non_tty_errors() {
     let out = clean_cmd()
         .env("ICLOUD_USERNAME", username)
         .env("KEI_DATA_DIR", dir.path())
+        .args(super::download_config_args(dir.path()))
         .args(["reset", "sync-token"])
         .assert()
         .failure()
@@ -641,60 +583,6 @@ fn reset_sync_token_without_yes_on_non_tty_errors() {
         "zone token must not be cleared without --yes"
     );
 }
-
-#[test]
-fn reset_sync_token_with_yes_clears_under_non_tty() {
-    // Mirror of the test above with `--yes`: the same non-TTY context now
-    // succeeds and clears tokens. Confirms the safety guard only fires on
-    // the missing-flag path, not in legitimate scripted use.
-    let dir = tempfile::tempdir().unwrap();
-    let username = "test@example.com";
-    let conn = create_state_db(dir.path(), username);
-    conn.execute(
-        "INSERT INTO metadata (key, value) VALUES ('sync_token:PrimarySync', 'tok-abc')",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO metadata (key, value) VALUES ('db_sync_token', 'db-tok-123')",
-        [],
-    )
-    .unwrap();
-    drop(conn);
-
-    let db_path = dir
-        .path()
-        .join(format!("{}.db", sanitize_username(username)));
-
-    let out = clean_cmd()
-        .env("ICLOUD_USERNAME", username)
-        .env("KEI_DATA_DIR", dir.path())
-        .args(["reset", "sync-token", "--yes"])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("Cleared sync tokens"),
-        "stdout should report Cleared sync tokens: {stdout}"
-    );
-
-    let conn = rusqlite::Connection::open(&db_path).unwrap();
-    let zone_token: Option<String> = conn
-        .query_row(
-            "SELECT value FROM metadata WHERE key = 'sync_token:PrimarySync'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .unwrap();
-    assert!(
-        zone_token.is_none(),
-        "zone token must be cleared with --yes"
-    );
-}
-
 #[test]
 fn verify_empty_db() {
     let dir = tempfile::tempdir().unwrap();
@@ -704,6 +592,7 @@ fn verify_empty_db() {
     let out = clean_cmd()
         .env("ICLOUD_USERNAME", username)
         .env("KEI_DATA_DIR", dir.path())
+        .args(super::download_config_args(dir.path()))
         .args(["verify"])
         .assert()
         .success()
@@ -741,6 +630,7 @@ fn verify_checksums_reports_missing_baseline_without_failing() {
     let out = clean_cmd()
         .env("ICLOUD_USERNAME", username)
         .env("KEI_DATA_DIR", dir.path())
+        .args(super::download_config_args(dir.path()))
         .args(["verify", "--checksums"])
         .assert()
         .success()
@@ -778,6 +668,7 @@ fn reset_sync_token_empty_metadata() {
     let out = clean_cmd()
         .env("ICLOUD_USERNAME", username)
         .env("KEI_DATA_DIR", dir.path())
+        .args(super::download_config_args(dir.path()))
         .args(["reset", "sync-token", "--yes"])
         .assert()
         .success()
@@ -824,6 +715,7 @@ fn verify_mixed_present_and_missing() {
     let out = clean_cmd()
         .env("ICLOUD_USERNAME", username)
         .env("KEI_DATA_DIR", dir.path())
+        .args(super::download_config_args(dir.path()))
         .args(["verify"])
         .assert()
         .code(1)
@@ -870,6 +762,7 @@ fn verify_truncates_issue_listing_past_cap() {
     let out = clean_cmd()
         .env("ICLOUD_USERNAME", username)
         .env("KEI_DATA_DIR", dir.path())
+        .args(super::download_config_args(dir.path()))
         .args(["verify"])
         .assert()
         .code(1)
@@ -898,61 +791,6 @@ fn verify_truncates_issue_listing_past_cap() {
         "201st missing line should have been suppressed; stdout: {stdout}"
     );
 }
-
-#[test]
-fn reconcile_truncates_issue_listing_past_cap() {
-    // Covers the 200-issue listing cap for `kei reconcile`. 250 seeded
-    // missing rows produce 200 MISSING lines + a tail; summary shows
-    // the full count and the `Marked failed` line confirms every row
-    // was re-queued regardless of which lines printed.
-    let dir = tempfile::tempdir().unwrap();
-    let username = "test@example.com";
-    let conn = create_state_db(dir.path(), username);
-
-    for i in 0..250 {
-        let id = format!("rid{i:04}");
-        let filename = format!("missing_{i:04}.jpg");
-        let path = dir.path().join(&filename);
-        // Path is under the tempdir but we never write the file, so
-        // the existence check inside reconcile reports it as missing.
-        insert_asset(
-            &conn,
-            &id,
-            "downloaded",
-            &filename,
-            Some(path.to_str().unwrap()),
-            None,
-            None,
-        );
-    }
-    drop(conn);
-
-    let out = clean_cmd()
-        .env("ICLOUD_USERNAME", username)
-        .env("KEI_DATA_DIR", dir.path())
-        .args(["reconcile"])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Missing:  250"), "stdout: {stdout}");
-    assert!(
-        stdout.contains("Marked failed: 250"),
-        "every row should be re-queued regardless of the print cap; stdout: {stdout}"
-    );
-    assert!(
-        stdout.contains("... and 50 more (listing capped at 200)"),
-        "truncation tail missing; stdout: {stdout}"
-    );
-    assert!(stdout.contains("missing_0000.jpg"), "first row absent");
-    assert!(stdout.contains("missing_0199.jpg"), "200th row absent");
-    assert!(
-        !stdout.contains("missing_0200.jpg"),
-        "201st row should be suppressed; stdout: {stdout}"
-    );
-}
-
 #[test]
 fn dry_run_creates_no_state_db() {
     let data_dir = tempfile::tempdir().unwrap();
@@ -982,189 +820,6 @@ fn dry_run_creates_no_state_db() {
         db_files.iter().map(|e| e.path()).collect::<Vec<_>>()
     );
 }
-
-#[test]
-fn reconcile_subcommand_marks_missing_and_preserves_present() {
-    let data_dir = tempfile::tempdir().unwrap();
-    let photos_dir = tempfile::tempdir().unwrap();
-    let username = "test@example.com";
-    let conn = create_state_db(data_dir.path(), username);
-
-    let present_path = photos_dir.path().join("present.jpg");
-    std::fs::write(&present_path, vec![0u8; 1000]).unwrap();
-    let missing_path = photos_dir.path().join("gone.jpg");
-
-    insert_asset(
-        &conn,
-        "PRESENT",
-        "downloaded",
-        "present.jpg",
-        Some(present_path.to_str().unwrap()),
-        None,
-        None,
-    );
-    insert_asset(
-        &conn,
-        "MISSING",
-        "downloaded",
-        "gone.jpg",
-        Some(missing_path.to_str().unwrap()),
-        None,
-        None,
-    );
-    drop(conn);
-
-    let out = clean_cmd()
-        .env("ICLOUD_USERNAME", username)
-        .env("KEI_DATA_DIR", data_dir.path())
-        .args(["reconcile"])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("MISSING:") && stdout.contains("gone.jpg"),
-        "missing file must be reported: {stdout}"
-    );
-    assert!(
-        stdout.contains("Present:  1"),
-        "present count must be 1: {stdout}"
-    );
-    assert!(
-        stdout.contains("Missing:  1"),
-        "missing count must be 1: {stdout}"
-    );
-    assert!(
-        stdout.contains("Marked failed: 1"),
-        "one mark_failed must have fired: {stdout}"
-    );
-
-    // Verify state transition landed in the DB.
-    let db_name = format!("{}.db", sanitize_username(username));
-    let conn = rusqlite::Connection::open(data_dir.path().join(db_name)).unwrap();
-    let missing_status: String = conn
-        .query_row("SELECT status FROM assets WHERE id = 'MISSING'", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(missing_status, "failed");
-    let missing_error: String = conn
-        .query_row(
-            "SELECT last_error FROM assets WHERE id = 'MISSING'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(missing_error, "FILE_MISSING_AT_STARTUP");
-    let present_status: String = conn
-        .query_row("SELECT status FROM assets WHERE id = 'PRESENT'", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(present_status, "downloaded");
-}
-
-#[test]
-fn reconcile_reports_shorter_file_without_authorizing_replacement() {
-    let data_dir = tempfile::tempdir().unwrap();
-    let photos_dir = tempfile::tempdir().unwrap();
-    let username = "test@example.com";
-    let conn = create_state_db(data_dir.path(), username);
-
-    let truncated_path = photos_dir.path().join("truncated.jpg");
-    std::fs::write(&truncated_path, b"short").unwrap();
-    insert_asset(
-        &conn,
-        "TRUNCATED",
-        "downloaded",
-        "truncated.jpg",
-        Some(truncated_path.to_str().unwrap()),
-        None,
-        None,
-    );
-    drop(conn);
-
-    let out = clean_cmd()
-        .env("ICLOUD_USERNAME", username)
-        .env("KEI_DATA_DIR", data_dir.path())
-        .args(["reconcile"])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("SHORTER:"), "stdout: {stdout}");
-    assert!(stdout.contains("Shorter:  1"), "stdout: {stdout}");
-    assert!(stdout.contains("Marked failed: 0"), "stdout: {stdout}");
-    assert_eq!(std::fs::read(truncated_path).unwrap(), b"short");
-
-    let db_name = format!("{}.db", sanitize_username(username));
-    let conn = rusqlite::Connection::open(data_dir.path().join(db_name)).unwrap();
-    let (status, error): (String, Option<String>) = conn
-        .query_row(
-            "SELECT status, last_error FROM assets WHERE id = 'TRUNCATED'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(status, "downloaded");
-    assert_eq!(error, None);
-}
-
-#[test]
-fn reconcile_dry_run_reports_but_does_not_mutate() {
-    let data_dir = tempfile::tempdir().unwrap();
-    let photos_dir = tempfile::tempdir().unwrap();
-    let username = "test@example.com";
-    let conn = create_state_db(data_dir.path(), username);
-
-    let missing_path = photos_dir.path().join("gone.jpg");
-    insert_asset(
-        &conn,
-        "MISSING_DRY",
-        "downloaded",
-        "gone.jpg",
-        Some(missing_path.to_str().unwrap()),
-        None,
-        None,
-    );
-    drop(conn);
-
-    let out = clean_cmd()
-        .env("ICLOUD_USERNAME", username)
-        .env("KEI_DATA_DIR", data_dir.path())
-        .args(["reconcile", "--dry-run"])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("dry run") || stdout.contains("Dry run"),
-        "dry-run wording must appear: {stdout}"
-    );
-    assert!(
-        stdout.contains("Missing:  1"),
-        "missing count must still be 1 in dry-run: {stdout}"
-    );
-    assert!(
-        !stdout.contains("Marked failed:"),
-        "dry-run must not print Marked failed summary: {stdout}"
-    );
-
-    let db_name = format!("{}.db", sanitize_username(username));
-    let conn = rusqlite::Connection::open(data_dir.path().join(db_name)).unwrap();
-    let status: String = conn
-        .query_row(
-            "SELECT status FROM assets WHERE id = 'MISSING_DRY'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(status, "downloaded", "dry-run must leave the DB unchanged");
-}
-
 #[test]
 fn reconcile_on_empty_db_prints_guidance_and_exits_clean() {
     let data_dir = tempfile::tempdir().unwrap();
@@ -1173,6 +828,7 @@ fn reconcile_on_empty_db_prints_guidance_and_exits_clean() {
     let out = clean_cmd()
         .env("ICLOUD_USERNAME", username)
         .env("KEI_DATA_DIR", data_dir.path())
+        .args(super::download_config_args(data_dir.path()))
         .args(["reconcile"])
         .assert()
         .success()
@@ -1418,90 +1074,6 @@ fn behavioral_preservation_tables_and_guards_are_present() {
     let guards:i64=conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'unattributed_%'",[],|row|row.get(0)).unwrap();
     assert_eq!(guards, 30);
 }
-
-#[test]
-fn preserved_legacy_status_and_reconcile_keep_attribution_separate_from_failure() {
-    let data_dir = tempfile::tempdir().unwrap();
-    let username = "synthetic@example.com";
-    let conn = create_state_db(data_dir.path(), username);
-    let missing = data_dir.path().join("retained-original.jpg");
-    insert_asset(
-        &conn,
-        "LEGACY",
-        "downloaded",
-        "retained-original.jpg",
-        Some(missing.to_str().unwrap()),
-        None,
-        Some("original-checksum"),
-    );
-    conn.execute("INSERT INTO sync_runs(started_at,completed_at,status) VALUES (1700000000,1700000001,'complete')", []).unwrap();
-    // This tests the command/report boundary with an explicitly prepared
-    // synthetic record; it does not manufacture an activation proof.
-    conn.execute("INSERT INTO unattributed_legacy(library,asset_id,evidence_version,original_evidence,files,prepared_at) VALUES ('PrimarySync','LEGACY',1,'synthetic-original','[]',1)", []).unwrap();
-    drop(conn);
-    let out = clean_cmd()
-        .env("ICLOUD_USERNAME", username)
-        .env("KEI_DATA_DIR", data_dir.path())
-        .args(["status"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let output = String::from_utf8(out).unwrap();
-    assert!(
-        output.contains(
-            "preserved legacy records with unknown attribution: 1; legacy records without a stored coverage certificate: 1. Certification is retired; this is not pending sync work."
-        ),
-        "{output}"
-    );
-    assert!(
-        output.contains("Backup record: 1 preserved legacy records need attribution"),
-        "{output}"
-    );
-    assert!(
-        output.contains(
-            "Scope: recorded local state only; this does not establish iCloud completeness or verify local media checksums."
-        ),
-        "{output}"
-    );
-    assert!(!output.contains("Backup status: safe"), "{output}");
-    assert!(!output.contains("Backup status: unsafe"), "{output}");
-    let out = clean_cmd()
-        .env("ICLOUD_USERNAME", username)
-        .env("KEI_DATA_DIR", data_dir.path())
-        .args(["reconcile"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let output = String::from_utf8(out).unwrap();
-    assert!(
-        output
-            .contains("Protected legacy records needing inspection: 1; original receipts retained"),
-        "{output}"
-    );
-    let conn = rusqlite::Connection::open(
-        data_dir
-            .path()
-            .join(format!("{}.db", sanitize_username(username))),
-    )
-    .unwrap();
-    let retained: (String, Option<String>, String) = conn
-        .query_row(
-            "SELECT status,last_error,local_checksum FROM assets WHERE id='LEGACY'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .unwrap();
-    assert_eq!(
-        retained,
-        ("downloaded".into(), None, "original-checksum".into())
-    );
-    assert!(!missing.exists());
-}
-
 #[test]
 fn retired_legacy_trust_plan_and_apply_refuse_before_archive_or_auth_writes() {
     let root = tempfile::tempdir().unwrap();

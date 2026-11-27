@@ -98,17 +98,10 @@ pub(crate) fn install_signal_handler(
                 // stop_grace_period so the app exits cleanly before Docker
                 // sends SIGKILL.
                 tokio::spawn(wait_then_force_exit(GRACEFUL_SHUTDOWN_TIMEOUT, |code| {
-                    // Same restore-before-exit reasoning as the
-                    // second-Ctrl+C branch above.
-                    crate::personality::tty_echo::restore_now();
                     std::process::exit(code)
                 }));
             } else {
                 tracing::warn!("Force exit requested");
-                // Drop guards don't run on `process::exit`. Restore the
-                // tty's ECHOCTL flag explicitly so a force-quit doesn't
-                // leave the user's shell with control-char echo silenced.
-                crate::personality::tty_echo::restore_now();
                 std::process::exit(FORCE_EXIT_CODE);
             }
         }

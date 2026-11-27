@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
-use crate::state::{error::StateError, schema};
+use crate::state::error::StateError;
+
+/// The newest previous-engine schema version the upgrade reads.
+const LAST_LEGACY_SCHEMA_VERSION: i32 = 49;
 
 const ACCOUNT_OWNER_FORMAT_VERSION: i64 = 1;
 
@@ -21,6 +24,16 @@ impl AccountOwner {
             key: crate::account::namespace(username, realm),
             provider: None,
         }
+    }
+
+    /// The configured account namespace.
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// The authenticated provider fingerprint, if this owner was authenticated.
+    pub(crate) fn provider_key(&self) -> Option<&str> {
+        self.provider.as_deref()
     }
 
     pub(crate) fn authenticated(
@@ -90,16 +103,6 @@ pub(super) fn validate(conn: &Connection, owner: &AccountOwner) -> Result<(), St
     Ok(())
 }
 
-pub(super) fn validate_authenticated(
-    conn: &Connection,
-    owner: &AccountOwner,
-) -> Result<(), StateError> {
-    if owner.provider.is_none() {
-        return Err(StateError::AccountIdentityUnavailable);
-    }
-    validate(conn, owner)
-}
-
 fn bind(conn: &Connection, owner: &AccountOwner) -> Result<(), StateError> {
     let provider = owner
         .provider
@@ -114,59 +117,16 @@ fn bind(conn: &Connection, owner: &AccountOwner) -> Result<(), StateError> {
     Ok(())
 }
 
-pub(super) fn open(path: &Path, owner: &AccountOwner) -> Result<(Connection, bool), StateError> {
-    // Reserve the new file exclusively. A pre-existing empty/unowned file is
-    // never silently claimed, including one left by an interrupted creation.
-    if owner.provider.is_none()
-        && !path.try_exists().map_err(|source| StateError::TempPath {
-            path: path.to_path_buf(),
-            source,
-        })?
-    {
-        return Err(StateError::AccountIdentityUnavailable);
-    }
-    let created = match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
-        Ok(file) => {
-            drop(file);
-            true
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
-        Err(source) => {
-            return Err(StateError::TempPath {
-                path: path.to_path_buf(),
-                source,
-            });
-        }
-    };
-    if !created {
-        let inspection = open_read_only(path)?;
-        validate(&inspection, owner)?;
-    }
-    let conn =
-        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE).map_err(|source| {
-            StateError::Open {
-                path: path.to_path_buf(),
-                source,
-            }
-        })?;
-    // A refused connection must not checkpoint a crash-left WAL on drop.
-    // Recheck after the writable open, including a replaced-file race.
-    conn.set_db_config(
-        rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
-        true,
-    )?;
-    if created {
-        bind(&conn, owner)?;
-    } else {
-        validate(&conn, owner)?;
-    }
-    // The lifecycle owner enables close-time checkpointing only after backup
-    // and migration succeed. Refusals must preserve a crash-left WAL.
-    Ok((conn, created))
+/// Open an existing state file read-only after verifying it belongs to the
+/// account. A configured owner checks the account; an authenticated owner
+/// also checks the provider identity. Nothing in the file is changed.
+pub(crate) fn open_verified_read_only(
+    path: &Path,
+    owner: &AccountOwner,
+) -> Result<Connection, StateError> {
+    let conn = open_read_only(path)?;
+    validate(&conn, owner)?;
+    Ok(conn)
 }
 
 pub(super) fn open_read_only(path: &Path) -> Result<Connection, StateError> {
@@ -211,26 +171,6 @@ pub(crate) async fn state_path(
         return Err(StateError::LegacyAccountMigrationRequired);
     }
     Ok(path)
-}
-
-/// Resolve and open authenticated sync/import state through one startup boundary.
-/// Identity refusal precedes directory creation; schema upgrades retain the
-/// loaded configuration through the existing durable backup owner.
-pub(crate) async fn open_sync_state(
-    directory: &Path,
-    username: &str,
-    realm: &str,
-    owner: &AccountOwner,
-    config: &crate::config::ConfigSource,
-) -> Result<super::SqliteStateDb, StateError> {
-    if owner.key != crate::account::namespace(username, realm) {
-        return Err(StateError::AccountOwnerMismatch);
-    }
-    if owner.provider.is_none() {
-        return Err(StateError::AccountIdentityUnavailable);
-    }
-    let path = state_path(directory, username, realm).await?;
-    super::SqliteStateDb::open_owned_with_config(&path, owner, config).await
 }
 
 /// Copy a confirmed legacy snapshot, bind the staged copy and publish without
@@ -320,11 +260,11 @@ fn copy_and_bind_legacy(
             }
         }
     }
-    let version = schema::get_schema_version(&input)?;
-    if version > schema::SCHEMA_VERSION {
+    let version: i32 = input.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version > LAST_LEGACY_SCHEMA_VERSION {
         return Err(StateError::UnsupportedSchemaVersion {
             found: version,
-            expected: schema::SCHEMA_VERSION,
+            expected: LAST_LEGACY_SCHEMA_VERSION,
         });
     }
     let before: i64 = input.pragma_query_value(None, "data_version", |row| row.get(0))?;
@@ -358,8 +298,9 @@ fn copy_and_bind_legacy(
     }
     output.pragma_update(None, "journal_mode", "DELETE")?;
     output.pragma_update(None, "synchronous", "FULL")?;
+    // The bound copy is upgraded into sync-core state on first use; its own
+    // schema is read as it is.
     bind(&output, owner)?;
-    schema::migrate(&output)?;
     validate(&output, owner)?;
     let integrity: String = output.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     if integrity != "ok" {
@@ -384,9 +325,3 @@ fn copy_and_bind_legacy(
     crate::test_helpers::process_death_point("account-adoption-stage-synced");
     Ok(())
 }
-
-#[cfg(test)]
-mod tests;
-
-#[cfg(all(test, target_os = "linux"))]
-mod interruption_tests;

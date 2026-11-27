@@ -1,7 +1,7 @@
 #![no_main]
 
 // Drives every CloudKit response struct (`ZoneListResponse`, `QueryResponse`,
-// `Record`, `ChangesDatabaseResponse`, etc.) through `serde_json::from_slice`
+// `Record`, `ChangesZoneResponse`, etc.) through `serde_json::from_slice`
 // in one pass via `kei::__fuzz::cloudkit_try_all`. Apple controls these
 // payloads, so any panic is reachable by a hostile or malformed iCloud
 // response.

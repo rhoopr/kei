@@ -1725,7 +1725,7 @@ fn missing_reference_inventory_requires_explicit_live_json_opt_in() {
 }
 
 #[test]
-fn missing_reference_inventory_actual_cli_bypasses_sync_doctor_and_credentials() {
+fn missing_reference_inventory_actual_cli_is_refused_without_credentials_or_writes() {
     let dir = tempfile::tempdir().unwrap();
     let media = dir.path().join("media");
     std::fs::create_dir(&media).unwrap();
@@ -1760,9 +1760,13 @@ fn missing_reference_inventory_actual_cli_bypasses_sync_doctor_and_credentials()
         .failure()
         .get_output()
         .clone();
-    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["scan"], "incomplete");
-    assert_eq!(report["reason"], "cached_input_unavailable");
+    // The inventory is retired; the refusal still reads no credentials and
+    // touches no media or state.
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no longer available"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let output = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),

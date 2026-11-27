@@ -1,0 +1,656 @@
+//! Turn catalog facts into the local copies kei owes.
+//!
+//! A copy's path is chosen once, when its row is created, and never changes.
+//! With primary naming, the rendition at the plain name follows edits and
+//! reverts while the path stays.
+//! An album's folder is fixed the first time a copy is planned into it, so
+//! renaming the album in iCloud moves nothing. Copies that stop being wanted
+//! keep their files.
+
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+
+use crate::download::core_io::{ExpectedFile, expected_files};
+use crate::download::filter::PathDerivationConfig;
+use crate::download::paths;
+use crate::icloud::photos::feed::{SmartRule, in_derived_smart_folder, smart_rule, stored_asset};
+use crate::icloud::photos::smart_folders::{sensitive_smart_folder_names, smart_folder_names};
+use crate::selection::{AlbumSelector, SmartFolderSelector};
+
+use super::CoreConfig;
+use super::state::{AlbumRow, DirtyAsset, FileRow, ImportedCopy, State, WantedFile};
+
+const BATCH: usize = 256;
+/// `files.album` prefix for smart folder copies.
+pub(crate) const SMART_KEY_PREFIX: &str = "smart:";
+/// Upper bound on collision suffixes tried for one path.
+const MAX_ORDINAL: u64 = 1000;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PlanStats {
+    pub(crate) planned: u64,
+    /// Assets that cannot be planned yet, such as one whose master or album
+    /// iCloud has not reported. They stay marked and are retried.
+    pub(crate) waiting: u64,
+}
+
+/// Plan every marked asset in a zone.
+pub(crate) async fn plan_zone(
+    state: &State,
+    zone: &str,
+    config: &CoreConfig,
+) -> anyhow::Result<PlanStats> {
+    let albums = Albums::new(state.albums().await?, &config.albums);
+    let smart = selected_smart_folders(&config.smart_folders);
+    let mut stats = PlanStats::default();
+    let mut after = String::new();
+    let mut progress = super::progress::Progress::start();
+    loop {
+        if progress.due() && stats != PlanStats::default() {
+            tracing::info!(
+                zone,
+                planned = stats.planned,
+                waiting = stats.waiting,
+                "Planning copies"
+            );
+        }
+        let batch = state.dirty_assets(zone, &after, BATCH).await?;
+        let Some(last) = batch.last() else {
+            break;
+        };
+        after.clone_from(&last.name);
+        // One transaction per batch. Paths chosen earlier in the batch are
+        // not in the state yet, so the batch tracks them itself.
+        let mut taken = HashSet::new();
+        let mut plans = Vec::with_capacity(batch.len());
+        for asset in batch {
+            match plan_asset(state, zone, config, &albums, &smart, &asset, &mut taken).await? {
+                Some(wanted) => plans.push((asset.name, wanted)),
+                None => stats.waiting += 1,
+            }
+        }
+        stats.planned += plans.len() as u64;
+        state.apply_plans(zone, plans).await?;
+    }
+    let unresolved = albums.unresolved();
+    if unresolved > 0 && !matches!(config.albums, AlbumSelector::None) {
+        tracing::warn!(
+            zone,
+            albums = unresolved,
+            waiting = stats.waiting,
+            "Some albums arrived without a name; their photos wait until iCloud reports it"
+        );
+    }
+    Ok(stats)
+}
+
+/// Where a copy goes: its key in `files` and the path rules for it.
+struct Placement {
+    key: String,
+    /// The album whose folder this copy fixes, as `(zone, album)`.
+    album: Option<(String, String)>,
+    config: PathDerivationConfig,
+}
+
+/// Where one asset's copies go. `None` means it must wait for more facts.
+async fn plan_asset(
+    state: &State,
+    zone: &str,
+    config: &CoreConfig,
+    albums: &Albums,
+    smart: &[(String, SmartRule)],
+    asset: &DirtyAsset,
+    taken: &mut HashSet<String>,
+) -> anyhow::Result<Option<Vec<WantedFile>>> {
+    if asset.purged || asset.sparse {
+        return Ok(Some(Vec::new()));
+    }
+    // CONTRACT: UNKNOWN_PROVIDER_IDENTITY_REMAINS_PENDING
+    // Without its master record a photo stays dirty and is planned later.
+    let Some(master) = &asset.master_body else {
+        return Ok(None);
+    };
+    let photo = match stored_asset(master, &asset.asset_body) {
+        Ok(photo) => photo,
+        Err(error) => {
+            tracing::warn!(error = %error, "Could not read a stored photo record");
+            return Ok(None);
+        }
+    };
+    // Hidden and recently deleted photos appear only in their own smart folders.
+    let in_library = !asset.hidden && !asset.deleted;
+
+    let mut placements = Vec::new();
+    let mut member_of_any = false;
+    for (album_zone, album) in &asset.albums {
+        let Some(row) = albums.rows.get(&(album_zone.clone(), album.clone())) else {
+            return Ok(None);
+        };
+        if row.deleted || row.is_folder {
+            continue;
+        }
+        member_of_any = true;
+        // An album whose name iCloud has not reported cannot be matched
+        // against the selection or given a folder. Hold the photo rather
+        // than leave it out of every placement.
+        if in_library
+            && !matches!(config.albums, AlbumSelector::None)
+            && !albums.resolved(album_zone, album)
+        {
+            return Ok(None);
+        }
+        if !in_library || !albums.selected(album_zone, album) {
+            continue;
+        }
+        let Some(folder) = albums.folder(album_zone, album) else {
+            return Ok(None);
+        };
+        placements.push(Placement {
+            key: album.clone(),
+            album: Some((album_zone.clone(), album.clone())),
+            config: album_config(config, zone, &folder),
+        });
+    }
+    let mut in_selected_smart = false;
+    for (name, rule) in smart {
+        let member = if *rule == SmartRule::Queried {
+            in_library && asset.smart.contains(name)
+        } else {
+            in_derived_smart_folder(*rule, &photo, asset.hidden, asset.deleted)
+        };
+        if member {
+            in_selected_smart = true;
+            placements.push(Placement {
+                key: format!("{SMART_KEY_PREFIX}{name}"),
+                album: None,
+                config: smart_config(config, zone, name),
+            });
+        }
+    }
+    if config.unfiled && in_library && !member_of_any && !in_selected_smart {
+        placements.push(Placement {
+            key: String::new(),
+            album: None,
+            config: unfiled_config(config, zone),
+        });
+    }
+
+    let existing = state.files_for_asset(zone, &asset.name).await?;
+    let mut claimed = HashSet::new();
+    let mut wanted = Vec::new();
+    for placement in placements {
+        let files = expected_files(&photo, &placement.config);
+        if !files.is_empty()
+            && let Some((album_zone, album)) = &placement.album
+            && let Some(folder) = albums.folder(album_zone, album)
+        {
+            state.fix_album_folder(album_zone, album, &folder).await?;
+        }
+        for file in files {
+            let relative = relative_path(&config.directory, &file.path)?;
+            let mut imported = None;
+            let mut row = None;
+            let (path, adopt) =
+                if let Some(existing) = matching_row(&existing, &claimed, &placement.key, &file) {
+                    claimed.insert(existing.id);
+                    row = Some(existing.id);
+                    (existing.path.clone(), false)
+                } else if let Some(copy) = carried_over(
+                    state,
+                    &config.directory,
+                    zone,
+                    [photo.id(), photo.asset_record_name()],
+                    file.rendition,
+                    &relative,
+                    taken,
+                )
+                .await?
+                {
+                    let path = copy.path.clone();
+                    imported = Some(copy);
+                    (path, false)
+                } else {
+                    choose_path(
+                        state,
+                        &config.directory,
+                        &relative,
+                        Collision {
+                            size: file.size,
+                            asset_id: photo.id(),
+                            size_suffix: size_suffix_first(config, file.rendition),
+                        },
+                        taken,
+                    )
+                    .await?
+                };
+            taken.insert(path.clone());
+            wanted.push(WantedFile {
+                rendition: file.rendition.to_owned(),
+                album: placement.key.clone(),
+                slot: file.slot.to_owned(),
+                row,
+                path,
+                size: file.size,
+                checksum: file.checksum,
+                adopt,
+                imported,
+            });
+        }
+    }
+    Ok(Some(wanted))
+}
+
+/// The existing copy that `file` continues, if any. A path never changes, so
+/// a match keeps its path.
+///
+/// With primary naming the plain name belongs to a slot, not a rendition:
+/// when a photo is edited, the copy at the plain name takes the edit and the
+/// original gets a new `_original` copy; when the edit is reverted, the
+/// plain name takes the original again. A slot is matched first, then a
+/// copy of the same rendition planned before the slot existed.
+fn matching_row<'a>(
+    existing: &'a [FileRow],
+    claimed: &HashSet<i64>,
+    album: &str,
+    file: &ExpectedFile,
+) -> Option<&'a FileRow> {
+    let mut free = existing
+        .iter()
+        .filter(|row| row.album == album && !claimed.contains(&row.id));
+    if file.slot.is_empty() {
+        let candidates: Vec<&FileRow> =
+            free.filter(|row| row.rendition == file.rendition).collect();
+        return candidates
+            .iter()
+            .find(|row| row.slot.is_empty())
+            .or_else(|| candidates.first())
+            .copied();
+    }
+    let candidates: Vec<&FileRow> = free.by_ref().collect();
+    candidates
+        .iter()
+        .find(|row| row.slot == file.slot)
+        .or_else(|| {
+            candidates
+                .iter()
+                .find(|row| row.slot.is_empty() && row.rendition == file.rendition)
+        })
+        .copied()
+}
+
+/// A copy the previous engine recorded for this photo and rendition at the
+/// planned path or in the same folder, if its file is still there unchanged
+/// in size.
+async fn carried_over(
+    state: &State,
+    directory: &Path,
+    zone: &str,
+    ids: [&str; 2],
+    rendition: &str,
+    relative: &str,
+    taken: &HashSet<String>,
+) -> anyhow::Result<Option<ImportedCopy>> {
+    let Some(copy) = state.imported_copy(zone, ids, rendition, relative).await? else {
+        return Ok(None);
+    };
+    if taken.contains(&copy.path) {
+        return Ok(None);
+    }
+    Ok(
+        match tokio::fs::symlink_metadata(directory.join(&copy.path)).await {
+            Ok(meta) if meta.is_file() && meta.len() == copy.size => Some(copy),
+            _ => None,
+        },
+    )
+}
+
+/// Pick a free path for a new copy: the derived path, then the asset's
+/// identity suffix, then numbered suffixes. A file already at a candidate
+/// with the expected size is adopted; anything else there is left alone.
+/// What a planned file needs when its preferred path is taken.
+struct Collision<'a> {
+    size: u64,
+    asset_id: &'a str,
+    /// Try `<stem>-<size><ext>` first, as icloudpd and earlier kei did.
+    size_suffix: bool,
+}
+
+/// Under the default file-match policy a colliding photo or video gets its
+/// size appended first, matching icloudpd and earlier kei. Live Photo
+/// videos, and the `name-id7` policy, go straight to the asset ID.
+fn size_suffix_first(config: &CoreConfig, rendition: &str) -> bool {
+    config.paths.file_match_policy == crate::types::FileMatchPolicy::NameSizeDedupWithSuffix
+        && !rendition.starts_with("live_")
+}
+
+async fn choose_path(
+    state: &State,
+    directory: &Path,
+    relative: &str,
+    collision: Collision<'_>,
+    taken: &HashSet<String>,
+) -> anyhow::Result<(String, bool)> {
+    let Collision {
+        size,
+        asset_id,
+        size_suffix,
+    } = collision;
+    let candidates = std::iter::once(relative.to_owned())
+        .chain(size_suffix.then(|| paths::insert_suffix(relative, &size.to_string())))
+        .chain(std::iter::once(paths::insert_asset_identity_suffix(
+            relative, asset_id,
+        )))
+        .chain((2..=MAX_ORDINAL).map(|ordinal| {
+            paths::insert_asset_identity_ordinal_suffix(relative, asset_id, ordinal)
+        }));
+    for candidate in candidates {
+        // A path a carried-over copy still holds is that copy's, even when a
+        // file of this size is there: its own photo takes it over.
+        if taken.contains(&candidate)
+            || state.path_owner(&candidate).await?.is_some()
+            || state.imported_at(&candidate).await?
+        {
+            continue;
+        }
+        match tokio::fs::symlink_metadata(directory.join(&candidate)).await {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((candidate, false));
+            }
+            Err(error) => return Err(error.into()),
+            Ok(meta) if meta.is_file() && meta.len() == size => return Ok((candidate, true)),
+            Ok(_) => {}
+        }
+    }
+    anyhow::bail!("No free path for {relative}")
+}
+
+fn relative_path(directory: &Path, path: &Path) -> anyhow::Result<String> {
+    let relative = path.strip_prefix(directory).map_err(|_outside| {
+        anyhow::anyhow!(
+            "Planned path {} is outside the download directory",
+            path.display()
+        )
+    })?;
+    let parts = relative
+        .components()
+        .map(|part| match part {
+            std::path::Component::Normal(part) => part
+                .to_str()
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| anyhow::anyhow!("Planned path is not valid UTF-8")),
+            _ => Err(anyhow::anyhow!(
+                "Planned path {} is not a plain relative path",
+                path.display()
+            )),
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    anyhow::ensure!(!parts.is_empty(), "Planned path is empty");
+    Ok(parts.join("/"))
+}
+
+fn unfiled_config(config: &CoreConfig, zone: &str) -> PathDerivationConfig {
+    let mut placement = config.paths.clone();
+    let template = paths::expand_named_token(&placement.folder_structure, paths::TOKEN_ALBUM, None);
+    placement.folder_structure = with_library(&template, zone);
+    placement.library = zone.into();
+    placement.album_name = None;
+    placement
+}
+
+fn album_config(config: &CoreConfig, zone: &str, folder: &[String]) -> PathDerivationConfig {
+    let mut placement = config.paths.clone();
+    let template = paths::expand_album_components(&placement.folder_structure_albums, folder);
+    placement.folder_structure = with_library(&template, zone);
+    placement.library = zone.into();
+    placement.album_name = Some(folder.join("/").into());
+    placement
+}
+
+fn smart_config(config: &CoreConfig, zone: &str, name: &str) -> PathDerivationConfig {
+    let mut placement = config.paths.clone();
+    let template = paths::expand_named_token(
+        &placement.folder_structure_smart_folders,
+        paths::TOKEN_SMART_FOLDER,
+        Some(name),
+    );
+    placement.folder_structure = with_library(&template, zone);
+    placement.library = zone.into();
+    placement.album_name = Some(name.into());
+    placement
+}
+
+fn with_library(template: &str, zone: &str) -> String {
+    paths::expand_named_token(
+        template,
+        paths::TOKEN_LIBRARY,
+        Some(paths::truncate_library_zone(zone)),
+    )
+}
+
+/// Selected smart folders with their rules, in a stable order.
+fn selected_smart_folders(selector: &SmartFolderSelector) -> Vec<(String, SmartRule)> {
+    let sensitive: HashSet<&str> = sensitive_smart_folder_names().collect();
+    smart_folder_names()
+        .filter(|name| match selector {
+            SmartFolderSelector::None => false,
+            SmartFolderSelector::All {
+                include_sensitive,
+                excluded,
+            } => (*include_sensitive || !sensitive.contains(name)) && !excluded.contains(*name),
+            SmartFolderSelector::Named { included, excluded } => {
+                included.contains(*name) && !excluded.contains(*name)
+            }
+        })
+        .filter_map(|name| smart_rule(name).map(|rule| (name.to_owned(), rule)))
+        .collect()
+}
+
+/// Smart folders whose members must be fetched from iCloud each cycle.
+pub(crate) fn queried_smart_folders(selector: &SmartFolderSelector) -> Vec<String> {
+    selected_smart_folders(selector)
+        .into_iter()
+        .filter(|(_, rule)| *rule == SmartRule::Queried)
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// Album rows with their resolved selection, keyed by `(zone, album)`.
+struct Albums {
+    rows: HashMap<(String, String), AlbumRow>,
+    selected: HashSet<(String, String)>,
+}
+
+impl Albums {
+    fn new(rows: Vec<AlbumRow>, selector: &AlbumSelector) -> Self {
+        let rows: HashMap<_, _> = rows
+            .into_iter()
+            .map(|row| ((row.zone.clone(), row.name.clone()), row))
+            .collect();
+        let selected = rows
+            .iter()
+            .filter(|(_, row)| !row.deleted && !row.is_folder)
+            .filter(|(key, _)| {
+                components(&rows, key).is_some_and(|components| selects(selector, &components))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        Self { rows, selected }
+    }
+
+    /// The album has a fixed folder, or a name for it and every parent.
+    fn resolved(&self, zone: &str, album: &str) -> bool {
+        self.folder(zone, album).is_some()
+    }
+
+    /// Live albums whose name or parent iCloud has not reported.
+    fn unresolved(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|(key, row)| {
+                !row.deleted
+                    && !row.is_folder
+                    && row.folder.is_none()
+                    && components(&self.rows, key).is_none()
+            })
+            .count()
+    }
+
+    fn selected(&self, zone: &str, album: &str) -> bool {
+        self.selected.contains(&(zone.to_owned(), album.to_owned()))
+    }
+
+    /// The album's fixed folder, or its current components if none is fixed yet.
+    fn folder(&self, zone: &str, album: &str) -> Option<Vec<String>> {
+        let key = (zone.to_owned(), album.to_owned());
+        let row = self.rows.get(&key)?;
+        row.folder.clone().or_else(|| components(&self.rows, &key))
+    }
+}
+
+/// Every live album's current path, such as `Travel/Paris`, by zone.
+pub(crate) fn album_paths(rows: Vec<AlbumRow>) -> Vec<(String, String)> {
+    let rows: HashMap<_, _> = rows
+        .into_iter()
+        .map(|row| ((row.zone.clone(), row.name.clone()), row))
+        .collect();
+    let mut out: Vec<(String, String)> = rows
+        .iter()
+        .filter(|(_, row)| !row.deleted && !row.is_folder)
+        .filter_map(|(key, row)| {
+            components(&rows, key).map(|components| (row.zone.clone(), components.join("/")))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Current names from the top folder down to the album.
+fn components(
+    rows: &HashMap<(String, String), AlbumRow>,
+    key: &(String, String),
+) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    let mut current = rows.get(key)?;
+    loop {
+        out.push(current.title.clone()?);
+        match &current.parent {
+            None => break,
+            Some(parent) => current = rows.get(&(current.zone.clone(), parent.clone()))?,
+        }
+        if out.len() > 32 {
+            return None;
+        }
+    }
+    out.reverse();
+    Some(out)
+}
+
+fn selects(selector: &AlbumSelector, components: &[String]) -> bool {
+    let matches = |name: &String| {
+        if name.contains('/') {
+            components.join("/") == *name
+        } else {
+            components.last() == Some(name)
+        }
+    };
+    match selector {
+        AlbumSelector::None => false,
+        AlbumSelector::All { excluded } => !excluded.iter().any(matches),
+        AlbumSelector::Named { included, excluded } => {
+            included.iter().any(matches) && !excluded.iter().any(matches)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(name: &str, title: &str, parent: Option<&str>) -> AlbumRow {
+        AlbumRow {
+            zone: "Z".into(),
+            name: name.into(),
+            parent: parent.map(Into::into),
+            title: Some(title.into()),
+            is_folder: false,
+            deleted: false,
+            folder: None,
+        }
+    }
+
+    #[test]
+    fn selection_matches_leaf_names_and_full_paths() {
+        let mut folder = row("F", "Travel", None);
+        folder.is_folder = true;
+        let rows = vec![folder, row("A", "Paris", Some("F")), row("B", "Home", None)];
+        let all = Albums::new(rows.clone(), &AlbumSelector::default());
+        assert!(all.selected("Z", "A") && all.selected("Z", "B") && !all.selected("Z", "F"));
+        assert_eq!(
+            all.folder("Z", "A").unwrap(),
+            vec!["Travel".to_owned(), "Paris".to_owned()]
+        );
+
+        let named = AlbumSelector::Named {
+            included: ["Travel/Paris".to_owned()].into(),
+            excluded: Default::default(),
+        };
+        let named = Albums::new(rows.clone(), &named);
+        assert!(named.selected("Z", "A") && !named.selected("Z", "B"));
+
+        let excluded = AlbumSelector::All {
+            excluded: ["Home".to_owned()].into(),
+        };
+        assert!(!Albums::new(rows, &excluded).selected("Z", "B"));
+    }
+
+    #[test]
+    fn fixed_folders_survive_renames() {
+        let mut album = row("A", "Renamed", None);
+        album.folder = Some(vec!["Original".into()]);
+        let albums = Albums::new(vec![album], &AlbumSelector::default());
+        assert_eq!(
+            albums.folder("Z", "A").unwrap(),
+            vec!["Original".to_owned()]
+        );
+    }
+
+    #[test]
+    fn smart_selection_keeps_sensitive_folders_opt_in() {
+        let names = |selector| {
+            selected_smart_folders(&selector)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>()
+        };
+        let all = names(SmartFolderSelector::All {
+            include_sensitive: false,
+            excluded: Default::default(),
+        });
+        assert!(all.contains(&"Favorites".to_owned()) && !all.contains(&"Hidden".to_owned()));
+        let sensitive = names(SmartFolderSelector::All {
+            include_sensitive: true,
+            excluded: ["Videos".to_owned()].into(),
+        });
+        assert!(
+            sensitive.contains(&"Hidden".to_owned()) && !sensitive.contains(&"Videos".to_owned())
+        );
+        assert!(names(SmartFolderSelector::None).is_empty());
+        assert_eq!(
+            queried_smart_folders(&SmartFolderSelector::Named {
+                included: ["Screenshots".to_owned(), "Favorites".to_owned()].into(),
+                excluded: Default::default(),
+            }),
+            ["Screenshots"]
+        );
+    }
+
+    #[test]
+    fn relative_paths_reject_escapes() {
+        let dir = Path::new("/photos");
+        assert_eq!(
+            relative_path(dir, Path::new("/photos/2024/a.jpg")).unwrap(),
+            "2024/a.jpg"
+        );
+        assert!(relative_path(dir, Path::new("/elsewhere/a.jpg")).is_err());
+    }
+}

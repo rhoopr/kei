@@ -49,7 +49,8 @@ use predicates::prelude::*;
 use tempfile::tempdir;
 
 const FIXTURE_TIMEOUT_SECS: u64 = 1800; // Large media can need more time than metadata-only scans.
-const IMPORT_TIMEOUT_SECS: u64 = 300; // 5m: import-existing scans, no downloads
+// Import runs a cycle that lists the whole library on fresh state.
+const IMPORT_TIMEOUT_SECS: u64 = 1800;
 
 /// Copy auth artifacts (cookie file + .session + .cache) from `src`
 /// into `dst`, deliberately skipping `.db` and `.lock` files. A state
@@ -147,8 +148,8 @@ fn fixture() -> &'static (PathBuf, PathBuf) {
             .env("KEI_DATA_DIR", &data_dir)
             .args([
                 "sync",
-                "--password",
-                &password,
+                "--password-file",
+                &common::password_file(&password),
                 "--config",
                 config_path.to_str().unwrap(),
                 "--no-progress-bar",
@@ -241,8 +242,8 @@ fn import_cmd(
     }
     cmd.args([
         "import-existing",
-        "--password",
-        password,
+        "--password-file",
+        &common::password_file(password),
         "--no-progress-bar",
     ]);
     // import-existing takes its scan cap from the CLI, not filters.recent.
@@ -634,8 +635,8 @@ fn import_recent_limit_caps_scan() {
             .env("KEI_DATA_DIR", test_data.path())
             .args([
                 "import-existing",
-                "--password",
-                &password,
+                "--password-file",
+                &common::password_file(&password),
                 "--config",
                 toml_path.to_str().unwrap(),
                 "--no-progress-bar",
@@ -872,8 +873,8 @@ keep_unicode_in_filenames = false
             .env("KEI_DATA_DIR", test_data.path());
         cmd.args([
             "import-existing",
-            "--password",
-            &password,
+            "--password-file",
+            &common::password_file(&password),
             "--config",
             toml_path.to_str().unwrap(),
             "--no-progress-bar",
@@ -974,8 +975,8 @@ fn run_sync_against_fixture(
         .env("KEI_DATA_DIR", data_dir);
     cmd.args([
         "sync",
-        "--password",
-        password,
+        "--password-file",
+        &common::password_file(password),
         "--config",
         config_path.to_str().unwrap(),
         "--no-progress-bar",
@@ -1231,8 +1232,8 @@ fn toml_invalid_file_match_policy_errors_loudly() {
             .env("KEI_DATA_DIR", test_data.path());
         cmd.args([
             "import-existing",
-            "--password",
-            &password,
+            "--password-file",
+            &common::password_file(&password),
             "--config",
             toml_path.to_str().unwrap(),
             "--no-progress-bar",
@@ -1285,8 +1286,8 @@ fn import_sigint_then_rerun_is_idempotent() {
                 "--config",
                 config_path.to_str().unwrap(),
                 "import-existing",
-                "--password",
-                &password,
+                "--password-file",
+                &common::password_file(&password),
                 "--recent",
                 &recent,
                 "--no-progress-bar",
@@ -1389,8 +1390,8 @@ fn two_concurrent_imports_do_not_both_succeed_silently() {
                     "--config",
                     config_path.to_str().unwrap(),
                     "import-existing",
-                    "--password",
-                    &password,
+                    "--password-file",
+                    &common::password_file(&password),
                     "--recent",
                     &recent,
                     "--no-progress-bar",

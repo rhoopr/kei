@@ -43,17 +43,6 @@ pub fn line_to_stderr(mode: Mode, text: &str) {
     crate::personality::active_bar::println_above_bars(text);
 }
 
-/// Pre-cycle greeting. One line, fired once per process before the first
-/// sync cycle runs.
-pub fn greet_to_stderr(mode: Mode, watch_mode: bool) {
-    let text = if watch_mode {
-        "Watching iCloud for new photos."
-    } else {
-        "Checking iCloud for new photos."
-    };
-    line_to_stderr(mode, text);
-}
-
 /// Post-auth narration: confirms the account that just authenticated.
 /// Scrollback-stable: a `✓` checkmark prefix marks each phase boundary so the
 /// run reads as a sequence of completed steps once the bar clears.
@@ -82,13 +71,6 @@ pub fn stop_signal_to_stderr(mode: Mode) {
         mode,
         "Stopping. Finishing in-flight downloads. Press Ctrl+C again to exit immediately.",
     );
-}
-
-/// Final line on a graceful Ctrl+C exit, after in-flight downloads drain.
-/// Off mode is silent; the existing `tracing::info!` "Shutdown..." lines
-/// already serve journal consumers.
-pub fn farewell_to_stderr(mode: Mode) {
-    line_to_stderr(mode, FAREWELL_LINE);
 }
 
 /// Pre-sleep narration before a retry. The existing `tracing::warn!` in
@@ -122,7 +104,6 @@ pub fn two_fa_prompt_to_stderr(mode: Mode) {
     line_to_stderr(mode, TWO_FA_PROMPT_LINE);
 }
 
-const FAREWELL_LINE: &str = "Stopped.";
 const BACK_ON_TRACK_LINE: &str = "Back on track.";
 const GIVING_UP_LINE: &str = "Skipping this item; it will retry on the next sync.";
 const TWO_FA_PROMPT_LINE: &str =
@@ -281,11 +262,5 @@ mod tests {
             render_retry_pause(Duration::from_secs(0)),
             "Retrying after iCloud error in 1s.",
         );
-    }
-
-    #[test]
-    fn farewell_line_is_stable_text() {
-        // Pin the user-visible string so accidental rewording goes through review.
-        assert_eq!(FAREWELL_LINE, "Stopped.");
     }
 }

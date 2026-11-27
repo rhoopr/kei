@@ -140,7 +140,8 @@ fn support_export_is_readonly_with_old_schema_and_malicious_inputs() {
     assert!(!text.contains("private-"), "{text}");
     let bundle: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(bundle["schema_version"], 1);
-    assert_eq!(bundle["state"]["status"], "older_schema");
+    // A previous release's file waits for the next sync to upgrade it.
+    assert_eq!(bundle["state"]["status"], "upgrade_pending");
     assert_eq!(bundle["state"]["migration_performed"], false);
     assert_eq!(bundle["health"]["counters"]["consecutive_failures"], 4);
     // Existing output is never replaced, including a state/media path.
@@ -191,7 +192,7 @@ fn support_export_never_opens_live_wal_or_creates_sqlite_companions() {
     let data = root.path().join("data");
     std::fs::create_dir(&data).unwrap();
     let username = "private-user@example.invalid";
-    let path = data.join(format!("{}.db", sanitize_username(username)));
+    let path = data.join(format!("{}.sync.db", sanitize_username(username)));
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.pragma_update(None, "journal_mode", "WAL").unwrap();
     conn.execute_batch(
@@ -222,7 +223,7 @@ fn support_export_never_opens_live_wal_or_creates_sqlite_companions() {
 }
 
 #[test]
-fn support_export_retains_storage_and_migration_summary_when_sqlite_is_unavailable() {
+fn support_export_retains_history_summary_when_sqlite_is_unavailable() {
     let root = tempfile::tempdir().unwrap();
     let data = root.path().join("data");
     std::fs::create_dir(&data).unwrap();
@@ -233,7 +234,7 @@ fn support_export_retains_storage_and_migration_summary_when_sqlite_is_unavailab
         format!("[auth]\nusername={}", crate::common::toml_string(username)),
     )
     .unwrap();
-    let path = data.join(format!("{}.db", sanitize_username(username)));
+    let path = data.join(format!("{}.sync.db", sanitize_username(username)));
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.pragma_update(None, "journal_mode", "WAL").unwrap();
     conn.execute_batch(
@@ -309,16 +310,8 @@ fn support_export_retains_storage_and_migration_summary_when_sqlite_is_unavailab
     assert_eq!(bundle["state"]["status"], "live_wal_snapshot_unavailable");
     assert_eq!(bundle["history"]["status"], "available");
     let cycle = &bundle["history"]["data"]["cycles"][0];
-    assert_eq!(cycle["storage_reuse"]["catalogue"]["single_item_limit"], 1);
-    assert_eq!(
-        cycle["storage_reuse"]["catalogue"]["last_reason"],
-        "single_item_limit"
-    );
-    assert_eq!(cycle["storage_reuse"]["selection"]["last_observed_used"], 7);
-    assert_eq!(
-        cycle["storage_reuse"]["selection"]["last_observed_limit"],
-        9
-    );
+    // Retired storage counters from earlier releases are dropped on read.
+    assert!(cycle.get("storage_reuse").is_none());
     assert_eq!(
         cycle["transport_compaction"]["invalid_canonical_or_member"],
         2
@@ -370,13 +363,30 @@ fn support_history_survives_a_real_process_restart_without_new_sync() {
 }
 
 #[test]
-fn support_export_current_owned_state_is_bounded_and_wrong_owner_degrades() {
+fn support_export_current_owned_state_reports_counts_and_wrong_owner_degrades() {
     let root = tempfile::tempdir().unwrap();
     let data = root.path().join("data");
     std::fs::create_dir(&data).unwrap();
     let username = "private-user@example.invalid";
-    let conn = super::support::create_state_db(&data, username);
-    conn.execute_batch("WITH RECURSIVE n(value) AS (SELECT 1 UNION ALL SELECT value+1 FROM n WHERE value<10005) INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,last_seen_at,status) SELECT 'PRIVATE_ZONE',CAST(value AS TEXT),'original','PRIVATE_CHECKSUM','PRIVATE_FILE',1,1,'photo',1,CASE WHEN value=1 THEN 'failed' ELSE 'pending' END FROM n").unwrap();
+    let path = data.join(format!("{}.sync.db", sanitize_username(username)));
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    // The columns the summary reads, as the sync core's state file has them.
+    conn.execute_batch(
+        "PRAGMA user_version = 1;
+         CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         CREATE TABLE zones (zone TEXT PRIMARY KEY, position TEXT, listed INTEGER NOT NULL);
+         CREATE TABLE files (path TEXT, state TEXT NOT NULL, wanted INTEGER NOT NULL);
+         CREATE TABLE imported (path TEXT);
+         INSERT INTO zones VALUES ('PRIVATE_ZONE', 'PRIVATE_POSITION', 1);
+         WITH RECURSIVE n(value) AS (SELECT 1 UNION ALL SELECT value+1 FROM n WHERE value<10005)
+         INSERT INTO files SELECT 'PRIVATE_FILE' || value, CASE WHEN value=1 THEN 'failed' ELSE 'pending' END, 1 FROM n;",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO kv VALUES ('account_key', ?1)",
+        [sanitize_username(username)],
+    )
+    .unwrap();
     drop(conn);
     let config = root.path().join("config.toml");
     std::fs::write(
@@ -400,13 +410,12 @@ fn support_export_current_owned_state_is_bounded_and_wrong_owner_degrades() {
     assert!(!text.contains("PRIVATE_"));
     let bundle: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(bundle["state"]["status"], "available");
-    assert_eq!(bundle["state"]["complete"], false);
-    assert_eq!(bundle["state"]["observed_asset_rows"], 10001);
-    assert_eq!(bundle["state"]["omitted_rows"], "unknown");
-    let path = data.join(format!("{}.db", sanitize_username(username)));
-    let conn = rusqlite::Connection::open(path).unwrap();
+    assert_eq!(bundle["state"]["copies_owed"], 10004);
+    assert_eq!(bundle["state"]["copies_failed"], 1);
+    assert_eq!(bundle["state"]["zones_listed"], 1);
+    let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute(
-        "UPDATE account_owner SET account_key='private-wrong-account'",
+        "UPDATE kv SET value='private-wrong-account' WHERE key='account_key'",
         [],
     )
     .unwrap();
@@ -426,7 +435,7 @@ fn support_export_current_owned_state_is_bounded_and_wrong_owner_degrades() {
         bundle["state"]["status"],
         "account_owner_unavailable_or_mismatched"
     );
-    assert!(bundle["state"].get("status_counts").is_none());
+    assert!(bundle["state"].get("copies_owed").is_none());
 }
 
 #[test]

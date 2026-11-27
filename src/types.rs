@@ -99,16 +99,6 @@ pub enum LivePhotoResolution {
     Thumb = 2,
 }
 
-impl LivePhotoResolution {
-    pub const fn to_asset_version_size(self) -> AssetVersionSize {
-        match self {
-            Self::Original => AssetVersionSize::LiveOriginal,
-            Self::Medium => AssetVersionSize::LiveMedium,
-            Self::Thumb => AssetVersionSize::LiveThumb,
-        }
-    }
-}
-
 impl From<LivePhotoSize> for LivePhotoResolution {
     fn from(value: LivePhotoSize) -> Self {
         match value.to_asset_version_size() {

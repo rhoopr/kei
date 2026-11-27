@@ -1,6 +1,6 @@
 # Unsafe usage audit
 
-Audit date: 2026-08-24.
+Audit date: 2026-11-27.
 
 This file lists each `unsafe` block or expression in repo-owned production
 Rust source. Test modules, `tests/`, plain-text mentions of "unsafe", Cargo
@@ -24,36 +24,8 @@ The Linux sidecar receipt regression uses a one-byte shared mapping of its priva
 | `src/download/file/platform.rs::rename_exchange_blocking` (macOS) | `libc::renamex_np(..., RENAME_SWAP)` in `rename_exchange_blocking`. | Atomically exchanges a verified `.part` file with the exact file approved by truncated-repair planning or the preservation-backed layout owner. Both paths are owned `CString`s and remain valid for the call. | No safe `std` equivalent for an atomic path exchange. A direct safe wrapper could move the FFI out of kei. A sequence of ordinary renames would add a crash window. |
 | `src/fs_util.rs::move_file_no_replace_blocking` (Windows) | Windows `MoveFileExW(..., MOVEFILE_WRITE_THROUGH)` in `move_file_no_replace_blocking`. | Promotes media staging files and private migration-backup directories without replacement or cross-volume copy fallback. The lossless UTF-16 paths are absolute, NUL-terminated and live for the call, with extended drive or UNC namespaces for ordinary paths. | Not cleanly removable with `std` while preserving native write-through behavior. This is the Windows publication contract, not a claim of POSIX directory-fsync equivalence or physical power-loss survival. |
 | `src/download/file/platform.rs::replace_file_with_backup_blocking` (Windows) | Windows `ReplaceFileW(..., REPLACEFILE_WRITE_THROUGH)` in `replace_file_with_backup_blocking`. | Atomically replaces an explicitly authorized truncated file and moves its old bytes to a distinct backup path for post-exchange verification or restoration. Every lossless UTF-16 path is absolute, NUL-terminated and valid for the call, with extended drive or UNC namespaces for ordinary paths. | No safe `std` equivalent provides atomic replacement with a backup. A safe Windows wrapper could move the FFI out of kei, but ordinary remove and rename calls would weaken crash and race safety. |
-| `src/fs_util.rs::ConfinedRegularFile::remove` (Unix) | `libc::unlinkat(...)` removes the verified name relative to the retained parent directory descriptor. | The descriptor and NUL-terminated name remain live for the call. Descriptor-relative removal prevents an ancestor rename and symlink swap from redirecting deletion outside the download root. | No safe `std` equivalent removes a name relative to an open directory. A direct `rustix` dependency could provide a safe wrapper. Replacing this with `std::fs::remove_file` would restore the race. |
-| `src/fs_util.rs::ConfinedPath::remove_verified` (Unix) | `unlinkat` retires a temporary bundle member or its empty directory. | The retained parent descriptor and NUL-terminated leaf are live. The entry identity must match; `AT_REMOVEDIR` cannot remove a nonempty directory. | No safe `std` API removes an entry relative to a retained parent descriptor. |
-| `src/fs_util.rs::delete_windows_handle` (Windows) | `SetFileInformationByHandle(..., FileDispositionInfo, ...)` marks the verified file or empty directory handle for deletion. | `ConfinedRegularFile::remove` and `ConfinedPath::remove_verified` supply a live handle with delete access. The disposition value has the required layout and size. Deletion stays bound to the opened object if an ancestor changes. | No safe `std` API deletes by an existing file handle. A safe Windows wrapper could move the FFI out of kei. Path-based removal would restore the race. |
-| `src/fs_util.rs::open_confined_regular_file_platform` (Unix) | `OwnedFd::from_raw_fd(...)` takes ownership of each successful `open` or `openat` result. | A nonnegative descriptor from the kernel is newly owned and is transferred exactly once. `OwnedFd` closes it on every return path. | A safe descriptor-relative filesystem crate could own this conversion. `std` does not expose `openat`. |
-| `src/fs_util.rs::open_confined_regular_file_platform` (Unix) | `libc::open(..., O_DIRECTORY | O_NOFOLLOW)` opens the configured root. | The path is NUL-terminated and remains live for the call. The flags require a real directory and reject a final symlink. | A direct `rustix` dependency could provide a safe wrapper. Opening by ordinary path later would not protect removal. |
-| `src/fs_util.rs::open_confined_regular_file_platform` (Unix) | `libc::openat(..., O_DIRECTORY | O_NOFOLLOW)` opens each descendant directory from the retained parent descriptor. | Both the descriptor and NUL-terminated component remain live. Each successful handle fixes the next lookup beneath the verified directory. | A direct `rustix` dependency could provide a safe wrapper. Rechecking with `symlink_metadata` would leave a race before deletion. |
-| `src/fs_util.rs::open_confined_regular_file_platform` (Unix) | `libc::fstatat(..., AT_SYMLINK_NOFOLLOW)` inspects the final directory entry. | The parent descriptor, NUL-terminated name, and output storage remain valid. The no-follow flag inspects a final symlink instead of its target. | A direct `rustix` dependency could provide a safe wrapper. `std` cannot inspect relative to an open directory. |
-| `src/fs_util.rs::open_confined_regular_file_platform` (Unix) | `MaybeUninit::assume_init()` reads the successful `fstatat` result. | The value is read only after `fstatat` returns success, which initializes the complete `libc::stat` structure. | A safe syscall wrapper would return an initialized value and remove this expression. |
-| `src/fs_util.rs::open_confined_regular_file_platform` (Windows) | `GetFileInformationByHandle(...)` reads attributes for the opened root and file. | The handle remains live and the output pointer references storage with the exact Windows structure layout. | A safe Windows wrapper could return the initialized handle information. `std` does not expose reparse attributes for these handles. |
-| `src/fs_util.rs::open_confined_regular_file_platform` (Windows) | `MaybeUninit::assume_init()` reads the successful handle-information result. | The value is read only after `GetFileInformationByHandle` returns success and initializes the full structure. | A safe Windows wrapper would return an initialized value and remove this expression. |
-| `src/fs_util.rs::open_confined_regular_file_platform` (Windows) | `GetFinalPathNameByHandleW(...)` resolves each retained handle for an exact destination comparison. | The handle and UTF-16 output buffer remain live. The supplied length matches the writable buffer. The call repeats if the buffer is too small. | A safe Windows wrapper could return the final path. A lexical path check alone would not detect an ancestor reparse-point swap. |
 | `src/download/metadata.rs::exif_datetime_to_iso` | `String::as_bytes_mut()` in `exif_datetime_to_iso`. | Mutates three delimiter bytes in an owned `String`. The length and delimiter checks prove the byte positions exist, and the replacement bytes are ASCII, so UTF-8 stays valid. | Removable. Build a `Vec<u8>` from `s.as_bytes()`, mutate the vector with safe indexing after the same length checks, and convert with `String::from_utf8`. A formatting-based rewrite would also work. |
-| `src/personality/tty_echo.rs::EchoGuard::install` | `std::mem::zeroed::<termios>()` before `tcgetattr` in `EchoGuard::install`. | Prepares a `termios` output buffer. `tcgetattr` fills it before fields are read. | Removable by switching the module to safe termios bindings, for example a direct `rustix` dependency with the `termios` feature. That would also remove the related `tcgetattr` and `tcsetattr` unsafe calls. |
-| `src/personality/tty_echo.rs::EchoGuard::install` | `tcgetattr(STDIN_FILENO, &mut t)` in `EchoGuard::install`. | Reads terminal flags from stdin into a valid `termios` pointer. Failure returns `None`. | Removable with safe termios bindings such as `rustix::termios::tcgetattr(std::io::stdin())`. |
-| `src/personality/tty_echo.rs::EchoGuard::install` | `tcsetattr(STDIN_FILENO, TCSANOW, &t)` in `EchoGuard::install`. | Writes the modified terminal flags back to stdin. The input pointer is valid for the call. | Removable with safe termios bindings such as `rustix::termios::tcsetattr`. |
-| `src/personality/tty_echo.rs::EchoGuard::restore_now` | `std::mem::zeroed::<termios>()` before restore-time `tcgetattr`. | Prepares a `termios` output buffer during terminal restore. | Removable with the same safe termios rewrite as `src/personality/tty_echo.rs::EchoGuard::install`. |
-| `src/personality/tty_echo.rs::EchoGuard::restore_now` | `tcgetattr(STDIN_FILENO, &mut t)` in `restore_now`. | Reads the current terminal flags so only the saved local flags are restored. Failure is ignored because shutdown recovery is best-effort. | Removable with the same safe termios rewrite as `src/personality/tty_echo.rs::EchoGuard::install`. |
-| `src/personality/tty_echo.rs::EchoGuard::restore_now` | `tcsetattr(STDIN_FILENO, TCSANOW, &t)` in `restore_now`. | Restores the saved terminal flags. Failure is ignored because the next shell prompt normally resets tty state. | Removable with the same safe termios rewrite as `src/personality/tty_echo.rs::EchoGuard::install`. |
 | `src/service/env.rs::effective_uid` | `libc::geteuid()` in `effective_uid`. | Centralizes effective-UID lookup for Unix service backends. `geteuid` is stateless and has no pointer or aliasing preconditions. | Removable by adding a direct safe wrapper dependency, for example `rustix::process::geteuid` or `nix::unistd::geteuid`. This is a good cleanup target because tests duplicate this same unsafe call. |
-
-## Windows migration-backup privacy
-
-- `src/state/db/migration_backup/windows.rs::current_user_sid` calls `GetCurrentProcess` and `OpenProcessToken` with writable handle output. The borrowed pseudo-handle is never closed. A successful token handle transfers once into `OwnedHandle`.
-- `GetTokenInformation` first obtains the required length, then writes into bounded `usize` storage with the alignment required by `TOKEN_USER`. The token and storage stay live through SID conversion. The structure is read only after a successful call.
-- `ConvertSidToStringSidA` receives the SID from that live token buffer. Its successful output is a NUL-terminated ASCII SID string. `CStr::from_ptr` reads it while its `LocalAllocation` owner remains live. SID text is never logged.
-- `descriptor` passes a live NUL-terminated SDDL string to `ConvertStringSecurityDescriptorToSecurityDescriptorW`. The returned self-relative descriptor owns its SID data and stays live throughout each creation call. Its protected DACL grants only the process user's SID, with inheritance for SQLite companions.
-- `LocalAllocation::drop` calls `LocalFree` once for each API allocation. Null is permitted. The wrapper is neither cloned nor transferred to another allocator.
-- `create_private_dir` calls `GetVolumeInformationByHandleW` on a live non-reparse directory handle with writable flag output. Optional output pointers are null with zero lengths. Storage without persistent ACL support is refused before sensitive bytes are written.
-- `CreateDirectoryW` and `CreateFileW(CREATE_NEW)` receive live native paths and creation-time security attributes. Existing names are refused. No permissive creation precedes ACL application. Each successful file handle transfers once into `File`; invalid handles never do.
-- The shared write-through move runs after staged file contents are flushed and handles are closed. A retained directory identity is checked after publication. Partial directories and failed publications remain evidence, not completed backups.
 
 ## Reconciliation leaf checks
 
@@ -61,26 +33,18 @@ The Linux sidecar receipt regression uses a one-byte shared mapping of its priva
   write into correctly sized storage. The live handle outlasts each call;
   `assume_init` runs only after success. The result pins comparisons to the
   opened file. Safe `std` has no equivalent stable Windows file-ID API.
-- `src/download/file/platform.rs::rename_confined_macos` (macOS):
-  `renameatx_np` receives retained descriptors, NUL-terminated names, and
-  `RENAME_EXCL`. The kernel
-  rejects an existing destination atomically. An existence check followed by
-  ordinary rename would not preserve no-overwrite publication.
 
 ## Reconciliation ancestor checks
 
 - `src/fs_util.rs::openat_owned` transfers each successful syscall descriptor
   into one `OwnedFd`. The retained directory and NUL-terminated name remain
   live; the variadic mode has the promoted C integer type required on macOS.
-- `ConfinedPath::create_new_directory` uses `mkdirat` with its live retained parent descriptor and NUL-terminated leaf. It never replaces an entry; directory identity and parent durability are checked before ownership is stored.
-- `ConfinedPath::entry_identity` uses `fstatat(AT_SYMLINK_NOFOLLOW)` against a live retained parent and NUL-terminated leaf. Its writable `libc::stat` storage is read with `assume_init` only after success. Namespace validation brackets the lookup; a user symlink is identified without opening its target.
 - `ConfinedPath::open_platform` uses `mkdirat` beneath retained directories,
   then opens each component with `O_DIRECTORY | O_NOFOLLOW`. Every created
   directory's parent is synced before traversal continues.
 - `ConfinedPath::entry_exists` uses `fstatat` with `AT_SYMLINK_NOFOLLOW` and
   reads its output only after success. It never follows a replaced leaf.
-- `src/download/file/platform.rs::renameat2_confined_blocking`,
-  `rename_confined_macos`, and `hard_link_confined` retain both parent
+- `src/download/file/platform.rs::hard_link_confined` retains both parent
   descriptors and NUL-terminated names for no-overwrite publication.
 - `src/fs_util.rs::windows_file_information` and Windows attribute probes use
   live handles and correctly sized output storage. Initialization is assumed

@@ -464,7 +464,7 @@ fn ensure_session(username: &str, password: &str, cookie_dir: &Path) {
         let output = assert_cmd::cargo_bin_cmd!("kei")
             .env("ICLOUD_USERNAME", username)
             .env("KEI_DATA_DIR", cookie_dir)
-            .args(["login", "--password", password])
+            .args(["login", "--password-file", &password_file(password)])
             .timeout(std::time::Duration::from_secs(90))
             .output()
             .expect("failed to run login session validation");
@@ -522,7 +522,7 @@ fn refresh_auth() {
     let output = assert_cmd::cargo_bin_cmd!("kei")
         .env("ICLOUD_USERNAME", username)
         .env("KEI_DATA_DIR", cookie_dir)
-        .args(["login", "--password", password])
+        .args(["login", "--password-file", &password_file(password)])
         .timeout(std::time::Duration::from_secs(90))
         .output()
         .expect("failed to run login");
@@ -735,6 +735,40 @@ pub fn walkdir(dir: &Path) -> Vec<PathBuf> {
     }
     files.sort();
     files
+}
+
+/// A private file holding `password`, for `--password-file`. A password
+/// passed as an argument appears in the command line `assert_cmd` prints
+/// whenever a command fails; the file's path is safe to print.
+#[allow(dead_code)]
+pub fn password_file(password: &str) -> String {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static FILES: OnceLock<Mutex<(tempfile::TempDir, HashMap<String, String>)>> = OnceLock::new();
+    let files = FILES.get_or_init(|| {
+        Mutex::new((
+            tempfile::tempdir().expect("password file directory"),
+            HashMap::new(),
+        ))
+    });
+    let mut guard = files
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (dir, paths) = &mut *guard;
+    if let Some(path) = paths.get(password) {
+        return path.clone();
+    }
+    let path = dir.path().join(format!("password-{}", paths.len()));
+    std::fs::write(&path, password).expect("write password file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("restrict password file");
+    }
+    let path = path.to_string_lossy().into_owned();
+    paths.insert(password.to_owned(), path.clone());
+    path
 }
 
 /// Quote a string for the simple TOML snippets live tests write at runtime.

@@ -6,8 +6,7 @@
 use crate::cli;
 use crate::config;
 use crate::service::status::{render_oneline, service_state};
-use crate::state;
-use crate::state::AssetRecord;
+use crate::sync_core::state::{Completeness, FileState};
 
 use super::{LISTING_CAP, print_truncation_tail};
 
@@ -19,354 +18,165 @@ pub(crate) async fn run_status(
 ) -> anyhow::Result<()> {
     print_service_section().await;
 
-    let db_path = super::super::get_db_path(globals, toml).await?;
-
-    if !db_path.exists() {
-        println!("No state database found at {}", db_path.display());
+    let (location, state) = super::core_state(globals, toml).await?;
+    let Some(state) = state else {
+        println!("No state database found at {}", location.current.display());
         println!("Run a sync first to create the database.");
         return Ok(());
-    }
+    };
+    let completeness = state.completeness().await?;
+    let carried_over = state.list_imported().await?;
 
-    let db = state::SqliteStateDb::open_owned_with_config(
-        &db_path,
-        &super::super::get_account_owner(globals, toml),
-        &globals.config_source,
-    )
-    .await?;
-    let summary = db.get_summary().await?;
-
-    println!("State Database: {}", db_path.display());
+    println!("State Database: {}", location.current.display());
     println!();
-    println!("Assets:");
-    println!("  Total:      {}", summary.total_assets);
-    println!("  Downloaded: {}", summary.downloaded);
-    println!("  Pending:    {}", summary.pending);
-    println!("  Policy excluded: {}", summary.policy_excluded);
-    println!("  Failed:     {}", summary.failed);
-    println!("  Source deleted: {}", summary.source_deleted);
-    let trusted = db.stored_trusted_legacy_file_count().await?;
-    if trusted > 0 {
+    println!("Backup:");
+    println!("  Saved:            {}", completeness.done);
+    println!("  Owed:             {}", completeness.pending);
+    println!("  Failed:           {}", completeness.failed);
+    println!(
+        "  Locally modified: {} (kept; kei never overwrites a file you changed)",
+        completeness.modified
+    );
+    if !carried_over.is_empty() {
         println!(
-            "  Stored historical local-trust declarations: {trusted} (not provider verification)"
+            "  Carried over:     {} (from the previous state; taken over by the next sync)",
+            carried_over.len()
         );
     }
-
-    println!(
-        "  Awaiting provider verification: {}",
-        summary.awaiting_provider_verification
-    );
-    println!();
-    println!(
-        "Provider checkpoint: {}",
-        summary
-            .provider_checkpoint_status
-            .as_deref()
-            .unwrap_or("unavailable")
-    );
-    if let Some(reason) = &summary.last_full_enumeration_reason {
-        println!("Last full-enumeration reason: {reason}");
-    }
-    if let Some(action) = summary
-        .last_recovery_action
-        .as_deref()
-        .filter(|action| *action != "none")
-    {
-        println!("Last recovery action: {action}");
-        if action == "repair_retained_checkpoint_evidence" {
-            println!(
-                "  Retained recovery evidence is malformed or unsupported. Provider work is paused. Preserve the state database and media and restore validated recovery evidence before resuming."
-            );
-        } else if action == "retained_checkpoint_retry_exhausted" {
-            println!(
-                "  Automatic retained-checkpoint recovery exhausted. Active source/configuration and historical work remain retained. Preserve the state database and media while obtaining authoritative retained-history evidence."
-            );
-        } else if action == "await_retained_checkpoint_evidence" {
-            println!(
-                "  Retained cursor rejected. Recovery makes at most three automatic attempts, at least one hour apart; exhausted holds require authoritative retained-history evidence. Preserve the state database and media. Fresh inventory alone cannot resolve this hold."
-            );
-        }
-    }
-    if summary.unresolved_sparse_records > 0 {
+    let zones = state.zones().await?;
+    if !zones.is_empty() {
         println!();
-        println!(
-            "Sparse identity recovery: {} unresolved, {} deferred until retry",
-            summary.unresolved_sparse_records, summary.deferred_sparse_records
-        );
-    }
-    let archived = db.archived_sparse_reference_count().await?;
-    if archived > 0 {
-        println!(
-            "Archived sparse references: {archived} (preserved at upgrade; not active retries)"
-        );
-    }
-    if !summary.metadata_capture.is_empty() {
-        println!("Metadata capture:");
-        for capture in &summary.metadata_capture {
-            if capture.unattributed_legacy_assets > 0 {
-                println!(
-                    "  {}: preserved legacy records with unknown attribution: {}; legacy records without a stored coverage certificate: {}. Certification is retired; this is not pending sync work.",
-                    capture.library,
-                    capture.unattributed_legacy_assets,
-                    capture.unattributed_legacy_pending
-                );
-            }
-            if let Some(pending) = capture.pending_revision {
-                println!(
-                    "  {}: revision {} -> {}; {} processed, {} failed, {} remaining",
-                    capture.library,
-                    capture.active_revision,
-                    pending,
-                    capture.processed_assets,
-                    capture.failed_assets,
-                    capture.remaining_assets
-                );
-                if capture.unresolved_assets > 0 {
-                    println!(
-                        "    {} unresolved identities, {} deferred retries",
-                        capture.unresolved_assets, capture.deferred_assets
-                    );
-                }
-                if let Some(error) = &capture.last_error {
-                    println!("    Last error: {error}");
-                }
+        println!("Libraries:");
+        for zone in &zones {
+            let position = if zone.listed && zone.has_position {
+                "caught up; the next sync reads only changes"
+            } else if zone.has_position {
+                "listing in progress; the next sync resumes it"
             } else {
+                "the next sync lists the whole library"
+            };
+            println!("  {}: {position}", zone.zone);
+        }
+    }
+    println!();
+    let last = state.last_run().await?;
+    if let Some(run) = &last {
+        let time = |seconds: i64| {
+            chrono::DateTime::from_timestamp(seconds, 0).map_or_else(
+                || "unknown".to_owned(),
+                |time| time.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+            )
+        };
+        match run.finished_at {
+            None => println!("Sync in progress:   started {}", time(run.started_at)),
+            Some(finished) => {
+                println!("Last sync started:   {}", time(run.started_at));
                 println!(
-                    "  {}: revision {} current",
-                    capture.library, capture.active_revision
+                    "Last sync finished:  {} ({}; {} downloaded, {} failed)",
+                    time(finished),
+                    run.outcome.as_deref().unwrap_or("unknown"),
+                    run.downloaded,
+                    run.failed
                 );
             }
         }
     }
-    if let Some(primary) = &summary.primary_layout {
-        println!(
-            "Managed primary: {} bound families; {} independently preserved files; {} pending operations ({} held)",
-            primary.bound_families,
-            primary.preserved_files,
-            primary.pending_operations,
-            primary.held_operations
-        );
-        println!("  Preserved files are local copies, separate from sync network downloads.");
-    }
-    println!("{}", backup_status_line(&summary));
-    println!();
+    println!("{}", backup_line(last.as_ref(), completeness));
 
-    if let Some(started) = &summary.active_sync_started {
-        println!(
-            "Sync in progress:   started {}",
-            started.format("%Y-%m-%d %H:%M:%S UTC")
-        );
-    } else if let Some(started) = &summary.last_sync_started {
-        println!(
-            "Last sync started:   {}",
-            started.format("%Y-%m-%d %H:%M:%S UTC")
-        );
-    }
-    if summary.active_sync_started.is_none()
-        && let Some(completed) = &summary.last_sync_completed
-    {
-        println!(
-            "Last sync completed: {}",
-            completed.format("%Y-%m-%d %H:%M:%S UTC")
-        );
-    }
-    if !summary.active_enumeration_zones.is_empty() {
-        println!(
-            "Full enumeration in progress: {}",
-            summary.active_enumeration_zones.join(", ")
-        );
-    }
-    if let Some(api_total) = summary.last_api_total_at_start {
-        if summary.last_api_total_at_start_partial {
-            println!("Last API total at start: partial, {api_total}");
-        } else {
-            println!("Last API total at start: {api_total}");
+    let sections: [(bool, &str, &[FileState]); 3] = [
+        (args.failed, "Failed assets:", &[FileState::Failed]),
+        (
+            args.pending,
+            "Pending assets:",
+            &[FileState::Pending, FileState::Adopt],
+        ),
+        (args.downloaded, "Downloaded assets:", &[FileState::Done]),
+    ];
+    for (wanted, heading, states) in sections {
+        if !wanted {
+            continue;
         }
-    }
-    if summary.last_inventory_drop_detected {
-        let library = summary
-            .last_inventory_drop_library
-            .as_deref()
-            .unwrap_or("unknown library");
-        if let (Some(previous), Some(current)) = (
-            summary.last_inventory_drop_previous_total,
-            summary.last_inventory_drop_current_total,
-        ) {
-            let drop = previous.saturating_sub(current);
-            println!(
-                "Inventory warning: {library} dropped {drop} assets since the previous comparable full run ({previous} -> {current})"
+        let mut files = state.list_files(states).await?;
+        files.retain(|file| file.wanted);
+        let mut lines: Vec<String> = files
+            .iter()
+            .map(|file| match &file.last_error {
+                Some(error) if states.contains(&FileState::Failed) => {
+                    format!("  {} - {error}", file.path)
+                }
+                _ => format!("  {}", file.path),
+            })
+            .collect();
+        if states.contains(&FileState::Done) {
+            lines.extend(
+                carried_over
+                    .iter()
+                    .map(|copy| format!("  {} (carried over)", copy.path)),
             );
-        } else {
-            println!("Inventory warning: {library} dropped below the previous comparable full run");
         }
-    }
-
-    if args.failed && summary.failed > 0 {
+        if lines.is_empty() {
+            continue;
+        }
         println!();
-        println!("Failed assets:");
-        let printed = paginate_print(&db, Section::Failed).await?;
-        print_truncation_tail(summary_count_to_usize(summary.failed), printed);
+        println!("{heading}");
+        for line in lines.iter().take(LISTING_CAP) {
+            println!("{line}");
+        }
+        print_truncation_tail(lines.len(), lines.len().min(LISTING_CAP));
     }
-
-    if args.pending && summary.pending > 0 {
-        println!();
-        println!("Pending assets:");
-        let printed = paginate_print(&db, Section::Pending).await?;
-        print_truncation_tail(summary_count_to_usize(summary.pending), printed);
-    }
-
-    if args.downloaded && summary.downloaded > 0 {
-        println!();
-        println!("Downloaded assets:");
-        let printed = paginate_print(&db, Section::Downloaded).await?;
-        print_truncation_tail(summary_count_to_usize(summary.downloaded), printed);
-    }
-
     Ok(())
 }
 
-const BACKUP_RECORD_SCOPE: &str = "Scope: recorded local state only; this does not establish iCloud completeness or verify local media checksums.";
-
-pub(crate) fn backup_status_line(summary: &state::types::SyncSummary) -> String {
-    if summary.active_sync_started.is_some() {
+/// One line saying whether the recorded backup is complete.
+fn backup_line(
+    last: Option<&crate::sync_core::state::RunRow>,
+    completeness: Completeness,
+) -> String {
+    let Some(last) = last else {
+        return backup_record("no sync has completed yet");
+    };
+    if last.finished_at.is_none() {
         return backup_record("sync is currently in progress");
     }
-
-    if summary.last_sync_started.is_none() {
-        return backup_record("no sync has completed yet");
-    }
-
     let mut reasons = Vec::new();
-    if summary
-        .last_recovery_action
-        .as_deref()
-        .is_some_and(|action| {
-            matches!(
-                action,
-                "await_retained_checkpoint_evidence"
-                    | "retained_checkpoint_retry_exhausted"
-                    | "repair_retained_checkpoint_evidence"
-            )
-        })
-    {
-        reasons.push(
-            "retained provider history is unavailable; recovery evidence is required".to_owned(),
-        );
+    match last.outcome.as_deref() {
+        Some("complete") => {}
+        Some("interrupted") => reasons.push("last sync was interrupted".to_owned()),
+        Some(other) => reasons.push(format!("last sync status is {other}")),
+        None => reasons.push("last sync did not record completion".to_owned()),
     }
-    if summary.unresolved_identity_zones > 0 {
-        reasons.push(format!(
-            "unresolved asset identity in {}; checkpoint replay is required",
-            count_phrase(summary.unresolved_identity_zones, "provider zone")
-        ));
-    }
-
-    if summary.last_sync_interrupted
-        || summary
-            .last_sync_status
-            .as_deref()
-            .is_some_and(|status| status == "interrupted")
-    {
-        reasons.push("last sync was interrupted".to_string());
-    } else if summary
-        .last_sync_status
-        .as_deref()
-        .is_some_and(|status| status != "complete")
-        && let Some(status) = &summary.last_sync_status
-    {
-        reasons.push(format!("last sync status is {status}"));
-    }
-    if summary.last_sync_completed.is_none() {
-        reasons.push("last sync did not record completion".to_string());
-    }
-    if summary.last_sync_assets_failed > 0 {
-        reasons.push(format!(
-            "{} failed in the last sync",
-            count_phrase(summary.last_sync_assets_failed, "asset")
-        ));
-    }
-    if summary.last_sync_enumeration_errors > 0 {
-        reasons.push(format!(
-            "{} occurred in the last sync",
-            count_phrase(summary.last_sync_enumeration_errors, "enumeration error")
-        ));
-    }
-    if summary.failed > 0 {
+    if completeness.failed > 0 {
         reasons.push(format!(
             "{} {}",
-            count_phrase(summary.failed, "failed asset"),
-            remain_verb(summary.failed)
+            count_phrase(completeness.failed, "failed copy", "failed copies"),
+            remain_verb(completeness.failed)
         ));
     }
-    if summary.pending > 0 {
+    if completeness.pending > 0 {
         reasons.push(format!(
             "{} {}",
-            count_phrase(summary.pending, "pending asset"),
-            remain_verb(summary.pending)
+            count_phrase(completeness.pending, "owed copy", "owed copies"),
+            remain_verb(completeness.pending)
         ));
     }
-    if summary.awaiting_provider_verification > 0 {
-        reasons.push(format!(
-            "{} awaiting provider verification",
-            count_phrase(summary.awaiting_provider_verification, "asset")
-        ));
-    }
-    let unattributed: u64 = summary
-        .metadata_capture
-        .iter()
-        .map(|capture| capture.unattributed_legacy_assets)
-        .sum();
-    if unattributed > 0 {
-        reasons.push(format!(
-            "{unattributed} preserved legacy records need attribution"
-        ));
-    }
-    let metadata_capture_remaining: u64 = summary
-        .metadata_capture
-        .iter()
-        .map(|capture| capture.remaining_assets)
-        .sum();
-    if metadata_capture_remaining > 0 {
-        reasons.push(format!(
-            "{} metadata capture {}",
-            count_phrase(metadata_capture_remaining, "asset"),
-            remain_verb(metadata_capture_remaining)
-        ));
-    }
-    let metadata_capture_failures: u64 = summary
-        .metadata_capture
-        .iter()
-        .map(|capture| capture.failed_assets)
-        .sum();
-    if metadata_capture_failures > 0 {
-        reasons.push(format!(
-            "{} metadata capture failure{} recorded",
-            metadata_capture_failures,
-            if metadata_capture_failures == 1 {
-                ""
-            } else {
-                "s"
-            }
-        ));
-    }
-    if summary.last_inventory_drop_detected {
-        reasons.push("inventory warning is active".to_string());
-    }
-
     if reasons.is_empty() {
-        backup_record("last sync completed and no pending or failed assets are recorded")
+        backup_record("last sync completed and no owed or failed copies are recorded")
     } else {
         backup_record(&reasons.join("; "))
     }
 }
 
+const BACKUP_RECORD_SCOPE: &str = "Scope: recorded local state only; this does not establish iCloud completeness or verify local media checksums.";
+
 fn backup_record(headline: &str) -> String {
     format!("Backup record: {headline}\n  {BACKUP_RECORD_SCOPE}")
 }
 
-fn count_phrase(count: u64, singular: &str) -> String {
+fn count_phrase(count: u64, singular: &str, plural: &str) -> String {
     if count == 1 {
         format!("1 {singular}")
     } else {
-        format!("{count} {singular}s")
+        format!("{count} {plural}")
     }
 }
 
@@ -390,92 +200,4 @@ async fn print_service_section() {
     };
     println!("{}", render_oneline(&state));
     println!();
-}
-
-/// Which `kei status` listing is being paginated. Picks the state-DB page
-/// fetcher and the per-row print fn.
-#[derive(Clone, Copy)]
-enum Section {
-    Failed,
-    Pending,
-    Downloaded,
-}
-
-/// Stream a status listing through the state-DB pagination primitive,
-/// printing up to [`LISTING_CAP`] rows. Returns the number of rows printed
-/// so the caller can decide whether to emit the "... and N more" tail.
-///
-/// The page size is smaller than `LISTING_CAP` so pagination is exercised
-/// before the cap kicks in; post-cap rows are skipped via an early break,
-/// not by narrowing the SQL query.
-async fn paginate_print(db: &state::SqliteStateDb, section: Section) -> anyhow::Result<usize> {
-    let page_size: u32 = 100;
-    let mut offset: u64 = 0;
-    let mut printed: usize = 0;
-    'outer: loop {
-        let page = match section {
-            Section::Failed => db.get_failed_page(offset, page_size).await?,
-            Section::Pending => db.get_pending_page(offset, page_size).await?,
-            Section::Downloaded => db.get_downloaded_page(offset, page_size).await?,
-        };
-        if page.is_empty() {
-            break;
-        }
-        for asset in &page {
-            if printed >= LISTING_CAP {
-                break 'outer;
-            }
-            match section {
-                Section::Failed => print_failed(asset),
-                Section::Pending => print_pending(asset),
-                Section::Downloaded => print_downloaded(asset),
-            }
-            printed += 1;
-        }
-        offset += page.len() as u64;
-    }
-    Ok(printed)
-}
-
-/// Convert a `summary.{failed,pending,downloaded}` count (u64 from SQLite
-/// `COUNT(*)`) to `usize` for `print_truncation_tail`. Counts are well under
-/// `u32::MAX` on any supported target, so the cast is lossless.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "asset counts from SQLite; cap-to-usize is safe on supported targets"
-)]
-fn summary_count_to_usize(count: u64) -> usize {
-    count as usize
-}
-
-fn print_failed(asset: &AssetRecord) {
-    let last_seen = asset.last_seen_at.format("%Y-%m-%d %H:%M:%S");
-    println!(
-        "  {} ({}) - {} (attempts: {}, last seen: {})",
-        asset.filename,
-        asset.id,
-        asset.last_error.as_deref().unwrap_or("unknown error"),
-        asset.download_attempts,
-        last_seen
-    );
-}
-
-fn print_pending(asset: &AssetRecord) {
-    let last_seen = asset.last_seen_at.format("%Y-%m-%d %H:%M:%S");
-    println!(
-        "  {} ({}) - attempts: {}, last seen: {}",
-        asset.filename, asset.id, asset.download_attempts, last_seen
-    );
-}
-
-fn print_downloaded(asset: &AssetRecord) {
-    // status='downloaded' rows are written with local_path by mark_downloaded,
-    // so a missing path here means a state-DB invariant violation (manual
-    // edit, partial migration, upsert after mark_downloaded without path).
-    // Surface it clearly rather than hiding it.
-    let local = asset.local_path.as_ref().map_or_else(
-        || "<MISSING local_path>".to_string(),
-        |p| p.display().to_string(),
-    );
-    println!("  {} ({}) -> {}", asset.filename, asset.id, local);
 }
