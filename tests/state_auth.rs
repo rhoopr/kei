@@ -1,7 +1,7 @@
 //! State-management tests that require network credentials (live iCloud API).
 //!
-//! Exercises status, reset state, verify, import-existing, and retry-failed
-//! against real iCloud data. Live tests are `#[ignore]`; shared helper tests
+//! Exercises status, reset state, verify, import-existing, and automatic
+//! retry against real iCloud data. Live tests are `#[ignore]`; shared helper tests
 //! run offline without `--ignored`. Run the live tests with:
 //!
 //! ```sh
@@ -182,10 +182,9 @@ fn status_after_sync_shows_counts() {
             .success()
             .stdout(
                 predicate::str::contains("State Database:")
-                    .and(predicate::str::contains("Assets:"))
-                    .and(predicate::str::contains("Total:"))
-                    .and(predicate::str::contains("Downloaded:"))
-                    .and(predicate::str::contains("Pending:"))
+                    .and(predicate::str::contains("Backup:"))
+                    .and(predicate::str::contains("Saved:"))
+                    .and(predicate::str::contains("Owed:"))
                     .and(predicate::str::contains("Failed:"))
                     .and(predicate::str::contains("Last sync started:")),
             );
@@ -273,12 +272,6 @@ fn verify_after_sync_reports_results() {
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
-        // Clear stale DB entries from prior test runs (may not exist yet)
-        let _ = reset_state_cmd(&username, &cookie_dir)
-            .arg("--yes")
-            .timeout(std::time::Duration::from_secs(TIMEOUT_CMD))
-            .assert();
-
         sync_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
@@ -304,12 +297,6 @@ fn verify_checksums_after_sync() {
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
-        // Clear stale DB entries from prior test runs (may not exist yet)
-        let _ = reset_state_cmd(&username, &cookie_dir)
-            .arg("--yes")
-            .timeout(std::time::Duration::from_secs(TIMEOUT_CMD))
-            .assert();
-
         sync_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
@@ -331,12 +318,6 @@ fn verify_detects_missing_files() {
 
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
-
-        // Clear stale DB entries from prior test runs (may not exist yet)
-        let _ = reset_state_cmd(&username, &cookie_dir)
-            .arg("--yes")
-            .timeout(std::time::Duration::from_secs(TIMEOUT_CMD))
-            .assert();
 
         sync_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
@@ -371,12 +352,6 @@ fn verify_checksums_detects_corruption() {
 
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
-
-        // Clear stale DB entries from prior test runs (may not exist yet)
-        let _ = reset_state_cmd(&username, &cookie_dir)
-            .arg("--yes")
-            .timeout(std::time::Duration::from_secs(TIMEOUT_CMD))
-            .assert();
 
         sync_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
@@ -449,24 +424,26 @@ fn import_existing_matches_synced_files() {
         let files = common::walkdir(download_dir.path());
         assert!(!files.is_empty(), "expected files from sync");
 
-        reset_state_cmd(&username, &cookie_dir)
-            .arg("--yes")
-            .timeout(std::time::Duration::from_secs(TIMEOUT_CMD))
-            .assert()
-            .success();
-
-        import_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .args(["--recent", "5"])
+        // Import into another copy of the listed state, so the files are
+        // found on disk rather than in the sync's records.
+        let import_data = common::listed_data_dir(&username, &cookie_dir);
+        import_cmd(&username, &password, &import_data, download_dir.path())
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
             .success()
-            .stdout(predicate::str::contains("Import complete:"));
+            .stdout(predicate::str::contains(format!(
+                "Adopted {} existing local files.",
+                files.len()
+            )));
 
-        status_cmd(&username, &cookie_dir)
+        status_cmd(&username, &import_data)
             .timeout(std::time::Duration::from_secs(TIMEOUT_CMD))
             .assert()
             .success()
-            .stdout(predicate::str::contains("Downloaded:"));
+            .stdout(predicate::str::contains(format!(
+                "Saved:            {}",
+                files.len()
+            )));
     });
 }
 
@@ -479,15 +456,12 @@ fn import_existing_empty_directory_reports_zero_matches() {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
         import_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .args(["--recent", "5"])
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
             .success()
             .stdout(
-                predicate::str::contains("Import complete:")
-                    .and(predicate::str::contains("Total assets scanned:"))
-                    .and(predicate::str::contains("Files matched:"))
-                    .and(predicate::str::contains("Unmatched versions:")),
+                predicate::str::contains("Adopted 0 existing local files.")
+                    .and(predicate::str::contains("Copies with no local file yet:")),
             );
     });
 }
@@ -524,33 +498,29 @@ fn import_existing_custom_folder_structure() {
         let files = common::walkdir(download_dir.path());
         assert!(!files.is_empty(), "expected files from sync");
 
-        reset_state_cmd(&username, &cookie_dir)
-            .arg("--yes")
-            .timeout(std::time::Duration::from_secs(TIMEOUT_CMD))
-            .assert()
-            .success();
-
+        let import_data = common::listed_data_dir(&username, &cookie_dir);
         let import_config = import_config(
-            &cookie_dir,
+            &import_data,
             download_dir.path(),
             "folder_structure = \"%Y\"\n",
         );
         common::cmd()
             .env("ICLOUD_USERNAME", &username)
-            .env("KEI_DATA_DIR", &cookie_dir)
+            .env("KEI_DATA_DIR", &import_data)
             .args([
                 "--config",
                 import_config.to_str().unwrap(),
                 "import-existing",
                 "--password-file",
                 &common::password_file(&password),
-                "--recent",
-                "5",
             ])
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
             .success()
-            .stdout(predicate::str::contains("Import complete:"));
+            .stdout(predicate::str::contains(format!(
+                "Adopted {} existing local files.",
+                files.len()
+            )));
     });
 }
 
@@ -579,10 +549,9 @@ fn normal_sync_after_successful_sync_does_not_download_again() {
             .success();
 
         let stderr = String::from_utf8_lossy(&assertion.get_output().stderr);
-        assert!(
-            stderr.contains("No new photos to download")
-                || stderr.contains("All incremental assets already downloaded")
-                || stderr.contains("0 downloaded"),
+        assert_eq!(
+            common::synced(&stderr, "downloaded"),
+            Some(0),
             "ordinary sync must not redownload completed files: {stderr}"
         );
         assert_eq!(common::walkdir(download_dir.path()).len(), files.len());
@@ -706,10 +675,15 @@ fn reset_sync_token_forces_full_enumeration() {
             .output()
             .unwrap();
         assert!(output.status.success());
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = common::strip_ansi(&String::from_utf8_lossy(&output.stderr));
         assert!(
-            stderr.contains("full enumeration") || stderr.contains("No sync token found"),
-            "after reset, sync should do full enumeration, stderr: {stderr}"
+            stderr.contains("Listing the whole library"),
+            "after reset, sync should list the whole library, stderr: {stderr}"
+        );
+        assert_eq!(
+            common::synced(&stderr, "downloaded"),
+            Some(0),
+            "listing again must not download saved copies again: {stderr}"
         );
     });
 }

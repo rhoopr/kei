@@ -49,13 +49,13 @@ fn state_machine_quiet_greps_do_not_sigpipe() {
             line.strip_suffix("; then").unwrap_or(line).to_owned()
         })
         .collect();
-    assert_eq!(predicates.len(), 8, "quiet search lines: {predicates:#?}");
+    assert_eq!(predicates.len(), 10, "quiet search lines: {predicates:#?}");
 
     let matching = concat!(
-        "date_bounded_full_enumeration Fetching full enumeration fallback ",
-        "No new photos Completed Existing session token is valid ",
-        "accountLogin succeeded Session validated recently, skipping /validate call ",
-        "Authenticating SRP",
+        "Listing the whole library iCloud rejected the saved sync position MISSING: / ",
+        "1 missing files will be downloaded again Dry run: no files or state were changed ",
+        "Existing session token is valid accountLogin succeeded ",
+        "Session validated recently, skipping /validate call Authenticating SRP",
     );
     let mut large_matching = String::from(matching);
     large_matching.push('\n');
@@ -2197,12 +2197,16 @@ fn live_import_smoke_uses_toml_directory() {
     let smokes = repo_file("scripts/full-test/run_live_smokes.sh");
 
     assert!(
-        smokes.contains("import-existing --dry-run --recent 5 --config \"$sync_config\""),
+        smokes.contains("import-existing --dry-run --config \"$sync_config\""),
         "import-existing live smoke must pass the generated TOML config"
     );
     assert!(
-        !smokes.contains("import-existing --dry-run --recent 5 --download-dir"),
-        "import-existing live smoke must not use the removed --download-dir flag"
+        !smokes.contains("--recent") && !smokes.contains("--download-dir"),
+        "import-existing live smoke must not use removed import flags"
+    );
+    assert!(
+        smokes.contains("kei_seed_listed_state \"$DD\"") && !smokes.contains(".test-cookies}"),
+        "live smokes must run in a scratch data dir with a listed catalog, never the shared session dir"
     );
     assert!(
         smokes.contains(r#"${TMPDIR:-/tmp/codex/kei/full-test/tmp}/photos-test"#),
@@ -2213,46 +2217,33 @@ fn live_import_smoke_uses_toml_directory() {
 #[test]
 fn live_import_rehearsal_uses_shared_bounded_selection() {
     let rehearsal = repo_file("scripts/full-test/run_live_import_rehearsal.sh");
-    assert!(rehearsal.contains("recent=$(kei_live_recent)"));
-    #[cfg(unix)]
-    {
-        let output = Command::new("bash")
-            .args([
-                "-c",
-                r#"source "$PROJECT_DIR/tests/shell/lib.sh"; kei_live_recent"#,
-            ])
-            .env("PROJECT_DIR", env!("CARGO_MANIFEST_DIR"))
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        let selection: toml::Table = repo_file("tests/data/live-selection.toml").parse().unwrap();
-        assert_eq!(
-            String::from_utf8(output.stdout).unwrap().trim(),
-            selection["import_sample"]["recent"]
-                .as_integer()
-                .unwrap()
-                .to_string()
-        );
-    }
-
     assert!(
         rehearsal.contains("sync --no-progress-bar --config")
             && rehearsal.contains("kei_live_filters"),
         "live import rehearsal must seed from the shared single-pass selection"
     );
     assert!(
+        rehearsal.contains("kei_preflight_selection")
+            && rehearsal.contains("kei_seed_listed_state \"$data\""),
+        "seed and import state must both start from the listed catalog"
+    );
+    assert!(
         rehearsal.contains("set +e\n    \"$@\" >\"$out\" 2>\"$err\"\n    local rc=$?\n    set -e"),
         "live import rehearsal must print command tails before propagating a failed command"
     );
+    for command in [
+        "import-existing --dry-run --no-progress-bar --config \"$import_config\"",
+        "import-existing --no-progress-bar --config \"$import_config\"",
+        "sync --no-progress-bar --config \"$import_config\"",
+    ] {
+        assert!(
+            rehearsal.contains(command),
+            "missing rehearsal step: {command}"
+        );
+    }
     assert!(
-        rehearsal.contains(
-            "import-existing --dry-run --force-empty --recent \"$recent\" --no-progress-bar"
-        ),
-        "live import rehearsal dry-run should keep import-existing bounded to the same recent count"
-    );
-    assert!(
-        rehearsal.contains("import-existing --force-empty --recent \"$recent\" --no-progress-bar"),
-        "live import rehearsal real import should keep import-existing bounded to the same recent count"
+        !rehearsal.contains("--recent"),
+        "import plans the whole selection; it takes no sample count"
     );
 }
 
@@ -2267,107 +2258,155 @@ fn live_import_rehearsal_validates_known_receipts_and_repeat_counts() {
         .split_once("\nPY")
         .unwrap()
         .0;
-    for (case, seed_count, matched, unmatched, hash_errors, error) in [
-        ("healthy", 1, 1, 9, 0, ""),
-        ("complete", 10, 10, 0, 0, ""),
-        ("capacity", 11, 10, 0, 0, "seed fixture exceeds"),
-        ("no_match", 1, 0, 10, 0, "import must match"),
-        ("identity", 1, 1, 9, 0, "independent seed receipts"),
-        ("checksum", 1, 1, 9, 0, "independent seed receipts"),
-        ("path", 1, 1, 9, 0, "independent seed receipts"),
-        ("duplicate", 1, 1, 9, 0, "duplicate asset receipt identity"),
+    for (case, error) in [
+        ("healthy", ""),
+        ("empty_seed", "seed sync recorded no saved copies"),
+        ("dry_miss", "dry run must find every seed file"),
+        ("refused", "no seed path may hold another file"),
+        ("real_short", "import must adopt every seed file"),
+        ("repeat_new", "repeat must find them recorded"),
+        ("planned_changed", "the planned copies changed"),
+        ("dry_write", "dry run changed the import state"),
+        ("repeat_rows", "repeat dry run changed the import state"),
+        ("identity", "import receipts must equal the seed's"),
+        ("checksum", "import receipts must equal the seed's"),
+        ("path", "import receipts must equal the seed's"),
         (
-            "hash_error",
-            1,
-            1,
-            9,
-            1,
-            "import must match without hash errors",
+            "sync_download",
+            "sync after import must neither download nor adopt",
         ),
-        ("repeat_counts", 1, 1, 9, 0, "summaries differ"),
-        ("known_missing", 2, 1, 9, 0, "known seed receipt missing"),
-        ("dry_write", 1, 1, 9, 0, "dry-run wrote asset rows"),
         (
-            "repeat_rows",
-            1,
-            1,
-            9,
-            0,
-            "repeat dry-run changed asset receipts",
+            "sync_adopt",
+            "sync after import must neither download nor adopt",
         ),
-        ("over_cap", 1, 1, 9, 0, "scan exceeded"),
-        ("zero_cap", 1, 1, 9, 0, "sample cap must be positive"),
+        ("no_sync_line", "logged no downloaded count"),
+        ("no_summary", "printed no matched count"),
     ] {
         let root = tempfile::tempdir().unwrap();
-        let seed = root.path().join("seed");
-        let import = root.path().join("import");
-        let mut import_rows = Vec::new();
-        for (directory, count) in [(&seed, seed_count), (&import, matched)] {
+        let (seed, import, work) = (
+            root.path().join("seed"),
+            root.path().join("import"),
+            root.path().join("work"),
+        );
+        let seed_count = if case == "empty_seed" { 0 } else { 2 };
+        for directory in [&seed, &import] {
             std::fs::create_dir(directory).unwrap();
-            let connection = rusqlite::Connection::open(directory.join("fixture.db")).unwrap();
-            connection.execute_batch("CREATE TABLE assets(library TEXT,id TEXT,version_size TEXT,checksum TEXT,local_path TEXT,status TEXT)").unwrap();
-            for index in 0..count {
-                let mut row = vec![
+            let connection = rusqlite::Connection::open(directory.join("account.sync.db")).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE files(zone TEXT, asset TEXT, rendition TEXT, album TEXT,
+                         path TEXT, sha256 TEXT, state TEXT, wanted INTEGER)",
+                )
+                .unwrap();
+            for index in 0..seed_count {
+                let mut row = [
                     "PrimarySync".to_owned(),
-                    format!("fixture-{index}"),
+                    format!("asset-{index}"),
                     "original".to_owned(),
-                    "checksum".to_owned(),
-                    format!("/fixture/{index}.jpg"),
-                    "downloaded".to_owned(),
+                    String::new(),
+                    format!("2025/01/02/{index}.JPG"),
+                    format!("{index:064}"),
                 ];
                 if directory == &import {
                     match case {
-                        "identity" => row[1] = "foreign-fixture".to_owned(),
-                        "checksum" => row[3] = "wrong-checksum".to_owned(),
-                        "path" => row[4] = "/fixture/wrong.jpg".to_owned(),
+                        "identity" if index == 0 => row[1] = "foreign".to_owned(),
+                        "checksum" if index == 0 => row[5] = "f".repeat(64),
+                        "path" if index == 0 => row[4] = "2025/01/02/other.JPG".to_owned(),
                         _ => {}
                     }
-                    import_rows.push(row.clone());
                 }
                 connection
                     .execute(
-                        "INSERT INTO assets VALUES (?1,?2,?3,?4,?5,?6)",
+                        "INSERT INTO files VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'done', 1)",
                         rusqlite::params_from_iter(&row),
                     )
                     .unwrap();
             }
-            if directory == &import && case == "duplicate" {
-                connection
-                    .execute("INSERT INTO assets SELECT * FROM assets", [])
-                    .unwrap();
-                import_rows.extend(import_rows.clone());
-            }
         }
-        let dry_snapshot = root.path().join("dry.json");
-        std::fs::write(
-            &dry_snapshot,
-            if case == "dry_write" {
-                serde_json::to_vec(&import_rows).unwrap()
+        std::fs::create_dir(&work).unwrap();
+        let summary = |dry: bool, matched: u64, already: u64, missing: u64, refused: u64| {
+            let mut text = if dry {
+                format!(
+                    "Dry run: no state was written.\n  Local files that match a photo: {matched}\n  Already recorded:               {already}\n  Copies with no local file yet:  {missing}\n"
+                )
             } else {
-                b"[]".to_vec()
-            },
-        )
-        .unwrap();
-        if case == "repeat_rows" {
-            import_rows[0][3] = "before-checksum".to_owned();
+                format!(
+                    "Adopted {matched} existing local files.\n  Already recorded:              {already}\n  Copies with no local file yet: {missing} (run `kei sync` to download them)\n"
+                )
+            };
+            if refused > 0 {
+                text.push_str(&format!(
+                    "  Could not adopt:               {refused} (a different file is at the planned path)\n"
+                ));
+            }
+            text
+        };
+        let n = seed_count;
+        let outputs = [
+            (
+                "import-dry-run.out",
+                summary(true, if case == "dry_miss" { n - 1 } else { n }, 0, 5, 0),
+            ),
+            (
+                "import-real.out",
+                if case == "no_summary" {
+                    "Import finished.\n".to_owned()
+                } else {
+                    summary(
+                        false,
+                        if case == "real_short" { n - 1 } else { n },
+                        0,
+                        5,
+                        u64::from(case == "refused"),
+                    )
+                },
+            ),
+            (
+                "import-repeat-dry-run.out",
+                summary(
+                    true,
+                    u64::from(case == "repeat_new"),
+                    n,
+                    if case == "planned_changed" { 6 } else { 5 },
+                    0,
+                ),
+            ),
+        ];
+        for (name, text) in outputs {
+            std::fs::write(work.join(name), text).unwrap();
         }
-        let real_snapshot = root.path().join("real.json");
-        std::fs::write(&real_snapshot, serde_json::to_vec(&import_rows).unwrap()).unwrap();
-        let reports: Vec<_> = (0..3).map(|index| {
-            let path = root.path().join(format!("{index}.out"));
-            let count = if index == 2 && case == "repeat_counts" { matched + 1 } else { matched };
-            let total = if case == "over_cap" { 11 } else { 10 };
-            std::fs::write(&path, format!("Total assets scanned: {total}\nFiles matched: {count}\nUnmatched versions: {unmatched}\nHash errors: {hash_errors}\n")).unwrap();
-            path
-        }).collect();
+        let sync = match case {
+            "no_sync_line" => "INFO kei::sync_core::runner: Backup status saved=2\n".to_owned(),
+            _ => format!(
+                "INFO kei::sync_core::runner: Library synced zone=PrimarySync pages=1 \x1b[3mdownloaded\x1b[0m\x1b[2m=\x1b[0m{} adopted={}\n",
+                u64::from(case == "sync_download"),
+                u64::from(case == "sync_adopt")
+            ),
+        };
+        std::fs::write(work.join("import-sync.err"), sync).unwrap();
+        for (name, rows) in [
+            ("before-import.json", "[]"),
+            (
+                "after-dry-run.json",
+                if case == "dry_write" { "[[1]]" } else { "[]" },
+            ),
+            ("after-real.json", "[[\"real\"]]"),
+            (
+                "after-repeat.json",
+                if case == "repeat_rows" {
+                    "[[\"other\"]]"
+                } else {
+                    "[[\"real\"]]"
+                },
+            ),
+        ] {
+            std::fs::write(work.join(name), rows).unwrap();
+        }
         let output = Command::new("python3")
             .args(["-c", validator])
             .arg(&seed)
             .arg(&import)
-            .arg(if case == "zero_cap" { "0" } else { "10" })
-            .arg(dry_snapshot)
-            .arg(real_snapshot)
-            .args(reports)
+            .arg(&work)
             .output()
             .unwrap();
         assert_eq!(
@@ -2407,12 +2446,13 @@ fn full_test_cross_zone_album_phase_is_opt_in_and_checks_source_zone() {
         "cross-zone fixture sync must include all visible libraries"
     );
     assert!(
-        script.contains("a.library <> 'PrimarySync'"),
+        script.contains("AND f.zone <> 'PrimarySync'"),
         "cross-zone fixture assertion must prove a non-primary source zone"
     );
     assert!(
-        script.contains("JOIN asset_albums aa"),
-        "cross-zone fixture assertion must be tied to the selected album membership"
+        script.contains("JOIN albums al ON al.name = f.album")
+            && script.contains("WHERE al.title = '$quoted_album'"),
+        "cross-zone fixture assertion must be tied to the selected album"
     );
     assert!(
         readme.contains("KEI_FULL_TEST_CROSS_ZONE_ALBUM"),
@@ -2537,55 +2577,52 @@ kei_copy_session_without_state() { printf 'session\n' >> "$CALLS"; }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn live_checkpoint_oracles_require_fixed_date_hold_or_complete_inventory() {
+fn live_state_machine_download_oracle_reads_each_library_summary() {
     let script = repo_file("tests/shell/state-machine.sh");
     let helper = script
-        .split_once("check_checkpoint() {")
+        .split_once("downloaded_is() {")
         .unwrap()
         .1
         .split_once("\n}")
         .unwrap()
         .0;
-    for (reason, token, success) in [
-        ("date_bounded_full_enumeration", "", true),
+    let line = |downloaded: &str| {
+        format!(
+            "INFO kei::sync_core::runner: Library synced zone=PrimarySync pages=1 \x1b[3mdownloaded\x1b[0m\x1b[2m=\x1b[0m{downloaded} adopted=0"
+        )
+    };
+    let two_libraries = format!("{}\n{}", line("1"), line("0"));
+    for (output, expected, success) in [
+        (line("0"), "0", true),
+        (line("1"), "0", false),
+        (line("1"), "1", true),
+        (two_libraries.clone(), "1", true),
+        (two_libraries, "0", false),
+        // Another line's count, or no summary at all, proves nothing.
         (
-            "date_bounded_full_enumeration",
-            "incorrect-new-token",
+            "INFO kei::sync_core::drain: Saved copies downloaded=0".to_owned(),
+            "0",
             false,
         ),
-        ("complete inventory", "saved-token", true),
-        ("complete inventory", "", false),
-        ("recent_limited_full_enumeration", "", false),
+        (String::new(), "0", false),
     ] {
         let command = format!(
-            "get_token() {{ printf '%s' \"$TOKEN\"; }}\nkei_check() {{ return $?; }}\ncheck_checkpoint() {{{helper}\n}}\ncheck_checkpoint"
+            "source \"$PROJECT_DIR/tests/shell/lib.sh\"\ndownloaded_is() {{{helper}\n}}\ndownloaded_is \"$EXPECTED\""
         );
-        let output = Command::new("bash")
+        let result = Command::new("bash")
             .args(["-c", &command])
-            .env("OUTPUT", reason)
-            .env("TOKEN", token)
+            .env("PROJECT_DIR", env!("CARGO_MANIFEST_DIR"))
+            .env("OUTPUT", &output)
+            .env("EXPECTED", expected)
             .output()
             .unwrap();
         assert_eq!(
-            output.status.success(),
+            result.status.success(),
             success,
-            "{reason}/{token}: {output:?}"
+            "{output:?} expecting {expected}: {}",
+            String::from_utf8_lossy(&result.stderr)
         );
     }
-    let sync = repo_file("tests/sync.rs");
-    let scenario = sync
-        .split_once("fn sync_bounded_second_run_preserves_checkpoint_and_skips_download()")
-        .unwrap()
-        .1
-        .split_once("\n#[test]")
-        .unwrap()
-        .0;
-    assert!(scenario.contains("date_bounded_full_enumeration"));
-    assert!(!scenario.contains("recent_limited_full_enumeration"));
-    assert!(
-        scenario.contains("token().is_none()")
-            && scenario.contains("second run must report no new downloads")
-    );
 }
 
 #[cfg(target_os = "linux")]
@@ -3044,14 +3081,28 @@ fn live_selection_guard_rejects_retired_album_consumers() {
 #[cfg(target_os = "linux")]
 #[test]
 fn live_shell_preflight_rejects_empty_selection() {
-    let dir = tempfile::tempdir().unwrap();
-    let binary = dir.path().join("kei");
-    let captured = dir.path().join("config.toml");
     for (output, success) in [("", false), ("controlled.JPG", true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("kei");
+        let listing = dir.path().join("listing.toml");
+        let captured = dir.path().join("config.toml");
+        // The listing sync creates state; the preview prints the selection.
         write_executable(
             &binary,
-            &format!("#!/bin/sh\ncp \"$3\" \"$CAPTURED_CONFIG\"\nprintf '%s\\n' '{output}'\n"),
+            &format!(
+                "#!/bin/sh\nif [ \"$4\" = --only-print-filenames ]; then\n  cp \"$3\" \"$CAPTURED_CONFIG\"\n  printf '%s\\n' '{output}'\nelse\n  cp \"$3\" \"$LISTING_CONFIG\"\n  python3 -c 'import sqlite3, sys; sqlite3.connect(sys.argv[1]).execute(\"CREATE TABLE kv (key TEXT, value TEXT)\")' \"$KEI_DATA_DIR/$SLUG.sync.db\"\nfi\n"
+            ),
         );
+        let slug = Command::new("bash")
+            .args([
+                "-c",
+                r#"source "$PROJECT_DIR/tests/shell/lib.sh"; kei_user_slug"#,
+            ])
+            .env("PROJECT_DIR", env!("CARGO_MANIFEST_DIR"))
+            .env("ICLOUD_USERNAME", "fixture@example.invalid")
+            .output()
+            .unwrap()
+            .stdout;
         let result = Command::new("bash")
             .args(["-c", r#"source "$PROJECT_DIR/tests/shell/lib.sh"; kei_release_bin() { printf '%s' "$BINARY"; }; kei_copy_session_without_state() { mkdir -p "$1"; }; kei_preflight_selection"#])
             .env("PROJECT_DIR", env!("CARGO_MANIFEST_DIR"))
@@ -3059,6 +3110,9 @@ fn live_shell_preflight_rejects_empty_selection() {
             .env("BINARY", &binary)
             .env("KEI_LIVE_SKIP_CREATED_BEFORE", "2025-01-02")
             .env("KEI_LIVE_SKIP_CREATED_AFTER", "2025-01-03")
+            .env("KEI_TEST_SCRATCH_DIR", dir.path())
+            .env("SLUG", String::from_utf8(slug).unwrap())
+            .env("LISTING_CONFIG", &listing)
             .env("CAPTURED_CONFIG", &captured)
             .output().unwrap();
         assert_eq!(
@@ -3067,6 +3121,16 @@ fn live_shell_preflight_rejects_empty_selection() {
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
+        let listing: toml::Table = std::fs::read_to_string(&listing).unwrap().parse().unwrap();
+        assert_eq!(listing["filters"]["libraries"][0].as_str(), Some("primary"));
+        assert_eq!(listing["filters"]["albums"][0].as_str(), Some("none"));
+        for key in ["skip_created_before", "skip_created_after"] {
+            assert_eq!(
+                listing["filters"][key].as_str(),
+                Some("2999-01-01"),
+                "the listing selects nothing"
+            );
+        }
         let config: toml::Table = std::fs::read_to_string(&captured).unwrap().parse().unwrap();
         assert_eq!(
             config["filters"]["skip_created_before"].as_str(),
@@ -3194,7 +3258,7 @@ kei_db_path"#,
         }
         let expected = root
             .path()
-            .join(format!("account-v1-{:x}.db", hash.finalize()));
+            .join(format!("account-v1-{:x}.sync.db", hash.finalize()));
         assert_eq!(
             Path::new(std::str::from_utf8(&output.stdout).unwrap()),
             expected

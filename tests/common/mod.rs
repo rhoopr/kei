@@ -617,6 +617,17 @@ pub(crate) fn is_retryable_auth_failure(msg: &str) -> bool {
 /// Panics if credentials are not configured or session validation fails.
 #[allow(dead_code)]
 pub fn require_preauth() -> (String, String, PathBuf) {
+    let (username, password, dir) = require_preauth_fresh();
+    live_selection::copy_listed_state(&username, &dir);
+    (username, password, dir)
+}
+
+/// Like [`require_preauth`], but the data directory holds no sync state, so
+/// the first sync lists the whole library. Use it only for behavior that
+/// depends on fresh state; that listing takes about six minutes on a
+/// 40k-record account.
+#[allow(dead_code)]
+pub fn require_preauth_fresh() -> (String, String, PathBuf) {
     live_selection::require_fixed_date();
     if RATE_LIMITED.load(Ordering::SeqCst) {
         eprintln!("\n*** ABORTING: Apple 503 rate limit detected in earlier test ***");
@@ -630,6 +641,94 @@ pub fn require_preauth() -> (String, String, PathBuf) {
     live_selection::ensure_selection(&username, &password, &dir);
     let isolated_dir = isolated_data_dir(&username, &dir);
     (username, password, isolated_dir)
+}
+
+/// Another data directory with the session from `data_dir` and its own copy
+/// of the listed state, for a second command that must not see the first
+/// one's records.
+#[allow(dead_code)]
+pub fn listed_data_dir(username: &str, data_dir: &Path) -> PathBuf {
+    let dir = isolated_data_dir(username, data_dir);
+    live_selection::copy_listed_state(username, &dir);
+    dir
+}
+
+/// Copy the listed state into `data_dir`, which holds no state yet.
+#[allow(dead_code)]
+pub fn seed_listed_state(username: &str, data_dir: &Path) {
+    live_selection::copy_listed_state(username, data_dir);
+}
+
+/// File name of the account's sync state in a data directory.
+#[allow(dead_code)]
+pub fn state_file_name(username: &str) -> String {
+    format!("{}.sync.db", account_namespace(username, ACCOUNT_REALM))
+}
+
+/// The sync state database in `data_dir`, if a command created one. A dry
+/// run's scratch copy is not it.
+#[allow(dead_code)]
+pub fn state_db(data_dir: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(data_dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".sync.db"))
+        })
+}
+
+/// Saved copies the state in `data_dir` records: done and still selected.
+#[allow(dead_code)]
+pub fn saved_copies(data_dir: &Path) -> Vec<PathBuf> {
+    let Some(db) = state_db(data_dir) else {
+        return Vec::new();
+    };
+    let conn = rusqlite::Connection::open(db).expect("open sync state");
+    let mut query = conn
+        .prepare("SELECT path FROM files WHERE state = 'done' AND wanted = 1 ORDER BY path")
+        .expect("query saved copies");
+    query
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("read saved copies")
+        .map(|path| PathBuf::from(path.expect("saved copy path")))
+        .collect()
+}
+
+/// Sum `field` over the `Library synced` lines a sync logs, one per
+/// library, such as `downloaded` or `pages`. `None` when no such line has
+/// the field.
+#[allow(dead_code)]
+pub fn synced(stderr: &str, field: &str) -> Option<u64> {
+    let prefix = format!("{field}=");
+    let mut total = None;
+    for line in strip_ansi(stderr)
+        .lines()
+        .filter(|line| line.contains("Library synced"))
+    {
+        if let Some(value) = line
+            .split_whitespace()
+            .find_map(|token| token.strip_prefix(prefix.as_str())?.parse::<u64>().ok())
+        {
+            *total.get_or_insert(0) += value;
+        }
+    }
+    total
+}
+
+#[test]
+fn synced_sums_a_field_over_library_lines() {
+    // kei colors field names even when stderr is a pipe.
+    let stderr = "INFO kei::sync_core::runner: Library synced zone=PrimarySync pages=3 \
+                  \x1b[3mdownloaded\x1b[0m\x1b[2m=\x1b[0m2\n\
+                  INFO kei::sync_core::drain: Saved copies downloaded=9\n\
+                  INFO kei::sync_core::runner: Library synced zone=SharedSync-1 pages=1 downloaded=1\n";
+    assert_eq!(synced(stderr, "downloaded"), Some(3));
+    assert_eq!(synced(stderr, "pages"), Some(4));
+    assert_eq!(synced(stderr, "adopted"), None);
+    assert_eq!(synced("", "downloaded"), None);
 }
 
 /// Strip ANSI escape sequences from a string (for log assertions).

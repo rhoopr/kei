@@ -1,13 +1,14 @@
 #!/bin/bash
-# Sync-token and config-hash invariants against live iCloud.
+# Sync-position and planning invariants against live iCloud.
 #
-# Covers the state machine around incremental sync: what is stored, when
-# it is cleared, and how kei recovers from corrupted/stale state. Each
-# scenario reads or mutates rows in the state DB between kei invocations,
-# which is awkward from Rust tests but natural from shell.
+# Covers the state the sync core keeps between runs: the library's saved
+# position, the planning fingerprint, and the saved copies. Each scenario
+# reads or changes rows in the state DB between kei invocations, which is
+# awkward from Rust tests but natural from shell.
 #
-# Uses ~15 Apple API calls. Session reuse via accountLogin avoids
-# repeated SRP handshakes.
+# Runs in its own data dir seeded with the listed catalog, so the shared
+# session dir never holds state. Two scenarios list the whole library again
+# (about six minutes each on a 40k-record account).
 #
 # Usage: ./tests/shell/state-machine.sh
 
@@ -22,7 +23,6 @@ kei_require_env
 kei_require_release_binary
 kei_install_scratch_cleanup
 
-COOKIES="$(kei_cookie_dir)"
 KEI="$(kei_release_bin)"
 kei_check_init
 
@@ -31,31 +31,41 @@ kei_sync() {
     shift
     local config
     local log_level="${KEI_SYNC_LOG_LEVEL:-info}"
-    config="$(kei_write_sync_config "$COOKIES" "$download_dir")"
+    config="$(kei_write_sync_config "$DATA" "$download_dir")"
     # Shared single-pass primary-library selection bounds provider work.
-    KEI_DATA_DIR="$COOKIES" "$KEI" sync \
-        --password "$ICLOUD_PASSWORD" \
+    KEI_DATA_DIR="$DATA" "$KEI" sync \
         --config "$config" \
         --no-progress-bar \
         --log-level "$log_level" \
         "$@" 2>&1
 }
 
-get_token() { kei_db_query "SELECT value FROM metadata WHERE key = 'sync_token:PrimarySync'"; }
-get_enum_hash() { kei_db_query "SELECT value FROM metadata WHERE key = 'enum_config_hash'"; }
-get_effective_enum_hash() {
-    kei_db_query "SELECT value FROM metadata WHERE key IN ('pending_enum_config_hash', 'enum_config_hash') ORDER BY key DESC LIMIT 1"
+kei_reconcile() {
+    local config
+    config="$(kei_write_sync_config "$DATA" "$DIR")"
+    KEI_DATA_DIR="$DATA" "$KEI" reconcile --config "$config" "$@" 2>&1
 }
-check_checkpoint() {
-    if grep -q 'date_bounded_full_enumeration' <<<"$OUTPUT"; then
-        [ -z "$(get_token)" ]
-        kei_check "bounded incomplete inventory does not checkpoint"
+
+get_position() { kei_db_query "SELECT position FROM zones WHERE zone = 'PrimarySync'"; }
+get_plan_hash() { kei_db_query "SELECT value FROM kv WHERE key = 'plan_config'"; }
+saved_count() { kei_db_query "SELECT COUNT(*) FROM files WHERE state = 'done' AND wanted = 1"; }
+disk_count() { find "$DIR" -type f | wc -l | tr -d ' '; }
+
+# The sync reported downloading N files.
+downloaded_is() {
+    [ "$(kei_synced "$OUTPUT" downloaded)" = "$1" ]
+}
+check_no_relisting() {
+    if grep -q "Listing the whole library" <<<"$OUTPUT"; then
+        kei_check "$1" 1
     else
-        [ -n "$(get_token)" ]
-        kei_check "complete inventory stores checkpoint"
+        kei_check "$1" 0
     fi
 }
-token_count() { kei_db_query "SELECT COUNT(*) FROM metadata WHERE key LIKE '%token%'"; }
+check_position() {
+    [ -n "$(get_position)" ]
+    kei_check "listed library keeps its position"
+}
 
 kei_suite_banner "STATE-MACHINE VALIDATION"
 
@@ -63,182 +73,141 @@ echo ""
 echo "--- Pre-flight ---"
 kei_preflight_session
 
+DATA=$(kei_scratch_dir state-data)
+kei_copy_session_without_state "$DATA"
+kei_seed_listed_state "$DATA" || exit 1
+export ICLOUD_TEST_COOKIE_DIR="$DATA"
 DIR=$(kei_scratch_dir state)
 
-# ── 1. Clean slate: full sync, verify token + enum config hash stored ────
+# ── 1. First sync from the listed catalog ────────────────────────────────
 echo ""
-echo "=== 1. Clean slate full sync ==="
-# Wipe both the metadata table (tokens, config hashes) AND the assets table
-# so the next sync starts from zero. Stale `assets` rows from prior runs
-# leave dangling on-disk paths that the incremental trust-state sample
-# treats as missing, forcing a fall-back to full enumeration in test 2.
-kei_db_exec "DELETE FROM metadata WHERE key LIKE '%token%' OR key IN ('config_hash', 'enum_config_hash', 'pending_enum_config_hash')"
-kei_db_exec "DELETE FROM assets"
-echo "  Cleared: tokens=$(token_count), enum_hash=$(get_enum_hash || echo 'none')"
+echo "=== 1. First sync ==="
 OUTPUT=$(kei_sync "$DIR")
 kei_check "sync exit status" "$?"
-echo "$OUTPUT" | grep -E "Incremental|token|Summary|downloaded|completed"
-check_checkpoint
-[ -n "$(get_enum_hash)" ]
-kei_check "enum config hash stored"
-[ "$(find "$DIR" -type f | wc -l | tr -d ' ')" -ge 1 ]
+echo "$OUTPUT" | grep -E "Library synced|Saved copies|Backup status"
+check_no_relisting "seeded state reads only the changes since its listing"
+check_position
+[ -n "$(get_plan_hash)" ]
+kei_check "planning fingerprint stored"
+[ "$(disk_count)" -ge 1 ]
 kei_check "files downloaded"
-BASELINE_ENUM_HASH=$(get_enum_hash)
-BASELINE_TOKEN=$(get_token)
-# Keep a path from the baseline selection. Resolution reconciliation below
-# retains other renditions, which may sort before the currently selected file.
-DRIFT_PATH=$(kei_db_query "SELECT local_path FROM assets WHERE status='downloaded' ORDER BY local_path LIMIT 1")
-echo "  enum_hash=$BASELINE_ENUM_HASH"
+[ "$(disk_count)" -eq "$(saved_count)" ]
+kei_check "every file on disk is a saved copy"
+BASELINE_HASH=$(get_plan_hash)
+BASELINE_FILES=$(disk_count)
+DRIFT_PATH=$(kei_db_query "SELECT path FROM files WHERE state = 'done' AND wanted = 1 ORDER BY path LIMIT 1")
+echo "  plan_hash=$BASELINE_HASH files=$BASELINE_FILES"
 
-# ── 2. Incremental sync: no changes → 0 downloads, token preserved ──────
+# ── 2. Repeat sync: nothing changed, nothing downloaded ──────────────────
 echo ""
-echo "=== 2. Bounded repeat sync (no changes) ==="
+echo "=== 2. Repeat sync (no changes) ==="
 OUTPUT=$(kei_sync "$DIR")
 kei_check "sync exit status" "$?"
-echo "$OUTPUT" | grep -E "incremental|token|change|download|[Cc]ompleted"
-# The incremental path logs "No new photos to download from incremental
-# sync" when the change feed is empty. If the trust-state sample detects
-# missing files (e.g. stale rows from a previous run pointing at deleted
-# scratch dirs) it falls back to a full enumeration that logs the
-# shorter "No new photos to download" instead. Both indicate "nothing
-# to do"; either is acceptable here.
-DL_LINE=$(echo "$OUTPUT" | grep -E "No new photos to download|All incremental assets already downloaded|0 downloaded")
-[ -n "$DL_LINE" ]
-kei_check "sync reported no-op"
-NEW_DOWNLOADS=$(echo "$OUTPUT" | grep -oE '[0-9]+ downloaded' | head -1 | grep -oE '^[0-9]+')
-[ "${NEW_DOWNLOADS:-0}" -eq 0 ]
+echo "$OUTPUT" | grep -E "Library synced"
+downloaded_is 0
 kei_check "0 new downloads"
-[ "$(get_token)" = "$BASELINE_TOKEN" ]
-kei_check "checkpoint preserved"
-check_checkpoint
+check_no_relisting "repeat sync reads only the changes since"
+check_position
 
-# ── 3. Live Photo component exclusion changes the enumeration hash ──────
+# ── 3. A config change plans every photo again without listing ──────────
 echo ""
-echo "=== 3. Config change stages reconciliation ==="
-ENUM_HASH_BEFORE=$(get_effective_enum_hash)
+echo "=== 3. Config change plans again ==="
 OUTPUT=$(KEI_SYNC_FILTERS_TOML=$'exclude = ["live-photo-videos"]\n' kei_sync "$DIR")
 kei_check "component-exclusion sync exit status" "$?"
-echo "$OUTPUT" | grep -E "config|changed|cleared|token|incremental|download|completed"
-ENUM_HASH_AFTER=$(get_effective_enum_hash)
-[ "$ENUM_HASH_BEFORE" != "$ENUM_HASH_AFTER" ]
-kei_check "enum config hash changed"
-echo "  enum_hash: $ENUM_HASH_BEFORE -> $ENUM_HASH_AFTER"
-check_checkpoint
+echo "$OUTPUT" | grep -E "Library synced"
+[ "$(get_plan_hash)" != "$BASELINE_HASH" ]
+kei_check "planning fingerprint changed"
+check_no_relisting "a config change keeps the saved position"
+downloaded_is 0
+kei_check "excluding a component downloads nothing"
+[ "$(disk_count)" -eq "$BASELINE_FILES" ]
+kei_check "copies that stop being selected keep their files"
 
-# ── 4. Restore original config → hash reverts ───────────────────────────
+# ── 4. Restore the original config ──────────────────────────────────────
 echo ""
 echo "=== 4. Restore original config ==="
 OUTPUT=$(kei_sync "$DIR")
 kei_check "sync exit status" "$?"
-echo "$OUTPUT" | grep -E "config|changed|cleared|token|incremental|download|completed"
-[ "$(get_effective_enum_hash)" = "$BASELINE_ENUM_HASH" ]
-kei_check "enum hash reverted to original"
-check_checkpoint
+[ "$(get_plan_hash)" = "$BASELINE_HASH" ]
+kei_check "planning fingerprint reverted"
+downloaded_is 0
+kei_check "selecting the kept files again downloads nothing"
+[ "$(disk_count)" -eq "$(saved_count)" ]
+kei_check "every file is a saved copy again"
 
-# ── 5. reset sync-token forces full enumeration ─────────────────────
+# ── 5. reset sync-token lists the whole library again ───────────────────
 echo ""
 echo "=== 5. reset sync-token ==="
-KEI_DATA_DIR="$COOKIES" "$KEI" reset sync-token --yes >/dev/null
-OUTPUT=$(KEI_SYNC_LOG_LEVEL=debug kei_sync "$DIR")
-kei_check "reset sync exit status" "$?"
-echo "$OUTPUT" | grep -E "reset|clear|token|Fetching|full|incremental|download|completed"
-grep -qi "Fetching\|full enumeration" <<<"$OUTPUT"
-kei_check "full enumeration ran"
-check_checkpoint
+KEI_DATA_DIR="$DATA" "$KEI" reset sync-token --yes >/dev/null
+kei_check "reset sync-token exit status" "$?"
+[ -z "$(get_position)" ]
+kei_check "reset forgets the position"
+OUTPUT=$(kei_sync "$DIR")
+kei_check "sync after reset exit status" "$?"
+grep -q "Listing the whole library" <<<"$OUTPUT"
+kei_check "the library is listed from the start"
+downloaded_is 0
+kei_check "listing again downloads nothing already saved"
+check_position
 
-# ── 6. Corrupt token → fallback to full enumeration ──────────────────────
+# ── 6. A position iCloud rejects is forgotten and listed again ──────────
 echo ""
-echo "=== 6. Corrupt token recovery ==="
-if [ -n "$(get_token)" ]; then
-    kei_db_exec "UPDATE metadata SET value = 'CORRUPT_GARBAGE_TOKEN_XYZ' WHERE key = 'sync_token:PrimarySync'"
-    OUTPUT=$(KEI_SYNC_LOG_LEVEL=debug kei_sync "$DIR")
-    SYNC_RC=$?
-    kei_check "corrupt-token sync succeeds" "$SYNC_RC"
-    grep -qi "fallback\|full enumeration\|Fetching" <<<"$OUTPUT"
-    kei_check "fell back to full enumeration"
-    [ "$(get_token)" != 'CORRUPT_GARBAGE_TOKEN_XYZ' ]
-    kei_check "corrupt token replaced"
-    check_checkpoint
-else
-    # No valid token exists after a bounded partial inventory. Do not bypass
-    # the checkpoint guard to force incremental mode against live account data.
-    echo "  Partial inventory: positive incremental fallback covered offline"
-    check_checkpoint
+echo "=== 6. Rejected position recovery ==="
+kei_db_exec "UPDATE zones SET position = 'CORRUPT_GARBAGE_TOKEN_XYZ' WHERE zone = 'PrimarySync'"
+OUTPUT=$(kei_sync "$DIR")
+kei_check "sync with a rejected position exit status" "$?"
+echo "$OUTPUT" | grep -E "rejected|Listing the whole library|Library synced"
+grep -q "iCloud rejected the saved sync position" <<<"$OUTPUT"
+kei_check "the rejected position is reported"
+[ "$(get_position)" != 'CORRUPT_GARBAGE_TOKEN_XYZ' ] && [ -n "$(get_position)" ]
+kei_check "a valid position replaces it"
+downloaded_is 0
+kei_check "recovery downloads nothing already saved"
+
+# ── 7. A deleted file comes back through reconcile ──────────────────────
+echo ""
+echo "=== 7. Missing file recovery ==="
+if [ -z "$DRIFT_PATH" ] || [ ! -f "$DIR/$DRIFT_PATH" ]; then
+    echo "ABORT: selected baseline drift fixture is missing" >&2
+    exit 1
 fi
+DRIFT_SIZE=$(wc -c <"$DIR/$DRIFT_PATH" | tr -d ' ')
+rm -f "$DIR/$DRIFT_PATH"
+echo "  Deleted one saved file from disk"
+OUTPUT=$(kei_reconcile --dry-run)
+kei_check "reconcile --dry-run exit status" "$?"
+grep -qF "MISSING: $DIR/$DRIFT_PATH" <<<"$OUTPUT"
+kei_check "reconcile lists the missing file"
+OUTPUT=$(kei_reconcile)
+kei_check "reconcile exit status" "$?"
+grep -q "1 missing files will be downloaded again" <<<"$OUTPUT"
+kei_check "reconcile owes exactly that copy again"
+OUTPUT=$(kei_sync "$DIR")
+kei_check "sync after reconcile exit status" "$?"
+downloaded_is 1
+kei_check "the next sync downloads it"
+[ -f "$DIR/$DRIFT_PATH" ] && [ "$(wc -c <"$DIR/$DRIFT_PATH" | tr -d ' ')" = "$DRIFT_SIZE" ]
+kei_check "the file is back at its path with its size"
 
-# ── 7. Simulated missing file: full re-enum re-downloads it ─────────────
-#
-# A checkpointed account needs a forced full enumeration to find local
-# state/disk drift. A bounded account without a token already enumerates.
+# ── 8. --dry-run changes nothing ────────────────────────────────────────
 echo ""
-echo "=== 7. Missing file detection ==="
-delete_one_downloaded_file() {
-    local path="$DRIFT_PATH" count
-    if [[ "$path" != "$DIR/"* ]] || [ ! -f "$path" ]; then
-        echo "ABORT: selected baseline drift fixture is missing or outside scratch" >&2
-        return 1
-    fi
-    count=$(kei_db_query "SELECT COUNT(*) FROM assets WHERE status='downloaded' AND local_path = $(kei_sql_string "$path")") || return 1
-    if ! [[ "$count" =~ ^[1-9][0-9]*$ ]]; then
-        echo "ABORT: selected baseline drift fixture is missing from state" >&2
-        return 1
-    fi
-    kei_db_exec "DELETE FROM assets WHERE local_path = $(kei_sql_string "$path")" || return 1
-    rm -f "$path" || return 1
-    echo "  Deleted one selected file from state + disk"
-}
-sync_and_count_downloads() {
-    local label="$1"
-    local out clean dl
-    out=$(kei_sync "$DIR")
-    kei_check "$label exit status" "$?"
-    echo "$out" | grep -E "incremental|change|download|[Cc]ompleted"
-    grep -qE "No new photos|[Cc]ompleted" <<<"$out"
-    kei_check "$label completed without error"
-    # Parameter expansion uses glob patterns and cannot express ANSI SGR sequences.
-    # shellcheck disable=SC2001
-    clean=$(echo "$out" | sed 's/\x1b\[[0-9;]*m//g')
-    dl=$(echo "$clean" | grep -oE '[0-9]+ downloaded,' | head -1 | grep -oE '^[0-9]+')
-    dl="${dl:-0}"
-    echo "  $label downloads: $dl"
-    DL_RESULT="$dl"
-}
-HAD_TOKEN=$(get_token)
-delete_one_downloaded_file || exit 1
-sync_and_count_downloads "bounded repeat"
-if [ -n "$HAD_TOKEN" ]; then
-    [ "$DL_RESULT" -eq 0 ]
-    kei_check "incremental leaves non-delta local drift for full reconcile"
-else
-    [ "$DL_RESULT" -ge 1 ]
-    kei_check "bounded full enumeration finds missing file"
-    delete_one_downloaded_file || exit 1
-fi
-KEI_DATA_DIR="$COOKIES" "$KEI" reset sync-token --yes >/dev/null
-[ -z "$(get_token)" ]
-kei_check "reset removes checkpoint"
-sync_and_count_downloads "full re-enum"
-[ "$DL_RESULT" -ge 1 ]
-kei_check "full re-enum finds missing file"
-
-# ── 8. --dry-run preserves token ─────────────────────────────────────────
-echo ""
-echo "=== 8. Dry run preserves token ==="
-TOKEN_BEFORE=$(get_token)
-kei_sync "$DIR" --dry-run >/dev/null
+echo "=== 8. Dry run changes nothing ==="
+POSITION_BEFORE=$(get_position)
+SAVED_BEFORE=$(saved_count)
+OUTPUT=$(kei_sync "$DIR" --dry-run)
 kei_check "dry-run exit status" "$?"
-[ "$(get_token)" = "$TOKEN_BEFORE" ]
-kei_check "token unchanged after dry-run"
+grep -q "Dry run: no files or state were changed" <<<"$OUTPUT"
+kei_check "dry run says nothing changed"
+[ "$(get_position)" = "$POSITION_BEFORE" ] && [ "$(saved_count)" = "$SAVED_BEFORE" ]
+kei_check "position and saved copies unchanged after dry-run"
 
-# ── 9. Filter flag changes enum config hash ──────────────────────────────
+# ── 9. A media filter changes the planning fingerprint ──────────────────
 echo ""
-echo "=== 9. Filter flag changes enum config hash ==="
-ENUM_HASH_BEFORE=$(get_effective_enum_hash)
+echo "=== 9. Media filter changes the planning fingerprint ==="
 OUTPUT=$(KEI_SYNC_FILTERS_TOML=$'exclude = ["videos"]\n' kei_sync "$DIR")
 kei_check "media-filter sync exit status" "$?"
-echo "$OUTPUT" | grep -E "config|changed|cleared|token|download|completed"
-[ "$ENUM_HASH_BEFORE" != "$(get_effective_enum_hash)" ]
-kei_check "enum hash changed with media filter"
+[ "$(get_plan_hash)" != "$BASELINE_HASH" ]
+kei_check "planning fingerprint changed with media filter"
 
 # ── 10. Session reuse check ─────────────────────────────────────────────
 echo ""
@@ -260,8 +229,6 @@ else
     kei_check "session reuse" 1
 fi
 
-# ── Cleanup: restore the original config so future runs start consistent ─
-kei_sync "$DIR" >/dev/null 2>&1
-rm -rf "$DIR"
+rm -rf "$DIR" "$DATA"
 
 kei_check_summary "STATE-MACHINE RESULTS"

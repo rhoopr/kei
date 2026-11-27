@@ -27,14 +27,13 @@ Create and pass each replacement before removing its live counterpart.
 `sync_album_downloads_all_asset_types` becomes a bounded, format-independent
 live download test. Its exact-format assertions remain covered by
 `bundled_media_download_finalize_reopen_and_second_sync` for all 13 media files.
-The import scan-limit test keeps its bounded live case; its multi-pass cap is
-covered by `bundled_import_recent_caps_each_pass` rather than enumerating all
-account albums. `classify_exit_error_partial_sync_uses_exit_partial` retains
+Import no longer samples by count, so the scan-limit case is now an offline
+check that `--recent` is refused. `classify_exit_error_partial_sync_uses_exit_partial` retains
 the exact exit-code-2 assertion for the removed shell partial-failure case.
 
 ## Bounded checkpoint coverage
 
-Current live sync fixtures use a fixed lower capture-date bound supplied through `KEI_LIVE_SKIP_CREATED_BEFORE`, not a recent-item cap. Optional `KEI_LIVE_SKIP_CREATED_AFTER` closes the inclusive capture-local interval. Rust and shell helpers write the existing `[filters].skip_created_before` and `skip_created_after` settings; missing lower dates, malformed dates and inverted intervals fail before provider preflight. Choose a narrow interval containing at least one eligible asset; without an upper date, every selected item at or after the lower date is in scope. The separate `[import_sample].recent` value in `live-selection.toml` is harness-only input for import's positive-count CLI option.
+Current live sync fixtures use a fixed lower capture-date bound supplied through `KEI_LIVE_SKIP_CREATED_BEFORE`, not a recent-item cap. Optional `KEI_LIVE_SKIP_CREATED_AFTER` closes the inclusive capture-local interval. Rust and shell helpers write the existing `[filters].skip_created_before` and `skip_created_after` settings; missing lower dates, malformed dates and inverted intervals fail before provider preflight. Choose a narrow interval containing at least one eligible asset; without an upper date, every selected item at or after the lower date is in scope. Import takes no sample: it plans every photo in the selected libraries and must find every file the fixture sync saved.
 
 A date-limited pass cannot checkpoint a truncated library inventory. The required result is either a stored token after proven EOF or the explicit `date_bounded_full_enumeration` hold with no token. The second run must do no new downloads in either mode. Config changes inspect pending reconciliation as well as the committed hash. Positive incremental and corrupt-token live checks run only when the bounded selection proves EOF; truncated selections retain the checkpoint-hold, reset, config-drift and file-recovery checks instead. The Rust and shell live assertions use the fixed-date hold reason. This source reconciliation does not replace an authorized live run.
 
@@ -57,7 +56,7 @@ and Docker/release/import/service smokes. File recovery must accept any media
 format. Keep the generated nonexistent-selector cases. Keep the separate
 opt-in cross-zone fixture unchanged.
 
-All general live paths use `live-selection.toml` plus the required fixed-date environment value. Explicit negative selector cases may override selectors; import scan-limit tests may lower the separate import sample count. Preflight reports the bounded selection and observed eligible filename count, without exposing filenames or requiring specific formats. Empty selection is a failure, not a passing skip. Test state and download directories stay isolated. Live import seeds use fresh per-run trees, so previous cached media cannot change collision naming.
+All general live paths use `live-selection.toml` plus the required fixed-date environment value. Explicit negative selector cases may override selectors. Preflight reports the bounded selection and observed eligible filename count, without exposing filenames or requiring specific formats. Empty selection is a failure, not a passing skip. Test state and download directories stay isolated. Live import seeds use fresh per-run trees, so previous cached media cannot change collision naming.
 
 ## Safety and validation
 

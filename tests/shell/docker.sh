@@ -41,12 +41,14 @@ docker_cleanup() {
     docker run --rm -v "$DOCKER_CONFIG:/c" -v "$DOCKER_PHOTOS:/p" "$IMAGE" \
         chown -R "$(id -u):$(id -g)" /c /p >/dev/null 2>&1 || true
     chmod -R u+rwX "$DOCKER_CONFIG" "$DOCKER_PHOTOS" >/dev/null 2>&1 || true
-    rm -rf "$DOCKER_CONFIG" "$DOCKER_PHOTOS" >/dev/null 2>&1 || true
+    rm -rf "$DOCKER_CONFIG" "$DOCKER_PHOTOS" "$(kei_listed_state_dir)" >/dev/null 2>&1 || true
     return "$exit_code"
 }
 trap docker_cleanup EXIT
 
 kei_copy_session_without_state "$DOCKER_CONFIG"
+# Start from the listed catalog so the container reads only recent changes.
+kei_seed_listed_state "$DOCKER_CONFIG" || exit 1
 
 sync_config="$(kei_write_sync_config "$DOCKER_CONFIG" "/photos")"
 cp "$sync_config" "$DOCKER_CONFIG/config.toml"
@@ -60,12 +62,12 @@ cp "$sync_config" "$DOCKER_CONFIG/config.toml"
 echo "--- 1. Docker sync (bounded primary library) ---"
 docker run --rm \
     -e ICLOUD_USERNAME="$ICLOUD_USERNAME" \
+    -e ICLOUD_PASSWORD \
     -e KEI_DATA_DIR=/config \
     -v "$DOCKER_CONFIG:/config" \
     -v "$DOCKER_PHOTOS:/photos" \
     "$IMAGE" sync \
     --config /config/config.toml \
-    --password "$ICLOUD_PASSWORD" \
     --no-progress-bar \
     2>& \
     1
@@ -106,11 +108,11 @@ fi
 
 echo ""
 echo "--- 5. State database ---"
-if [ -f "$DOCKER_CONFIG/${USER_SLUG}.db" ]; then
-    ASSET_COUNT=$(sqlite3 "$DOCKER_CONFIG/${USER_SLUG}.db" "SELECT COUNT(*) FROM assets WHERE status='downloaded'" 2>/dev/null)
-    echo "  Downloaded assets in DB: $ASSET_COUNT"
-    [ "$ASSET_COUNT" -ge 1 ]
-    kei_check "state DB has downloaded assets"
+if [ -f "$DOCKER_CONFIG/${USER_SLUG}.sync.db" ]; then
+    ASSET_COUNT=$(sqlite3 -readonly "$DOCKER_CONFIG/${USER_SLUG}.sync.db" "SELECT COUNT(*) FROM files WHERE state = 'done'" 2>/dev/null)
+    echo "  Saved copies in DB: $ASSET_COUNT"
+    [ "${ASSET_COUNT:-0}" -eq "$FILE_COUNT" ]
+    kei_check "state DB records every downloaded file"
 else
     kei_check "state database exists" 1
 fi
@@ -119,21 +121,18 @@ echo ""
 echo "--- 6. Idempotent re-sync (no new downloads) ---"
 RESYNC_OUT=$(docker run --rm \
     -e ICLOUD_USERNAME="$ICLOUD_USERNAME" \
+    -e ICLOUD_PASSWORD \
     -e KEI_DATA_DIR=/config \
     -v "$DOCKER_CONFIG:/config" \
     -v "$DOCKER_PHOTOS:/photos" \
     "$IMAGE" sync \
     --config /config/config.toml \
-    --password "$ICLOUD_PASSWORD" \
     --no-progress-bar \
     --log-level info \
     2>&1)
 RESYNC_EC=$?
 echo "$RESYNC_OUT"
-[ "$RESYNC_EC" -eq 0 ] && case "$RESYNC_OUT" in
-    *downloaded=0* | *"No new photos"*) true ;;
-    *) false ;;
-esac
+[ "$RESYNC_EC" -eq 0 ] && [ "$(kei_synced "$RESYNC_OUT" downloaded)" = "0" ]
 kei_check "re-sync downloads 0 files"
 
 echo ""
@@ -141,12 +140,12 @@ echo "--- 7. Dry run ---"
 DRY_PHOTOS=$(mktemp -d "${TMPDIR:-/tmp}/kei-docker-dry-XXXXX")
 docker run --rm \
     -e ICLOUD_USERNAME="$ICLOUD_USERNAME" \
+    -e ICLOUD_PASSWORD \
     -e KEI_DATA_DIR=/config \
     -v "$DOCKER_CONFIG:/config" \
     -v "$DRY_PHOTOS:/photos" \
     "$IMAGE" sync \
     --config /config/config.toml \
-    --password "$ICLOUD_PASSWORD" \
     --no-progress-bar \
     --dry-run \
     2>&1
@@ -182,12 +181,12 @@ WATCH_PHOTOS=$(mktemp -d "${TMPDIR:-/tmp}/kei-docker-watch-XXXXX")
 WATCH_NAME="kei-docker-watch-$$"
 docker run -d --name "$WATCH_NAME" \
     -e ICLOUD_USERNAME="$ICLOUD_USERNAME" \
+    -e ICLOUD_PASSWORD \
     -e KEI_DATA_DIR=/config \
     -v "$DOCKER_CONFIG:/config" \
     -v "$WATCH_PHOTOS:/photos" \
     "$IMAGE" sync \
     --config /config/watch-config.toml \
-    --password "$ICLOUD_PASSWORD" \
     --no-progress-bar \
     --log-level info >/dev/null
 
@@ -250,7 +249,7 @@ PWFILE_OUT=$(docker run --rm \
     --dry-run \
     2>&1)
 echo "$PWFILE_OUT" | tail -10
-echo "$PWFILE_OUT" | grep -qE "Would download|files would be downloaded"
+echo "$PWFILE_OUT" | grep -q "Dry run: no files or state were changed"
 kei_check "password-file auth works in container"
 rm -rf "$SECRETS_DIR" "$PWFILE_PHOTOS"
 

@@ -89,7 +89,7 @@ Every command that reads state uses `src/sync_core/access.rs`. It resolves `<acc
 | `reconcile` | Owes again every saved, selected copy whose file is missing (`--dry-run` only lists them). `--inspect-path` prints a copy's fingerprint; `--confirm-damage` owes it again so the next sync replaces exactly those bytes. |
 | `reset state` | Deletes the previous and current state files after checking ownership of each. |
 | `reset sync-token` | Forgets every library's position, so the next sync lists each again. Saved copies stay. |
-| `import-existing` | Runs one cycle that adopts local files at planned paths with the expected size and downloads nothing. `--dry-run` plans into a scratch file and reports matches without writing state. |
+| `import-existing` | Runs one cycle that adopts local files at planned paths with the expected size and downloads nothing. `--dry-run` plans into a scratch copy of the current state, as `sync --dry-run` does, and reports matches without writing state. |
 | `doctor` | Reports whether the state opens and its saved, owed and failed counts. |
 
 ## Upgrade

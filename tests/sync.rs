@@ -125,15 +125,6 @@ fn config_for_download_dir(
     common::live_selection::write_live_config(data_dir, "sync-live", &body)
 }
 
-fn reset_sync_tokens(cookie_dir: &std::path::Path) {
-    common::cmd()
-        .env("KEI_DATA_DIR", cookie_dir)
-        .args(["reset", "sync-token", "--yes"])
-        .timeout(Duration::from_secs(10))
-        .assert()
-        .success();
-}
-
 // ── Metadata (no downloads) ─────────────────────────────────────────────
 
 #[test]
@@ -709,15 +700,16 @@ fn sync_retry_failed_refuses_before_startup() {
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
 }
 
+/// The library's position is saved with each listed page, so a second run
+/// reads only the changes since and downloads nothing.
 #[test]
 #[ignore]
-fn sync_bounded_second_run_preserves_checkpoint_and_skips_download() {
+fn sync_bounded_second_run_keeps_position_and_downloads_nothing() {
     let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
 
-        // First sync: full enumeration
         library_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
@@ -726,45 +718,31 @@ fn sync_bounded_second_run_preserves_checkpoint_and_skips_download() {
         let first_count = common::walkdir(download_dir.path()).len();
         assert!(first_count > 0, "first sync should download files");
 
-        let db_path = std::fs::read_dir(cookie_dir.as_path())
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .find(|path| path.extension().is_some_and(|ext| ext == "db"))
-            .expect("first sync creates the state DB");
-        let db = rusqlite::Connection::open(db_path).unwrap();
-        let token = || {
-            use rusqlite::OptionalExtension;
-            db.query_row(
-                "SELECT value FROM metadata WHERE key = 'sync_token:PrimarySync'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .unwrap()
+        let position = || {
+            let db = common::state_db(&cookie_dir).expect("sync state");
+            rusqlite::Connection::open(db)
+                .unwrap()
+                .query_row(
+                    "SELECT position FROM zones WHERE zone = 'PrimarySync' AND listed = 1",
+                    [],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap()
         };
-        let first_token = token();
+        assert!(position().is_some(), "a listed library keeps its position");
 
-        // A bounded partial inventory must not manufacture an incremental token.
         let output = library_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .args(["--log-level", "debug"])
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .output()
             .unwrap();
-
-        assert!(output.status.success());
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if first_token.is_some() {
-            assert!(stderr.contains("sync_mode=\"incremental\""), "{stderr}");
-        } else {
-            assert!(stderr.contains("date_bounded_full_enumeration"), "{stderr}");
-            assert!(token().is_none(), "partial inventory must not checkpoint");
-        }
+        let stderr = common::strip_ansi(&String::from_utf8_lossy(&output.stderr));
+        assert!(output.status.success(), "{stderr}");
         assert!(
-            stderr.contains("No new photos to download")
-                || stderr.contains("All incremental assets already downloaded")
-                || stderr.contains("0 downloaded"),
-            "second run must report no new downloads: {stderr}"
+            !stderr.contains("Listing the whole library"),
+            "a second run must not list from the start: {stderr}"
         );
+        assert_eq!(common::synced(&stderr, "downloaded"), Some(0), "{stderr}");
+        assert!(position().is_some());
         assert_eq!(common::walkdir(download_dir.path()).len(), first_count);
     });
 }
@@ -925,7 +903,7 @@ fn sync_report_json_writes_valid_schema() {
 
         let body = std::fs::read_to_string(&report_path).expect("report file");
         let json: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-        assert_eq!(json["version"], "3", "schema version");
+        assert_eq!(json["version"], "5", "schema version");
         assert!(json["kei_version"].is_string(), "kei_version present");
         assert!(json["timestamp"].is_string(), "timestamp present");
         let status = json["status"].as_str().expect("status string");
@@ -942,11 +920,12 @@ fn sync_report_json_writes_valid_schema() {
 // ── Download integrity ──────────────────────────────────────────────────
 
 /// Data-sacred invariant: if the user (or `rm -rf` accident) deletes a synced
-/// file, a full reconciliation must restore it. A silent skip here would mean
-/// kei "loses" the file permanently.
+/// file, `kei reconcile` owes it again and the next sync restores the same
+/// bytes at the same path. Sync itself never treats a missing file as a
+/// deletion to mirror.
 #[test]
 #[ignore]
-fn sync_recovers_deleted_file() {
+fn sync_recovers_deleted_file_after_reconcile() {
     let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
@@ -963,38 +942,36 @@ fn sync_recovers_deleted_file() {
         // Select any media format, retain its exact bytes, then delete it.
         let victim = before.first().expect("at least one media file").clone();
         let original_bytes = std::fs::read(&victim).unwrap();
-        let expected_size = original_bytes.len() as u64;
         std::fs::remove_file(&victim).expect("delete victim");
-        assert!(!victim.exists(), "victim deleted");
 
-        // Re-sync with a full enumeration so the filter can notice the
-        // missing file. A normal incremental sync only receives new iCloud
-        // deltas, so local disk drift must be tested with the cursor reset.
-        reset_sync_tokens(&cookie_dir);
+        let config = library_config(&cookie_dir, download_dir.path(), SyncToml::default());
+        common::cmd()
+            .env("ICLOUD_USERNAME", &username)
+            .env("KEI_DATA_DIR", &cookie_dir)
+            .arg("reconcile")
+            .arg("--config")
+            .arg(&config)
+            .timeout(Duration::from_secs(TIMEOUT_META))
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("MISSING:"))
+            .stdout(predicate::str::contains(
+                "1 missing files will be downloaded again by the next sync",
+            ));
 
-        // Full enumeration can notice the missing file.
-        // Captured output is included in the assertion below so an intermittent
-        // skip-where-recovery-was-expected leaves a usable trail (data-sacred
-        // invariant: a silent skip here means kei "loses" the file).
         let assert = library_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .env("RUST_LOG", "kei=debug")
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
         let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
-
         assert!(
             victim.exists(),
-            "deleted file should be re-downloaded: {}\n--- post-sync walkdir ---\n{:#?}\n--- kei stderr ---\n{stderr}",
+            "deleted file should be downloaded again: {}\n--- post-sync walkdir ---\n{:#?}\n--- kei stderr ---\n{stderr}",
             victim.display(),
             common::walkdir(download_dir.path()),
         );
-        let after_size = std::fs::metadata(&victim).unwrap().len();
-        assert_eq!(
-            after_size, expected_size,
-            "recovered file should match original size"
-        );
         assert_eq!(std::fs::read(&victim).unwrap(), original_bytes);
+        assert_eq!(common::synced(&stderr, "downloaded"), Some(1), "{stderr}");
     });
 }
 
@@ -1025,11 +1002,7 @@ fn sync_truncated_file_does_not_cause_data_loss() {
             .expect("set_len 0");
         assert_eq!(std::fs::metadata(&victim).unwrap().len(), 0);
 
-        // Re-sync with a full enumeration so path planning compares the
-        // truncated local file with iCloud's expected size. A normal
-        // incremental sync only receives new iCloud deltas.
-        reset_sync_tokens(&cookie_dir);
-
+        // Ordinary sync leaves the shorter file alone: it may be a local edit.
         library_cmd(&username, &password, &cookie_dir, download_dir.path())
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()

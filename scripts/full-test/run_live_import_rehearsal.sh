@@ -2,8 +2,9 @@
 # Phase 5.5 - live import-existing mini rehearsal.
 #
 # Seeds a tiny real photo tree with the release binary, then imports that tree
-# into a fresh DB. This exercises the v0.20 TOML-first import path without
-# relying on prior state in .test-cookies.
+# into separate state. Both start from one listing of the library, so the
+# import must find every seeded file on disk rather than in the seed's records.
+# Nothing here relies on prior state in .test-cookies.
 
 set -euo pipefail
 
@@ -19,20 +20,21 @@ source "$repo_root/tests/shell/lib.sh"
 
 kei_require_env
 kei_require_release_binary
-kei_preflight_selection
 
 binary=$(kei_release_bin)
-recent=$(kei_live_recent)
 work=$(mktemp -d "${TMPDIR:-/tmp/codex/kei/full-test/tmp}/kei-live-import-rehearsal-XXXXX")
-trap 'rm -rf "$work"' EXIT
+trap 'rm -rf "$work" "$(kei_listed_state_dir)"' EXIT
+kei_preflight_selection
 
 sync_data="$work/sync-data"
 import_data="$work/import-data"
 photos="$work/photos"
 mkdir -p "$sync_data" "$import_data" "$photos"
 
-kei_copy_session_without_state "$sync_data"
-kei_copy_session_without_state "$import_data"
+for data in "$sync_data" "$import_data"; do
+    kei_copy_session_without_state "$data"
+    kei_seed_listed_state "$data"
+done
 
 write_config() {
     local data_dir="$1"
@@ -103,100 +105,126 @@ print(hashlib.sha256(json.dumps(rows).encode()).hexdigest())
 PY_MEDIA
 }
 
-snapshot_assets() {
-    python3 - "$import_data" "$1" <<'PY_ASSETS'
+# The copies a state records: identity, path, recorded bytes and state.
+snapshot_copies() {
+    python3 - "$1" "$2" <<'PY_COPIES'
 import json
 import pathlib
 import sqlite3
 import sys
 directory, output = map(pathlib.Path, sys.argv[1:])
-databases = list(directory.glob("*.db"))
-assert len(databases) <= 1, "ambiguous isolated state DB"
-rows = []
-if databases:
-    with sqlite3.connect(databases[0].resolve().as_uri() + "?mode=ro", uri=True) as connection:
-        rows = connection.execute("SELECT library,id,version_size,checksum,local_path,status FROM assets ORDER BY library,id,version_size").fetchall()
+databases = [path for path in directory.glob("*.sync.db")]
+assert len(databases) == 1, f"expected one isolated state DB, found {databases}"
+with sqlite3.connect(databases[0].resolve().as_uri() + "?mode=ro", uri=True) as connection:
+    rows = connection.execute(
+        "SELECT zone, asset, rendition, album, path, size, checksum, sha256, state, wanted "
+        "FROM files ORDER BY zone, asset, rendition, album, slot"
+    ).fetchall()
 output.write_text(json.dumps(rows))
-PY_ASSETS
+PY_COPIES
 }
 
 original_media=$(media_fingerprint)
-echo "--- import dry-run into fresh DB ---"
+snapshot_copies "$import_data" "$work/before-import.json"
+
+echo "--- import dry-run ---"
 run_and_show import-dry-run \
-    "$binary" import-existing --dry-run --force-empty --recent "$recent" --no-progress-bar --config "$import_config"
-snapshot_assets "$work/after-dry-run.json"
+    "$binary" import-existing --dry-run --no-progress-bar --config "$import_config"
+snapshot_copies "$import_data" "$work/after-dry-run.json"
 [[ "$(media_fingerprint)" == "$original_media" ]] || {
     echo "import dry-run changed seed media" >&2
     exit 1
 }
 
-echo "--- import real into fresh DB ---"
+echo "--- import real ---"
 run_and_show import-real \
-    "$binary" import-existing --force-empty --recent "$recent" --no-progress-bar --config "$import_config"
-snapshot_assets "$work/after-real.json"
+    "$binary" import-existing --no-progress-bar --config "$import_config"
+snapshot_copies "$import_data" "$work/after-real.json"
 
 echo "--- import repeat dry-run ---"
 run_and_show import-repeat-dry-run \
-    "$binary" import-existing --dry-run --force-empty --recent "$recent" --no-progress-bar --config "$import_config"
+    "$binary" import-existing --dry-run --no-progress-bar --config "$import_config"
+snapshot_copies "$import_data" "$work/after-repeat.json"
+
+echo "--- sync from the imported state ---"
+run_and_show import-sync \
+    "$binary" sync --no-progress-bar --config "$import_config"
 [[ "$(media_fingerprint)" == "$original_media" ]] || {
-    echo "import changed seed media" >&2
+    echo "import or the following sync changed seed media" >&2
     exit 1
 }
 echo "seed_media_unchanged=1"
 
-# The count sample can include records outside the date-bounded local tree.
-# Keep the sample unchanged and require exact known receipts and quiet repetition.
-python3 - "$sync_data" "$import_data" "$recent" "$work/after-dry-run.json" "$work/after-real.json" "$work/import-dry-run.out" "$work/import-real.out" "$work/import-repeat-dry-run.out" <<'PY'
+python3 - "$sync_data" "$import_data" "$work" <<'PY'
 import json
 import pathlib
+import re
 import sqlite3
 import sys
 
-seed_dir, import_dir, recent, dry_snapshot, real_snapshot, *reports = sys.argv[1:]
-recent = int(recent)
-assert recent > 0, "import sample cap must be positive"
-keys = ("Total assets scanned", "Files matched", "Unmatched versions", "Hash errors")
-summaries = []
-for report in reports:
+seed_dir, import_dir, work = map(pathlib.Path, sys.argv[1:])
+
+def summary(name):
     values = {}
-    for line in pathlib.Path(report).read_text().splitlines():
-        key, separator, value = line.strip().partition(":")
-        if separator and key in keys:
-            assert key not in values, "duplicate import summary field"
-            values[key] = int(value.strip())
-    assert all(key in values and values[key] >= 0 for key in keys), "missing import summary"
-    assert 0 < values["Total assets scanned"] <= recent, "scan exceeded the positive import sample cap"
-    summaries.append(values)
-assert len(summaries) == 3 and all(value == summaries[0] for value in summaries), "dry-run, real and repeat summaries differ"
-summary = summaries[0]
-matched = summary["Files matched"]
-assert matched > 0 and summary["Hash errors"] == 0, "import must match without hash errors"
+    for line in (work / f"{name}.out").read_text().splitlines():
+        line = line.strip()
+        for key, pattern in [
+            ("matched", r"^Adopted (\d+) existing local files\.$"),
+            ("matched", r"^Local files that match a photo:\s+(\d+)$"),
+            ("already", r"^Already recorded:\s+(\d+)$"),
+            ("missing", r"^Copies with no local file yet:\s+(\d+)"),
+            ("refused", r"^Could not adopt:\s+(\d+)"),
+        ]:
+            found = re.match(pattern, line)
+            if found:
+                assert key not in values, f"duplicate {key} in {name}"
+                values[key] = int(found.group(1))
+    for key in ("matched", "already", "missing"):
+        assert key in values, f"{name} printed no {key} count"
+    values.setdefault("refused", 0)
+    return values
 
-def asset_rows(directory):
-    databases = list(pathlib.Path(directory).glob("*.db"))
-    assert len(databases) == 1, "expected one isolated state DB"
-    with sqlite3.connect(databases[0].resolve().as_uri() + "?mode=ro", uri=True) as connection:
-        rows = connection.execute("SELECT library,id,version_size,checksum,local_path,status FROM assets ORDER BY library,id,version_size").fetchall()
-    assert len(rows) == len({row[:3] for row in rows}), "duplicate asset receipt identity"
-    return rows
+def saved(directory):
+    database = next(directory.glob("*.sync.db"))
+    with sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True) as connection:
+        return set(connection.execute(
+            "SELECT zone, asset, rendition, album, path, sha256 FROM files "
+            "WHERE state = 'done' AND wanted = 1"
+        ).fetchall())
 
-seed_rows = asset_rows(seed_dir)
-import_rows = asset_rows(import_dir)
-seed = {row[:5] for row in seed_rows if row[5] == "downloaded"}
-imported = {row[:5] for row in import_rows if row[5] == "downloaded"}
-assert json.loads(pathlib.Path(dry_snapshot).read_text()) == [], "dry-run wrote asset rows"
-assert json.loads(pathlib.Path(real_snapshot).read_text()) == [list(row) for row in import_rows], "repeat dry-run changed asset receipts"
-assert seed and imported and imported <= seed, "import receipts must match independent seed receipts"
-assert len(imported) == matched, "matched count must equal durable imported versions"
-assert len({row[:2] for row in seed}) <= recent, "seed fixture exceeds import sample capacity; refusing incomplete coverage"
-# Cardinality is only a capacity check. Exact observed receipt equality proves
-# overlap for this fixture; date/album gaps must refuse, not infer eligibility.
-assert imported == seed, "fixture/sample overlap incomplete: known seed receipt missing"
-print(f"import_matched={matched}")
-print(f"db_downloaded={len(imported)}")
-print("seed_sample_receipts_equal=1")
-print("dry_run_asset_rows=0")
-print("repeat_asset_receipts_unchanged=1")
+def synced(name, field):
+    total = None
+    for line in (work / f"{name}.err").read_text().splitlines():
+        line = re.sub(r"\x1b\[[0-9;]*m", "", line)
+        if "Library synced" in line:
+            found = re.search(rf"\b{field}=(\d+)", line)
+            if found:
+                total = (total or 0) + int(found.group(1))
+    assert total is not None, f"{name} logged no {field} count"
+    return total
+
+seed = saved(seed_dir)
+assert seed, "seed sync recorded no saved copies"
+dry, real, repeat = (summary(name) for name in ("import-dry-run", "import-real", "import-repeat-dry-run"))
+assert dry["matched"] == len(seed) and dry["already"] == 0, f"dry run must find every seed file: {dry}"
+assert dry["refused"] == 0 and real["refused"] == 0, "no seed path may hold another file"
+assert real["matched"] == len(seed), f"import must adopt every seed file: {real}"
+assert repeat["matched"] == 0 and repeat["already"] == len(seed), f"repeat must find them recorded: {repeat}"
+assert dry["missing"] == real["missing"] == repeat["missing"], "the planned copies changed between runs"
+
+before = json.loads((work / "before-import.json").read_text())
+assert json.loads((work / "after-dry-run.json").read_text()) == before, "dry run changed the import state"
+assert json.loads((work / "after-repeat.json").read_text()) == json.loads((work / "after-real.json").read_text()), \
+    "repeat dry run changed the import state"
+assert saved(import_dir) == seed, "import receipts must equal the seed's: path, identity and bytes"
+assert synced("import-sync", "downloaded") == 0 and synced("import-sync", "adopted") == 0, \
+    "sync after import must neither download nor adopt"
+print(f"import_matched={real['matched']}")
+print(f"import_owed={real['missing']}")
+print("seed_receipts_equal=1")
+print("dry_run_state_unchanged=1")
+print("repeat_state_unchanged=1")
+print("sync_after_import_quiet=1")
 PY
 
 echo "live import rehearsal passed"
