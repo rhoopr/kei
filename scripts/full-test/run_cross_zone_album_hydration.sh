@@ -7,8 +7,8 @@
 #
 # The fixture album must contain at least one asset whose source zone is not
 # PrimarySync. The script runs the release binary against that named album with
-# all visible libraries enabled, then proves the state DB recorded a downloaded
-# asset row in a non-primary source zone for that album.
+# all visible libraries enabled, then proves the state DB recorded a saved copy
+# from a non-primary source zone in that album.
 
 set -euo pipefail
 
@@ -72,33 +72,27 @@ config="$work/cross-zone.toml"
 echo "--- cross-zone album sync ($album, libraries=all) ---"
 "$binary" sync --no-progress-bar --config "$config"
 
-db=$(find "$data_dir" -maxdepth 1 -name '*.db' | head -1)
+db=$(find "$data_dir" -maxdepth 1 -name '*.sync.db' | head -1)
 if [[ -z "$db" ]]; then
     echo "run_cross_zone_album_hydration: state DB was not created" >&2
     exit 1
 fi
 
 quoted_album=${album//\'/\'\'}
-cross_zone_count=$(sqlite3 "$db" "
-  SELECT COUNT(DISTINCT a.library || char(31) || a.id)
-  FROM assets a
-  JOIN asset_albums aa
-    ON aa.library = a.library
-   AND aa.asset_id = a.id
-  WHERE aa.album_name = '$quoted_album'
-    AND a.status = 'downloaded'
-    AND a.library <> 'PrimarySync';
-" 2>/dev/null || echo 0)
-
-total_album_downloads=$(sqlite3 "$db" "
-  SELECT COUNT(DISTINCT a.library || char(31) || a.id)
-  FROM assets a
-  JOIN asset_albums aa
-    ON aa.library = a.library
-   AND aa.asset_id = a.id
-  WHERE aa.album_name = '$quoted_album'
-    AND a.status = 'downloaded';
-" 2>/dev/null || echo 0)
+album_copies() {
+    local zone_filter="$1"
+    sqlite3 -readonly "$db" "
+  SELECT COUNT(DISTINCT f.zone || char(31) || f.asset)
+  FROM files f
+  JOIN albums al ON al.name = f.album
+  WHERE al.title = '$quoted_album'
+    AND f.state = 'done'
+    AND f.wanted = 1
+    $zone_filter;
+" 2>/dev/null || echo 0
+}
+cross_zone_count=$(album_copies "AND f.zone <> 'PrimarySync'")
+total_album_downloads=$(album_copies "")
 
 echo "album_downloaded=$total_album_downloads"
 echo "cross_zone_downloaded=$cross_zone_count"
@@ -106,17 +100,15 @@ echo "cross_zone_min_files=$min_files"
 
 if [[ "$cross_zone_count" -lt "$min_files" ]]; then
     echo "run_cross_zone_album_hydration: expected at least $min_files non-primary downloaded asset(s) for album '$album', got $cross_zone_count" >&2
-    echo "--- downloaded album rows by library ---" >&2
-    sqlite3 "$db" "
-    SELECT a.library, COUNT(DISTINCT a.id)
-    FROM assets a
-    JOIN asset_albums aa
-      ON aa.library = a.library
-     AND aa.asset_id = a.id
-    WHERE aa.album_name = '$quoted_album'
-      AND a.status = 'downloaded'
-    GROUP BY a.library
-    ORDER BY a.library;
+    echo "--- saved album copies by library ---" >&2
+    sqlite3 -readonly "$db" "
+    SELECT f.zone, COUNT(DISTINCT f.asset)
+    FROM files f
+    JOIN albums al ON al.name = f.album
+    WHERE al.title = '$quoted_album'
+      AND f.state = 'done'
+    GROUP BY f.zone
+    ORDER BY f.zone;
   " >&2 || true
     exit 1
 fi

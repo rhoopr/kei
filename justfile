@@ -268,10 +268,16 @@ test MODE="" *ARGS="":
             ;;
         live)
             _live_env
-            cargo test --all-features --lib icloud::photos::album::lookup::tests::live_targeted_record_lookup_distinguishes_present_and_missing -- --exact --ignored --test-threads=1
-            cargo test --all-features --test sync -- --ignored --test-threads=1
-            cargo test --all-features --test state_auth -- --ignored --test-threads=1
-            cargo test --all-features --test import_existing_live -- --ignored --test-threads=1
+            # Run every live binary, then fail if any did, so one failure
+            # does not hide the others.
+            failed=()
+            for suite in sync state_auth import_existing_live; do
+                cargo test --all-features --test "$suite" -- --ignored --test-threads=1 || failed+=("$suite")
+            done
+            if [[ ${#failed[@]} -gt 0 ]]; then
+                echo "live suites failed: ${failed[*]}" >&2
+                exit 1
+            fi
             ;;
         live-smoke)
             _live_env
@@ -361,7 +367,7 @@ cov MODE="" BASE="main":
             # existing checkout of the base branch (e.g. the main repo
             # already sitting on main).
             git worktree add --detach ../.kei-cov-base "{{BASE}}" >/dev/null
-            (cd ../.kei-cov-base && cargo llvm-cov --all-features --lcov --output-path "$OLDPWD/base.lcov" -- --skip download::orchestration::queue_projection::tests::private_600_independent_album_writers_finish_through_reseeds_without_repeated_writes --skip sync_core::tests::copies_stress)
+            (cd ../.kei-cov-base && cargo llvm-cov --all-features --lcov --output-path "$OLDPWD/base.lcov" -- --skip sync_core::tests::copies_stress)
             git worktree remove ../.kei-cov-base >/dev/null
             python3 .github/scripts/patch_coverage.py \
                 --lcov head.lcov \

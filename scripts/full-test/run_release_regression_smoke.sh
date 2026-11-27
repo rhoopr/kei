@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Offline release regression smoke.
 #
-# This is the quick patch-release gate for the May 27, 2026 regression set:
-# token reuse, targeted retry, on-disk pending adoption, pagination-shortfall
-# diagnostics, permissive valid-media validation, inactive pass
-# templates, and dotted config paths.
+# A quick patch-release gate over the sync core's durable behavior: the saved
+# position, retry backoff, adoption of files already on disk, recovery of an
+# interrupted or rejected listing, permissive valid-media validation, and
+# dotted config paths.
 
 set -euo pipefail
 
@@ -24,24 +24,22 @@ run_lib_test() {
     cargo test --lib "$test_name" -- --exact
 }
 
-echo "--- stored token decisions stay incremental ---"
-run_lib_test sync_cycle::tests::determine_sync_mode_two_normal_syncs_reuse_stored_token
+echo "--- a listed library reads only new changes ---"
+run_lib_test sync_core::tests::full_listing_saves_unfiled_and_album_copies_then_stays_quiet
+run_lib_test sync_core::tests::a_new_photo_needs_only_its_own_work
 
-echo "--- failed rows use targeted retry without full enumeration ---"
-run_lib_test download::orchestration::recovery::tests::incremental_with_failed_rows_uses_targeted_retry_not_full_enumeration
+echo "--- failed copies are retried with backoff ---"
+run_lib_test sync_core::state::tests::failed_copies_retry_every_cycle_at_first_then_up_to_daily
 
-echo "--- pending rows with existing files are adopted ---"
-run_lib_test download::pipeline::adoption::tests::producer_adopts_pending_on_disk_skip_as_downloaded
+echo "--- files already at their planned paths are adopted ---"
+run_lib_test sync_core::tests::an_existing_file_with_the_same_size_is_adopted
 
-echo "--- pagination shortfall fixtures remain diagnostic warnings ---"
-run_lib_test download::orchestration::full::tests::classify_pagination_shortfall_issue_498_fixture_reports_shortfall
-run_lib_test download::orchestration::full::tests::classify_pagination_shortfall_billimek_sharedsync_fixture_reports_shortfall
+echo "--- interrupted and rejected listings recover ---"
+run_lib_test sync_core::tests::an_interrupted_listing_resumes_from_its_last_saved_page
+run_lib_test sync_core::tests::a_rejected_position_relists_without_downloading_again
 
 echo "--- valid JPEG bytes under .PNG are saved ---"
 run_lib_test download::file::transfer::tests::attempt_download_promotes_valid_jpeg_with_png_extension_issue_507
-
-echo "--- inactive album and smart-folder templates do not force full enumeration ---"
-run_lib_test download::orchestration::dispatch::tests::unfiled_only_incremental_ignores_inactive_album_path_templates
 
 echo "--- dotted config path handling ---"
 run_lib_test config::paths::tests::test_expand_tilde_with_injected_home_uses_path_join

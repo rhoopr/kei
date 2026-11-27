@@ -36,7 +36,7 @@ pub(crate) async fn run_reconcile(
         println!("Run a sync first to create the database.");
         return Ok(());
     };
-    let directory = super::download_directory(toml).ok_or_else(|| {
+    let directory = super::state_directory(toml, &state).await?.ok_or_else(|| {
         anyhow::anyhow!(
             "Set [download].directory in the config file to reconcile downloaded files."
         )

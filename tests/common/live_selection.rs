@@ -6,20 +6,6 @@ use std::time::Duration;
 
 const SELECTION: &str = include_str!("../data/live-selection.toml");
 
-pub fn live_recent() -> u32 {
-    let table: toml::Table = SELECTION.parse().expect("shared live selection TOML");
-    u32::try_from(
-        table
-            .get("import_sample")
-            .expect("import sample")
-            .get("recent")
-            .expect("recent")
-            .as_integer()
-            .expect("recent count"),
-    )
-    .expect("bounded positive live count")
-}
-
 pub fn live_config(body: &str) -> String {
     let (before, after) = require_fixed_range();
     live_config_with_bounds(body, &before, after.as_deref())
@@ -130,28 +116,133 @@ fn eligible_inventory(stdout: &[u8]) -> Result<usize, String> {
     Ok(count)
 }
 
+/// A capture date no photo has, so a sync with it selects nothing.
+const NO_PHOTOS: &str = "2999-01-01";
+
+/// The catalog this test binary's tests start from: one listing of the
+/// whole primary library with nothing selected, so no copies are owed.
+static LISTED: OnceLock<(tempfile::TempDir, PathBuf)> = OnceLock::new();
+
+/// Build the listed state once, then check the bounded selection is not
+/// empty against a copy of it.
+///
+/// The sync core lists a library from the start on fresh state, which takes
+/// about six minutes on a 40k-record account. Each test copies this state
+/// instead and reads only the changes since it was listed; a different
+/// selection or download folder plans every photo again without listing.
 pub(super) fn ensure_selection(username: &str, password: &str, cookies: &Path) {
-    static CHECKED: OnceLock<()> = OnceLock::new();
-    CHECKED.get_or_init(|| {
-        let data = tempfile::tempdir().expect("selection preflight state");
-        let config = write_live_config(
-            data.path(),
-            "selection-preflight",
-            &format!("[download]\ndirectory = {}\n", super::toml_string(&data.path().join("media").to_string_lossy())),
-        );
+    LISTED.get_or_init(|| {
+        let data = tempfile::tempdir().expect("listed state");
+        let config = data.path().join("listing.toml");
+        super::write_versioned_config(
+            &config,
+            format!(
+                "[download]\ndirectory = {}\n[filters]\nalbums = [\"none\"]\nunfiled = true\n\
+                 libraries = [\"primary\"]\nskip_created_before = \"{NO_PHOTOS}\"\n\
+                 skip_created_after = \"{NO_PHOTOS}\"\n",
+                super::toml_string(&data.path().join("media").to_string_lossy())
+            ),
+        )
+        .expect("listing config");
         super::with_auth_retry(|| {
             super::copy_auth_material(username, cookies, data.path());
-            let output = super::cmd()
+            super::cmd()
                 .env("ICLOUD_USERNAME", username)
                 .env("KEI_DATA_DIR", data.path())
+                .args(["sync", "--password-file", &super::password_file(password), "--config", config.to_str().expect("config path"), "--no-progress-bar"])
+                .timeout(Duration::from_secs(1800))
+                .assert()
+                .success();
+        });
+        let state = data.path().join(super::state_file_name(username));
+        assert!(state.is_file(), "the listing sync created no state at {}", state.display());
+
+        let probe = tempfile::tempdir().expect("selection preflight state");
+        let config = write_live_config(
+            probe.path(),
+            "selection-preflight",
+            &format!("[download]\ndirectory = {}\n", super::toml_string(&probe.path().join("media").to_string_lossy())),
+        );
+        super::with_auth_retry(|| {
+            super::copy_auth_material(username, cookies, probe.path());
+            copy_state(&state, probe.path(), username);
+            let output = super::cmd()
+                .env("ICLOUD_USERNAME", username)
+                .env("KEI_DATA_DIR", probe.path())
                 .args(["sync", "--password-file", &super::password_file(password), "--config", config.to_str().expect("config path"), "--only-print-filenames", "--no-progress-bar"])
-                // The preflight lists the whole library on fresh state.
                 .timeout(Duration::from_secs(1800))
                 .assert().success().get_output().clone();
             let count = eligible_inventory(&output.stdout).expect("live selection preflight");
             eprintln!("Live selection: primary library, albums=none, unfiled=true, fixed lower date={}, eligible filenames={count}", require_fixed_date());
         });
+        (data, state)
     });
+}
+
+/// Give `data_dir` a copy of the listed state. Its download folder is
+/// forgotten, so the first sync records the test's own folder without
+/// treating it as a move.
+pub(super) fn copy_listed_state(username: &str, data_dir: &Path) {
+    let (_, state) = LISTED
+        .get()
+        .expect("require_preauth builds the listed state first");
+    copy_state(state, data_dir, username);
+}
+
+fn copy_state(state: &Path, data_dir: &Path, username: &str) {
+    let target = data_dir.join(super::state_file_name(username));
+    rusqlite::Connection::open(state)
+        .expect("open listed state")
+        .backup(
+            rusqlite::MAIN_DB,
+            &target,
+            None::<fn(rusqlite::backup::Progress)>,
+        )
+        .expect("copy listed state");
+    rusqlite::Connection::open(&target)
+        .expect("open copied state")
+        .execute("DELETE FROM kv WHERE key = 'download_directory'", [])
+        .expect("forget the listing's download folder");
+}
+
+#[test]
+fn a_copied_state_forgets_only_its_download_folder() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("listed.sync.db");
+    let conn = rusqlite::Connection::open(&source).unwrap();
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         INSERT INTO kv VALUES ('download_directory', '/listing/media'), ('account_key', 'k');
+         CREATE TABLE zones (zone TEXT PRIMARY KEY, position TEXT, listed INTEGER);
+         INSERT INTO zones VALUES ('PrimarySync', 'token', 1);",
+    )
+    .unwrap();
+    let data = root.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    copy_state(&source, &data, "user@example.invalid");
+    drop(conn);
+
+    let copied =
+        rusqlite::Connection::open(data.join(super::state_file_name("user@example.invalid")))
+            .unwrap();
+    let keys: Vec<String> = copied
+        .prepare("SELECT key FROM kv ORDER BY key")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(keys, ["account_key"]);
+    let position: String = copied
+        .query_row("SELECT position FROM zones", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(position, "token");
+    let source_keys: i64 = rusqlite::Connection::open(&source)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM kv", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(source_keys, 2, "the listed state itself is unchanged");
 }
 
 #[test]
@@ -207,7 +298,6 @@ fn shared_live_selection_is_bounded_and_preserves_scenario_options() {
             .as_integer(),
         Some(2)
     );
-    assert!(live_recent() > 0 && live_recent() <= 10);
     assert!(value["filters"].get("skip_created_after").is_none());
 }
 

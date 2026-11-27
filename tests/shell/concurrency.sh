@@ -31,17 +31,17 @@ kei_sync() {
     config="$(kei_write_sync_config "$COOKIES" "$download_dir")"
     # Shared single-pass primary-library selection bounds provider work.
     KEI_DATA_DIR="$COOKIES" "$KEI" sync \
-        --password "$ICLOUD_PASSWORD" \
         --config "$config" \
         --no-progress-bar \
         --log-level info "$@" 2>&1
 }
 
-# Each download root gets a fresh account-owned database. Only login state
-# is shared with the operator or the other scenario.
+# Each download root gets its own copy of the listed catalog. Only login
+# state is shared with the operator or the other scenario.
 fresh_session() {
     COOKIES=$(kei_scratch_dir "$1")
     ICLOUD_TEST_COOKIE_DIR="$SESSION_SOURCE" kei_copy_session_without_state "$COOKIES"
+    ICLOUD_TEST_COOKIE_DIR="$SESSION_SOURCE" kei_seed_listed_state "$COOKIES" || exit 1
     export ICLOUD_TEST_COOKIE_DIR="$COOKIES"
 }
 
@@ -60,18 +60,18 @@ DIR1=$(kei_scratch_dir concurrent)
 fresh_session concurrent-session
 
 OUT=$(KEI_SYNC_DOWNLOAD_TOML=$'threads = 5\n' kei_sync "$DIR1")
-echo "$OUT" | grep -E "concurrency|downloaded|failed|completed"
+echo "$OUT" | grep -E "concurrency|Library synced|Saved copies"
 
 FC=$(find "$DIR1" -type f | wc -l | tr -d ' ')
 EMPTY=$(find "$DIR1" -type f -empty | wc -l | tr -d ' ')
-DB_COUNT=$(kei_db_query "SELECT COUNT(DISTINCT id) FROM assets WHERE status='downloaded'")
-DUPES=$(kei_db_query "SELECT COUNT(*) FROM (SELECT id, version_size, COUNT(*) c FROM assets GROUP BY id, version_size HAVING c > 1)")
-echo "  Files=$FC Empty=$EMPTY DB_assets=$DB_COUNT Dupes=$DUPES"
+DB_COUNT=$(kei_db_query "SELECT COUNT(*) FROM files WHERE state = 'done' AND wanted = 1")
+DUPES=$(kei_db_query "SELECT COUNT(*) FROM (SELECT path, COUNT(*) c FROM files GROUP BY path HAVING c > 1)")
+echo "  Files=$FC Empty=$EMPTY DB_copies=$DB_COUNT Dupes=$DUPES"
 [ "$FC" -ge 1 ]
 kei_check "files downloaded"
 [ "$EMPTY" -eq 0 ]
 kei_check "no empty files"
-[ "$DB_COUNT" -ge 1 ]
+[ "$DB_COUNT" -eq "$FC" ]
 kei_check "DB tracks all files"
 [ "$DUPES" -eq 0 ]
 kei_check "no duplicate DB entries"
@@ -81,7 +81,7 @@ ORPHANS=0
 while IFS= read -r -d '' f; do
     [ -z "$f" ] && continue
     basename=$(basename "$f")
-    in_db=$(kei_db_query "SELECT COUNT(*) FROM assets WHERE local_path=$(kei_sql_string "$f") AND status='downloaded'")
+    in_db=$(kei_db_query "SELECT COUNT(*) FROM files WHERE path = $(kei_sql_string "${f#"$DIR1/"}") AND state = 'done'")
     if [ "$in_db" -eq 0 ]; then
         echo "  ORPHAN: $basename not in state DB"
         ORPHANS=$((ORPHANS + 1))
@@ -99,14 +99,23 @@ echo "=== 2. Interrupted download + resume ==="
 DIR2=$(kei_scratch_dir resume)
 fresh_session resume-session
 
-# Session reuse puts auth at ~3s; kill at 4s so we interrupt mid- or
-# just-post-download. Even if all files complete before the kill the
-# resume pass validates idempotency.
-KEI_SYNC_DOWNLOAD_TOML=$'threads = 1\n' kei_sync "$DIR2" &
+# Kill as soon as downloads start, so a copy is likely mid-transfer. Even
+# if every file completes before the kill, the resume pass validates
+# idempotency.
+SYNC_LOG="$DIR2.log"
+KEI_SYNC_DOWNLOAD_TOML=$'threads = 1\n' kei_sync "$DIR2" >"$SYNC_LOG" 2>&1 &
 SYNC_PID=$!
-sleep 4
+for _ in $(seq 1 1200); do
+    grep -q "Saving owed copies" "$SYNC_LOG" && break
+    kill -0 "$SYNC_PID" 2>/dev/null || break
+    sleep 0.5
+done
+grep -q "Saving owed copies" "$SYNC_LOG"
+kei_check "downloads started before the interrupt"
+sleep 1
 kill -9 $SYNC_PID 2>/dev/null
 wait $SYNC_PID 2>/dev/null
+rm -f "$SYNC_LOG"
 kei_clear_stale_lock
 
 PART_COUNT=$(find "$DIR2" -name "*.kei-tmp" | wc -l | tr -d ' ')
@@ -114,12 +123,13 @@ FILE_COUNT=$(find "$DIR2" -type f ! -name "*.kei-tmp" | wc -l | tr -d ' ')
 echo "  After interrupt: $FILE_COUNT complete, $PART_COUNT .kei-tmp files"
 
 OUT=$(KEI_SYNC_DOWNLOAD_TOML=$'threads = 1\n' kei_sync "$DIR2")
-echo "$OUT" | grep -E "downloaded|failed|completed|Skipping"
+kei_check "resume sync exit status" "$?"
+echo "$OUT" | grep -E "Library synced|Saved copies"
 
 FINAL_FILES=$(find "$DIR2" -type f ! -name "*.kei-tmp" | wc -l | tr -d ' ')
 FINAL_PARTS=$(find "$DIR2" -name "*.kei-tmp" | wc -l | tr -d ' ')
 echo "  After resume: $FINAL_FILES complete, $FINAL_PARTS .kei-tmp files"
-[ "$FINAL_FILES" -ge 1 ]
+[ "$FINAL_FILES" -ge 1 ] && [ "$FINAL_FILES" -eq "$(kei_db_query "SELECT COUNT(*) FROM files WHERE state = 'done' AND wanted = 1")" ]
 kei_check "all files complete after resume"
 [ "$FINAL_PARTS" -eq 0 ]
 kei_check "no .kei-tmp files remain"

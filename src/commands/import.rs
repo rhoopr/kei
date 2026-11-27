@@ -100,7 +100,21 @@ pub(crate) async fn run_import_existing(
         remove_scratch(scratch).await?;
     }
     let state = match &scratch {
-        Some(scratch) => crate::sync_core::State::open(scratch).await?,
+        Some(scratch) => {
+            // Preview against a copy of the current state, as sync's dry
+            // run does, so only the changes since the last listing are read.
+            if location.current.exists() {
+                let current = crate::sync_core::access::open(&location, &owner, Some(&directory))
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("Sync state disappeared"))?;
+                current.copy_to(scratch).await?;
+                current.close().await?;
+            } else if location.legacy.exists() {
+                crate::sync_core::upgrade::prepare(&location.legacy, scratch, &owner, &directory)
+                    .await?;
+            }
+            crate::sync_core::State::open(scratch).await?
+        }
         None => match crate::sync_core::access::open(&location, &owner, Some(&directory)).await? {
             Some(state) => state,
             None => crate::sync_core::access::create(&location, &owner).await?,
@@ -159,6 +173,7 @@ pub(crate) async fn run_import_existing(
         remove_scratch(scratch).await?;
         println!("Dry run: no state was written.");
         println!("  Local files that match a photo: {}", count("adopt"));
+        println!("  Already recorded:               {}", count("done"));
         println!("  Copies with no local file yet:  {}", count("pending"));
     } else {
         let adopted: u64 = report.zones.iter().map(|zone| zone.drain.adopted).sum();

@@ -62,6 +62,18 @@ pub(crate) fn download_directory(
         .map(crate::config::expand_tilde)
 }
 
+/// The folder saved paths are under: the configured download directory, or
+/// when no config names one, the folder the last sync recorded.
+pub(crate) async fn state_directory(
+    toml: Option<&crate::config::TomlConfig>,
+    state: &crate::sync_core::State,
+) -> anyhow::Result<Option<std::path::PathBuf>> {
+    match download_directory(toml) {
+        Some(directory) => Ok(Some(directory)),
+        None => crate::sync_core::recorded_directory(state).await,
+    }
+}
+
 /// Maximum per-section listing size for the diagnostic subcommands
 /// (`kei status`, `kei verify`, `kei reconcile`). Listings beyond this
 /// cap print a tail line via [`print_truncation_tail`]; summary counts

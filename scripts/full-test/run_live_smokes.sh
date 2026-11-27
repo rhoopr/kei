@@ -7,7 +7,9 @@
 #   ICLOUD_USERNAME  iCloud account (sourced from .env by the orchestrator)
 #
 # Optional env:
-#   KEI_TEST_DATA_DIR  cookie / db dir (default .test-cookies under repo)
+#   KEI_TEST_DATA_DIR  data dir to run against as is (default: a scratch dir
+#                      with the .test-cookies session and a freshly listed
+#                      catalog, so the shared session dir never holds state)
 #   KEI_TEST_DOWNLOAD_DIR  temp dir for sync/import dry-run (default under TMPDIR)
 #
 # Adding a new CLI subcommand: add a smoke line below. Don't add destructive
@@ -29,10 +31,17 @@ if [[ ! -x "$binary" ]]; then
 fi
 
 USR="${ICLOUD_USERNAME:-missing@example.invalid}"
-DD="${KEI_TEST_DATA_DIR:-$repo_root/.test-cookies}"
 DOWNLOAD_DIR="${KEI_TEST_DOWNLOAD_DIR:-${TMPDIR:-/tmp/codex/kei/full-test/tmp}/photos-test}"
 kei_live_fixed_date >/dev/null || exit 1
 mkdir -p "$DOWNLOAD_DIR"
+if [[ -n "${KEI_TEST_DATA_DIR:-}" ]]; then
+    DD="$KEI_TEST_DATA_DIR"
+    seed_data=0
+else
+    DD=$(mktemp -d "${TMPDIR:-/tmp/codex/kei/full-test/tmp}/kei-live-smokes-XXXXX")
+    trap 'rm -rf "$DD"' EXIT
+    seed_data=1
+fi
 
 sync_config="$(kei_write_sync_config "$DD" "$DOWNLOAD_DIR")"
 
@@ -45,15 +54,30 @@ run() {
 # Wrappers for commands that need shell composition (rc check, etc.).
 verify_wrapper() {
     set +e
-    env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" verify
+    env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" verify --config "$sync_config"
     rc=$?
     set -e
     # rc=2 is clap parse error; everything else (including non-zero data
     # mismatches) means the command at least reached the binary correctly.
     [[ $rc -ne 2 ]]
 }
-export -f verify_wrapper
-export USR DD binary
+# List the library once into the scratch data dir (about six minutes on a
+# 40k-record account), so the smokes below read a real catalog.
+seed_wrapper() {
+    # shellcheck disable=SC1091
+    source "$PROJECT_DIR/tests/shell/lib.sh"
+    kei_require_env
+    kei_preflight_selection || return 1
+    kei_copy_session_without_state "$DD"
+    kei_seed_listed_state "$DD" || return 1
+    rm -rf "$(kei_listed_state_dir)"
+}
+export -f verify_wrapper seed_wrapper
+export USR DD binary PROJECT_DIR sync_config
+
+if [[ "$seed_data" == 1 ]]; then
+    run live_smoke_listing bash -c seed_wrapper
+fi
 
 run live_status env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" status
 run live_libraries env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" list libraries
@@ -61,6 +85,6 @@ run live_albums env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" list alb
 run live_dryrun env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" sync --dry-run --config "$sync_config"
 run live_config_show env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" config show
 run live_verify bash -c verify_wrapper
-run live_reconcile_dryrun env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" reconcile --dry-run
+run live_reconcile_dryrun env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" reconcile --dry-run --config "$sync_config"
 run live_password_backend env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" password backend
-run live_import_dryrun env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" import-existing --dry-run --recent 5 --config "$sync_config"
+run live_import_dryrun env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" import-existing --dry-run --config "$sync_config"

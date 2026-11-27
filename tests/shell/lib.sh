@@ -28,6 +28,9 @@ kei_require_env() {
         echo "ABORT: ICLOUD_USERNAME and ICLOUD_PASSWORD must be set (via .env or environment)."
         exit 1
     fi
+    # kei reads both from the environment, so the password never appears in
+    # a command line.
+    export ICLOUD_USERNAME ICLOUD_PASSWORD
 }
 
 # Match the exact account namespace. These suites generate com-realm configs;
@@ -64,17 +67,48 @@ kei_copy_session_without_state() {
     mkdir -p "$dest"
     cp "$cookies/"* "$dest/" 2>/dev/null || true
     cp "$cookies/".* "$dest/" 2>/dev/null || true
-    rm -f "$dest/"*.lock "$dest/.lock" "$dest/"*.db "$dest/health.json" 2>/dev/null || true
+    rm -f "$dest/"*.lock "$dest/.lock" "$dest/"*.db "$dest/"*.db-wal "$dest/"*.db-shm \
+        "$dest/"*.db-journal "$dest/health.json" 2>/dev/null || true
 }
 
+# The account's sync state in the session dir that kei_cookie_dir names.
 kei_db_path() {
-    printf '%s/%s.db' "$(kei_cookie_dir)" "$(kei_user_slug)"
+    printf '%s/%s.sync.db' "$(kei_cookie_dir)" "$(kei_user_slug)"
+}
+
+# A catalog of the whole primary library with nothing selected, built once by
+# kei_preflight_selection. A first sync lists the library from the start
+# (about six minutes on a 40k-record account); seeding a data dir from this
+# state makes its first sync read only the changes since.
+kei_listed_state_dir() {
+    printf '%s/listed-state-%s' "$(kei_scratch_base)" "$$"
+}
+
+# Copy the listed state into DEST, which must hold no state yet. Its download
+# folder is forgotten, so the first sync records DEST's own folder.
+kei_seed_listed_state() {
+    local dest="${1:?destination dir required}"
+    local source
+    source="$(kei_listed_state_dir)/$(kei_user_slug).sync.db"
+    if [ ! -f "$source" ]; then
+        echo "ABORT: no listed state; run kei_preflight_selection first" >&2
+        return 1
+    fi
+    python3 - "$source" "$dest/$(kei_user_slug).sync.db" <<'PY'
+import sqlite3
+import sys
+
+source, target = sys.argv[1:]
+with sqlite3.connect(f"file:{source}?mode=ro", uri=True) as src, sqlite3.connect(target) as dst:
+    src.backup(dst)
+    dst.execute("DELETE FROM kv WHERE key = 'download_directory'")
+PY
 }
 
 kei_live_filters() {
     local bounds
     bounds=$(kei_live_date_filters) || return 1
-    sed '/^\[import_sample\]/,$d' "$PROJECT_DIR/tests/data/live-selection.toml"
+    cat "$PROJECT_DIR/tests/data/live-selection.toml"
     printf '%s\n' "$bounds"
 }
 
@@ -85,11 +119,6 @@ kei_live_date_filters() {
     if [[ ${KEI_LIVE_SKIP_CREATED_AFTER+x} ]]; then
         printf 'skip_created_after = "%s"\n' "$KEI_LIVE_SKIP_CREATED_AFTER"
     fi
-}
-
-# Import-only sampling is separate from sync's mandatory fixed bound.
-kei_live_recent() {
-    awk '$1 == "recent" && $2 == "=" { print $3 }' "$PROJECT_DIR/tests/data/live-selection.toml"
 }
 
 kei_live_fixed_date() {
@@ -108,13 +137,38 @@ print(before)
 PY
 }
 
-# No download or shared-state mutation. Fail before account-dependent suites.
+# List the whole primary library once into kei_listed_state_dir, selecting
+# nothing, then fail before account-dependent suites if the bounded selection
+# is empty. Downloads nothing and writes no shared state.
 kei_preflight_selection() (
     kei_live_fixed_date >/dev/null || exit 1
-    local work config output count
+    local listed work config output count
+    listed="$(kei_listed_state_dir)"
+    if [ ! -f "$listed/$(kei_user_slug).sync.db" ]; then
+        rm -rf "$listed"
+        kei_copy_session_without_state "$listed"
+        config="$listed/listing.toml"
+        {
+            echo "config_version = 1"
+            echo "[download]"
+            printf 'directory = %s\n' "$(kei_toml_string "$listed/media")"
+            echo "[filters]"
+            echo 'albums = ["none"]'
+            echo "unfiled = true"
+            echo 'libraries = ["primary"]'
+            echo 'skip_created_before = "2999-01-01"'
+            echo 'skip_created_after = "2999-01-01"'
+        } >"$config"
+        if ! KEI_DATA_DIR="$listed" "$(kei_release_bin)" sync --config "$config" --no-progress-bar >"$listed/listing.log" 2>&1; then
+            echo "ABORT: listing the primary library failed" >&2
+            tail -20 "$listed/listing.log" >&2
+            exit 1
+        fi
+    fi
     work=$(mktemp -d "${TMPDIR:-/tmp}/kei-live-selection-XXXXXX") || exit 1
     trap 'rm -rf "$work"' EXIT
     kei_copy_session_without_state "$work/data"
+    kei_seed_listed_state "$work/data" || exit 1
     config=$(kei_write_sync_config "$work/data" "$work/media")
     if ! output=$(KEI_DATA_DIR="$work/data" "$(kei_release_bin)" sync --config "$config" --only-print-filenames --no-progress-bar); then
         echo "ABORT: bounded primary-library selection failed" >&2
@@ -128,6 +182,23 @@ kei_preflight_selection() (
         exit 1
     fi
 )
+
+# Value of FIELD summed over the `Library synced` lines in sync OUTPUT, such
+# as `downloaded` or `pages`. Prints nothing when no line has the field.
+kei_synced() {
+    local output="$1" field="$2"
+    # shellcheck disable=SC2001
+    sed 's/\x1b\[[0-9;]*m//g' <<<"$output" | awk -v field="$field" '
+        /Library synced/ {
+            for (i = 1; i <= NF; i++) {
+                if (index($i, field "=") == 1) {
+                    total += substr($i, length(field) + 2)
+                    seen = 1
+                }
+            }
+        }
+        END { if (seen) print total }'
+}
 
 kei_toml_string() {
     local s="$1"

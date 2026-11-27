@@ -33,7 +33,7 @@ tests/
   shell/
     lib.sh            shared helpers: release-binary, preflight, check, scratch
     concurrency.sh    concurrency, resume, partial-failure exit code
-    state-machine.sh  sync-token / config-hash lifecycle, corrupt recovery
+    state-machine.sh  saved position / planning fingerprint lifecycle, rejected-position recovery
     docker.sh         docker container scenarios
 ```
 
@@ -153,7 +153,7 @@ just test                       # all-feature offline tests
 just test offline               # all-feature/no-default suites + scenario catalog checks
 just test scenario NAME         # focused behavior slice from scripts/test-scenarios/
 just test scenarios             # every focused offline scenario slice
-just test live                  # live lookup + sync + state_auth + import-existing against iCloud
+just test live                  # live sync + state_auth + import-existing against iCloud (runs all, then fails)
 just test live-shell            # discovered live shell suites
 just test live-smoke            # release-binary live CLI/import smokes
 just test concurrency           # shell: concurrent/resume/partial-fail
@@ -261,9 +261,9 @@ opt-in (nightly + cargo-fuzz), excluded from `just gate`, and run via
 
 3. Choose an explicit fixed lower capture date containing at least one eligible primary-library asset. Set `KEI_LIVE_SKIP_CREATED_BEFORE` to that `YYYY-MM-DD` before running an authorized general live sync route, for example `KEI_LIVE_SKIP_CREATED_BEFORE=2025-01-01 just test live`. Replace the example date with your own narrowly chosen bound; all selected dates at or after it can download, so this is not a ten-item cap. An unset, invalid or rolling value fails closed before provider preflight.
 
-Each live test starts from empty state, and a first sync lists the whole library whatever the date bounds, so every test pays one full listing: about six minutes on a 40k-record account. Live commands time out after 30 minutes. Passwords reach `kei` through `--password-file` with a private temporary file, so a failed command never prints them.
+A first sync lists the whole library whatever the date bounds: about six minutes on a 40k-record account. So each Rust live test binary, and each shell suite, lists the primary library once into scratch state with a selection that matches no photo, then gives each test its own copy of that catalog (`require_preauth`, `kei_seed_listed_state`). A test's first sync reads only the changes since and plans its own selection; its download folder is new to the copy, so nothing is treated as moved. Tests of first-listing behavior use `require_preauth_fresh` or fresh state and pay the full listing. The shared session directory never holds sync state. Live commands time out after 30 minutes. Passwords reach `kei` through `--password-file` or the environment, never the command line, so a failed command never prints them.
 
-General live tests read the selectors in `tests/data/live-selection.toml`: albums `none`, unfiled enabled and the primary library. Rust `tests/common/live_selection.rs` and shell `tests/shell/lib.sh` add `[filters].skip_created_before` from `KEI_LIVE_SKIP_CREATED_BEFORE` to each generated config. Set optional `KEI_LIVE_SKIP_CREATED_AFTER` to an inclusive fixed upper capture date when the approved fixture is a closed interval. Missing upper dates retain lower-bound-only selection; empty, malformed or inverted dates fail before live authentication. Rust scenarios may narrow the configured interval but cannot widen it. Both bounds reach shell, cross-zone and release-binary sync configs. No named album, filename or media format is required. A filename-only preflight reports the eligible count and fails on an empty selection without downloading media. It uses isolated config/state paths and can reuse or refresh cached authentication.
+General live tests read the selectors in `tests/data/live-selection.toml`: albums `none`, unfiled enabled and the primary library. Rust `tests/common/live_selection.rs` and shell `tests/shell/lib.sh` add `[filters].skip_created_before` from `KEI_LIVE_SKIP_CREATED_BEFORE` to each generated config. Set optional `KEI_LIVE_SKIP_CREATED_AFTER` to an inclusive fixed upper capture date when the approved fixture is a closed interval. Missing upper dates retain lower-bound-only selection; empty, malformed or inverted dates fail before live authentication. Rust scenarios may narrow the configured interval but cannot widen it. Both bounds reach shell, cross-zone and release-binary sync configs. No named album, filename or media format is required. The listing step is also the preflight: a filename-only run against a copy of the listed state reports the eligible count and fails on an empty selection without downloading media. It uses isolated config/state paths and can reuse or refresh cached authentication.
 
 Exact content checks use the [bundled corpus](data/README.md). The
 [migration map](data/live-migration.md) names each deterministic replacement
@@ -353,11 +353,14 @@ happens:
   auth/session flows, service health, config docs, and full-test harness
   reachability. Each named filter must resolve to at least one current test.
   Use these before a broad gate when touching the matching owner path.
-- **`shell/concurrency.sh`** - things that need `kill -9` mid-process,
-  `chmod 555` on a target dir, direct sqlite3 assertions on the state
-  DB mid-test. Hard to do cleanly from Rust.
-- **`shell/state-machine.sh`** - token + config-hash invariants across
-  multiple kei invocations with DB mutation in between.
+- **`shell/concurrency.sh`** - things that need `kill -9` mid-download
+  and direct sqlite3 assertions on the state DB (every file on disk is a
+  saved copy, no duplicate paths). Hard to do cleanly from Rust.
+- **`shell/state-machine.sh`** - saved-position and planning-fingerprint
+  invariants across kei invocations with DB mutation in between: a config
+  change plans again without listing, `reset sync-token` and a rejected
+  position list from the start without downloading again, and a deleted
+  file returns through `kei reconcile`.
 - **`shell/docker.sh`** - anything that requires `docker run`, watch
   mode + SIGTERM, healthcheck probes inside the container.
 - **`scripts/full-test/run_release_archive_smoke.sh`** - packages the host
@@ -365,9 +368,10 @@ happens:
   probes against the extracted binary. `just test packaging` runs the host
   release build plus this smoke.
 - **`scripts/full-test/run_release_regression_smoke.sh`** - fast offline
-  patch-release gate for sync tokens, retry and pending adoption, pagination
-  diagnostics, media validation, pass templates, and config paths. Run it
-  before releases that touch those areas.
+  patch-release gate for the saved position, retry backoff, adoption of
+  files already on disk, interrupted and rejected listings, media
+  validation, and config paths. Run it before releases that touch those
+  areas.
 - **`scripts/full-test/run_docker_puid_smoke.sh`** - offline Docker entrypoint
   checks for PUID/PGID drop, UID/GID repair and opt-out, symlink safety,
   `MALLOC_ARENA_MAX=2`, root-default behavior, and invalid env rejection. `just test docker-full` runs this with
@@ -376,13 +380,15 @@ happens:
   Docker build-context filtering and the image healthcheck at default/custom
   ports, including HTTP failure. Requires host port 9090 to be free.
 - **`scripts/full-test/run_live_import_rehearsal.sh`** - live mini rehearsal
-  for the TOML-first import path: seed a tiny real tree, import it into a fresh
-  DB, and verify a repeat dry-run stays matched. `just test live-smoke` runs
-  this after the release-binary live CLI smokes.
+  for the TOML-first import path: seed a tiny real tree, import it into
+  separate state, and verify that the import records the seed's exact
+  copies, a repeat dry-run finds them recorded, and a following sync neither
+  downloads nor adopts. `just test live-smoke` runs this after the
+  release-binary live CLI smokes.
 - **`scripts/full-test/run_cross_zone_album_hydration.sh`** - opt-in live
   release-binary check for accounts with a prepared cross-zone album fixture.
   It selects the named album with `libraries = ["all"]` and fails unless the
-  sync records at least one downloaded asset from a non-primary source zone.
+  sync records at least one saved copy from a non-primary source zone.
 - **`service-smoke` workflow** - per-platform CI smoke for `kei install`
   / `kei uninstall`. Builds the release binary on
   `ubuntu-latest`/`macos-latest`/`windows-latest`, runs `kei install
