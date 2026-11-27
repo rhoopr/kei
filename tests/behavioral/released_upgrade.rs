@@ -50,7 +50,7 @@ fn schema_version(db: &Path) -> i32 {
 /// script supplies a checksum-verified old binary and runs this same history
 /// inside a Linux network namespace. No release is downloaded by this test.
 #[test]
-fn released_v0240_history_preserves_durable_evidence_through_upgrade() {
+fn released_v0240_history_upgrades_without_changing_the_released_file() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let db = root.join("upgradeexampleinvalid.db");
@@ -142,15 +142,6 @@ fn released_v0240_history_preserves_durable_evidence_through_upgrade() {
     let part = media.join("pending.jpg.part");
     std::fs::write(&part, b"synthetic partial transfer").unwrap();
     let before = rows(&db, "SELECT * FROM assets ORDER BY library,id,version_size");
-    let identities = rows(&db, "SELECT * FROM asset_master_mappings ORDER BY library");
-    let owners = rows(
-        &db,
-        "SELECT * FROM legacy_master_state_owners ORDER BY library",
-    );
-    let checkpoints = rows(&db, "SELECT * FROM metadata ORDER BY key");
-    let capture = rows(&db, "SELECT * FROM metadata_capture_state ORDER BY library");
-    let runs = rows(&db, "SELECT * FROM sync_runs ORDER BY id");
-    let albums = rows(&db, "SELECT * FROM asset_albums ORDER BY library");
 
     // Meaningful old CLI validation before the upgrade, including detecting
     // external edits without acknowledging them as downloaded bytes.
@@ -180,79 +171,35 @@ fn released_v0240_history_preserves_durable_evidence_through_upgrade() {
     super::support::bind_synthetic_owner(&adopted, "upgrade@example.invalid");
     drop(adopted);
     std::fs::remove_file(media.join("removed.jpg")).unwrap();
-    // Config drift is not permission for an offline command to advance tokens.
-    super::write_sync_config(&config, root.join("new-destination").to_str().unwrap());
+    let legacy_bytes = std::fs::read(&db).unwrap();
+    // The first command builds the new state from verified copies and
+    // leaves the released file untouched until a full listing completes.
     let verification = run(&current, root, &["verify", "--checksums"], false);
-    assert!(
-        verification.contains("Missing:                        1"),
-        "{verification}"
-    );
-    assert_eq!(schema_version(&db), super::support::HELPER_SCHEMA_VERSION);
+    assert!(verification.contains("MISSING"), "{verification}");
+    assert!(verification.contains("removed.jpg"), "{verification}");
+    assert_eq!(std::fs::read(&db).unwrap(), legacy_bytes);
+    let upgraded = db.with_extension("sync.db");
+    assert!(upgraded.exists());
+    let carried = rows(&upgraded, "SELECT path FROM imported ORDER BY path");
     assert_eq!(
-        rows(&db, "SELECT * FROM assets ORDER BY library,id,version_size"),
-        before
+        carried,
+        ["edited.jpg", "original.jpg", "removed.jpg", "shared.jpg"]
+            .map(|path| vec![rusqlite::types::Value::Text(path.to_owned())])
     );
-    assert_eq!(
-        rows(&db, "SELECT * FROM asset_master_mappings ORDER BY library"),
-        identities
-    );
-    assert_eq!(
-        rows(
-            &db,
-            "SELECT * FROM legacy_master_state_owners ORDER BY library"
-        ),
-        owners
-    );
-    assert_eq!(
-        rows(
-            &db,
-            "SELECT * FROM historical_v030_checkpoints ORDER BY key"
-        ),
-        checkpoints
-    );
-    assert!(rows(&db, "SELECT * FROM metadata ORDER BY key").is_empty());
-    assert_eq!(
-        rows(&db, "SELECT * FROM metadata_capture_state ORDER BY library"),
-        capture
-    );
-    assert_eq!(rows(&db, "SELECT * FROM sync_runs ORDER BY id"), runs);
-    assert_eq!(
-        rows(&db, "SELECT * FROM asset_albums ORDER BY library"),
-        albums
-    );
-
-    // Actual production reconciliation durably enqueues missing media. It does
-    // not delete the row, grant identity, or pretend restoration is a download.
-    run(&current, root, &["reconcile"], true);
-    let failed = rows(
-        &db,
-        "SELECT status,last_error FROM assets WHERE id='removed'",
-    );
-    assert_eq!(
-        failed,
-        vec![vec![
-            "failed".to_string().into(),
-            "FILE_MISSING_AT_STARTUP".to_string().into()
-        ]]
-    );
+    // Reconcile lists the missing copy for the next sync; it never deletes,
+    // grants identity, or pretends restoration is a download.
+    let reconciled = run(&current, root, &["reconcile"], true);
+    assert!(reconciled.contains("removed.jpg"), "{reconciled}");
     std::fs::write(media.join("removed.jpg"), removed).unwrap();
-    let stable = rows(&db, "SELECT * FROM assets ORDER BY library,id,version_size");
+    let stable = rows(&upgraded, "SELECT * FROM imported ORDER BY path");
     for _ in 0..2 {
         run(&current, root, &["reconcile"], true);
         run(&current, root, &["verify", "--checksums"], true);
         assert_eq!(
-            rows(&db, "SELECT * FROM assets ORDER BY library,id,version_size"),
+            rows(&upgraded, "SELECT * FROM imported ORDER BY path"),
             stable
         );
-        assert_eq!(
-            rows(
-                &db,
-                "SELECT * FROM historical_v030_checkpoints ORDER BY key"
-            ),
-            checkpoints
-        );
-        assert!(rows(&db, "SELECT * FROM metadata ORDER BY key").is_empty());
-        assert_eq!(schema_version(&db), super::support::HELPER_SCHEMA_VERSION);
+        assert_eq!(std::fs::read(&db).unwrap(), legacy_bytes);
         for (_, _, _, filename, bytes) in entries {
             assert_eq!(std::fs::read(media.join(filename)).unwrap(), bytes);
         }

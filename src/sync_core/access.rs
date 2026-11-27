@@ -228,11 +228,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let owner = signed_in("me@example.invalid", "1");
         let mine = location(root.path(), "me@example.invalid").await;
-        drop(
-            crate::state::SqliteStateDb::open_owned(&mine.legacy, &owner)
-                .await
-                .unwrap(),
-        );
+        crate::test_helpers::legacy_state_db(&mine.legacy, &owner);
         let upgraded = open(&mine, &owner, Some(root.path()))
             .await
             .unwrap()

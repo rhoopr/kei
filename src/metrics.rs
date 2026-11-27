@@ -31,7 +31,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::download::SyncStats;
 use crate::health::HealthStatus;
-use crate::state::types::SyncSummary;
 
 /// Cumulative count of `mark_downloaded` calls that matched 0 rows in the
 /// `assets` table — i.e. a download was promoted without a matching
@@ -88,22 +87,6 @@ static TARGETED_RECORD_LOOKUPS: LazyLock<Family<RecordLookupLabels, Counter>> =
     LazyLock::new(Family::default);
 static TRANSFERS_DEFERRED_AFTER_CHECKPOINT: LazyLock<Counter> = LazyLock::new(Counter::default);
 
-pub(crate) fn record_checkpoint_decision(decision: &'static str, reason: &'static str) {
-    CHECKPOINT_DECISIONS
-        .get_or_create(&CheckpointDecisionLabels { decision, reason })
-        .inc();
-}
-
-pub(crate) fn record_targeted_lookup(outcome: &'static str, count: usize) {
-    TARGETED_RECORD_LOOKUPS
-        .get_or_create(&RecordLookupLabels { outcome })
-        .inc_by(count as u64);
-}
-
-pub(crate) fn record_deferred_transfers(count: usize) {
-    TRANSFERS_DEFERRED_AFTER_CHECKPOINT.inc_by(count as u64);
-}
-
 /// Label set for the `kei_db_assets_total` and `kei_db_assets_size_bytes` gauge families.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, prometheus_client::encoding::EncodeLabelSet)]
 struct StatusLabels {
@@ -159,7 +142,6 @@ pub(crate) struct MetricsHandle {
     // DB-backed gauges (only populated when --metrics-port is set).
     db_assets_total: Family<StatusLabels, Gauge>,
     db_assets_size_bytes: Family<StatusLabels, Gauge>,
-    pending_verification_age_seconds: Gauge,
     db_last_sync_assets_seen: Gauge,
     db_summary_read_failures: Counter,
 }
@@ -350,13 +332,6 @@ impl MetricsHandle {
             db_assets_size_bytes.clone(),
         );
 
-        let pending_verification_age_seconds: Gauge = Gauge::default();
-        registry.register(
-            "kei_pending_provider_verification_age_seconds",
-            "Age in seconds of the oldest unresolved targeted provider verification",
-            pending_verification_age_seconds.clone(),
-        );
-
         let db_last_sync_assets_seen: Gauge = Gauge::default();
         registry.register(
             "kei_db_last_sync_assets_seen",
@@ -418,7 +393,6 @@ impl MetricsHandle {
             interrupted_cycles,
             db_assets_total,
             db_assets_size_bytes,
-            pending_verification_age_seconds,
             db_last_sync_assets_seen,
             db_summary_read_failures,
         }
@@ -485,14 +459,6 @@ impl MetricsHandle {
         self.update_health_gauges(health).await;
     }
 
-    /// Update only the health gauges and the /healthz snapshot.
-    ///
-    /// Use this on skipped cycles (no changes detected in watch mode) so that
-    /// `cycle_duration_seconds` and download counters are not clobbered.
-    pub(crate) async fn update_health_only(&self, health: &HealthStatus) {
-        self.update_health_gauges(health).await;
-    }
-
     /// Increment the session expiration counter.
     ///
     /// Call this whenever a sync cycle is aborted due to an expired iCloud
@@ -501,63 +467,36 @@ impl MetricsHandle {
         self.session_expirations.inc();
     }
 
-    /// Update DB-backed gauges from the current state database summary.
-    ///
-    /// Call this after [`Self::update`] on every real sync cycle, guarded by a
-    /// `state_db.as_ref()` check so dry-run and metrics-disabled paths are
-    /// no-ops. `assets_seen` comes from [`SyncStats`] already in hand at the
-    /// call site, so no extra DB query is needed for that gauge.
-    pub(crate) fn update_db_stats(&self, summary: &SyncSummary, assets_seen: u64) {
-        self.db_assets_total
-            .get_or_create(&StatusLabels {
-                status: "downloaded",
-            })
-            .set(i64::try_from(summary.downloaded).unwrap_or(i64::MAX));
-        self.db_assets_total
-            .get_or_create(&StatusLabels { status: "pending" })
-            .set(i64::try_from(summary.pending).unwrap_or(i64::MAX));
-        self.db_assets_total
-            .get_or_create(&StatusLabels {
-                status: "policy_excluded",
-            })
-            .set(i64::try_from(summary.policy_excluded).unwrap_or(i64::MAX));
-        self.db_assets_total
-            .get_or_create(&StatusLabels { status: "failed" })
-            .set(i64::try_from(summary.failed).unwrap_or(i64::MAX));
-        self.db_assets_total
-            .get_or_create(&StatusLabels {
-                status: "awaiting_provider_verification",
-            })
-            .set(i64::try_from(summary.awaiting_provider_verification).unwrap_or(i64::MAX));
-        self.db_assets_total
-            .get_or_create(&StatusLabels {
-                status: "source_deleted",
-            })
-            .set(i64::try_from(summary.source_deleted).unwrap_or(i64::MAX));
-        let verification_age = summary
-            .oldest_provider_verification_at
-            .map(|checked_at| {
-                Utc::now()
-                    .signed_duration_since(checked_at)
-                    .num_seconds()
-                    .max(0)
-            })
-            .unwrap_or(0);
-        self.pending_verification_age_seconds.set(verification_age);
-        self.db_assets_size_bytes
-            .get_or_create(&StatusLabels {
-                status: "downloaded",
-            })
-            .set(i64::try_from(summary.downloaded_bytes).unwrap_or(i64::MAX));
+    /// Update state-backed gauges from the sync core's backup completeness.
+    pub(crate) fn update_db_stats(
+        &self,
+        completeness: &crate::sync_core::state::Completeness,
+        assets_seen: u64,
+    ) {
+        for ((status, count), bytes) in [
+            ("downloaded", completeness.done),
+            ("pending", completeness.pending),
+            ("failed", completeness.failed),
+            ("locally_modified", completeness.modified),
+        ]
+        .into_iter()
+        .zip(completeness.bytes)
+        {
+            self.db_assets_total
+                .get_or_create(&StatusLabels { status })
+                .set(i64::try_from(count).unwrap_or(i64::MAX));
+            self.db_assets_size_bytes
+                .get_or_create(&StatusLabels { status })
+                .set(i64::try_from(bytes).unwrap_or(i64::MAX));
+        }
         self.db_last_sync_assets_seen
             .set(i64::try_from(assets_seen).unwrap_or(i64::MAX));
     }
 
     /// Increment the counter for failed DB summary reads.
     ///
-    /// Call this whenever [`get_summary`](crate::state::ReportStateStore::get_summary)
-    /// returns an error during a metrics update so the failure is visible in
-    /// the `/metrics` output rather than only in the log.
+    /// Call this whenever reading the state for a metrics update fails, so
+    /// the failure is visible in `/metrics` rather than only in the log.
     pub(crate) fn record_db_summary_failure(&self) {
         self.db_summary_read_failures.inc();
     }
@@ -872,7 +811,7 @@ mod tests {
         let handle = MetricsHandle::new(None);
         let stats = SyncStats {
             full_enumeration_reason: Some(
-                crate::download::FullEnumerationReason::AlbumRelationHydrationIncomplete,
+                crate::sync_stats::FullEnumerationReason::PositionRejected,
             ),
             ..SyncStats::default()
         };
@@ -880,136 +819,15 @@ mod tests {
 
         let output = render_metrics(&handle).await;
         assert!(
-            output.contains(
-                "kei_sync_full_enumeration_reason_total{reason=\"album_relation_hydration_incomplete\"} 1"
-            ),
+            output
+                .contains("kei_sync_full_enumeration_reason_total{reason=\"position_rejected\"} 1"),
             "output:\n{output}"
-        );
-    }
-
-    #[tokio::test]
-    async fn recovery_metrics_export_counters_and_bounded_decisions() {
-        let handle = MetricsHandle::new(None);
-        let stats = SyncStats {
-            tail_probes: 2,
-            count_undercount_assets: 3,
-            same_cycle_recovery_attempts: 1,
-            same_cycle_recovery_successes: 1,
-            ..SyncStats::default()
-        };
-        record_checkpoint_decision("preserved", "pass_token_missing");
-        record_targeted_lookup("present", 4);
-        record_deferred_transfers(5);
-        handle.update(&stats, &healthy_status(0)).await;
-
-        let output = render_metrics(&handle).await;
-        for expected in [
-            "kei_sync_tail_probes_total 2",
-            "kei_sync_count_undercount_assets_total 3",
-            "kei_sync_same_cycle_recovery_attempts_total 1",
-            "kei_sync_same_cycle_recovery_successes_total 1",
-            "kei_sync_checkpoint_decisions_total{decision=\"preserved\",reason=\"pass_token_missing\"}",
-            "kei_sync_targeted_record_lookups_total{outcome=\"present\"}",
-            "kei_sync_transfers_deferred_after_checkpoint_total",
-        ] {
-            assert!(output.contains(expected), "missing {expected}:\n{output}");
-        }
-    }
-
-    #[tokio::test]
-    async fn gauges_reflect_only_the_latest_cycle() {
-        let handle = MetricsHandle::new(None);
-        let stats1 = SyncStats {
-            elapsed_secs: 10.0,
-            ..Default::default()
-        };
-        handle.update(&stats1, &healthy_status(0)).await;
-
-        let stats2 = SyncStats {
-            elapsed_secs: 25.0,
-            ..Default::default()
-        };
-        handle.update(&stats2, &healthy_status(0)).await;
-
-        let output = render_metrics(&handle).await;
-        assert!(
-            output.contains("kei_sync_cycle_duration_seconds 25"),
-            "output:\n{output}"
-        );
-        assert!(
-            !output.contains("kei_sync_cycle_duration_seconds 10"),
-            "old gauge value should not appear:\n{output}"
         );
     }
 
     // ── update_health_only does not clobber cycle duration ────────────────────
 
-    #[tokio::test]
-    async fn cycle_duration_not_clobbered_by_health_only_update() {
-        let handle = MetricsHandle::new(None);
-        let stats = SyncStats {
-            elapsed_secs: 25.0,
-            ..Default::default()
-        };
-        handle.update(&stats, &healthy_status(0)).await;
-
-        // Simulate a skipped cycle: should not reset duration to 0.
-        handle.update_health_only(&healthy_status(0)).await;
-
-        let output = render_metrics(&handle).await;
-        assert!(
-            output.contains("kei_sync_cycle_duration_seconds 25"),
-            "cycle_duration_seconds should not be clobbered by update_health_only:\n{output}"
-        );
-    }
-
-    #[tokio::test]
-    async fn health_only_update_still_refreshes_health_gauges() {
-        let handle = MetricsHandle::new(None);
-        // First real cycle with 3 failures.
-        handle
-            .update(&SyncStats::default(), &healthy_status(3))
-            .await;
-        // Skipped cycle that resolves to healthy.
-        handle.update_health_only(&healthy_status(0)).await;
-
-        let output = render_metrics(&handle).await;
-        assert!(
-            output.contains("kei_health_consecutive_failures 0"),
-            "health gauge should be updated by update_health_only:\n{output}"
-        );
-    }
-
-    #[tokio::test]
-    async fn health_only_update_refreshes_healthz_snapshot() {
-        let handle = MetricsHandle::new(None);
-        handle.update_health_only(&healthy_status(0)).await;
-
-        let (status, _body) = render_healthz(&handle).await;
-        assert_eq!(
-            status,
-            axum::http::StatusCode::OK,
-            "/healthz should return 200 after update_health_only with no failures"
-        );
-    }
-
     // ── interrupted counter ───────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn interrupted_flag_increments_counter() {
-        let handle = MetricsHandle::new(None);
-        let stats = SyncStats {
-            interrupted: true,
-            ..Default::default()
-        };
-        handle.update(&stats, &healthy_status(0)).await;
-
-        let output = render_metrics(&handle).await;
-        assert!(
-            output.contains("kei_sync_interrupted_cycles_total 1"),
-            "output:\n{output}"
-        );
-    }
 
     #[tokio::test]
     async fn non_interrupted_cycle_does_not_increment_counter() {
@@ -1293,151 +1111,17 @@ mod tests {
 
     // ── DB-backed gauges ──────────────────────────────────────────────────────
 
-    fn make_summary(
-        downloaded: u64,
-        pending: u64,
-        failed: u64,
-        downloaded_bytes: u64,
-    ) -> SyncSummary {
-        SyncSummary {
-            primary_layout: None,
-            unresolved_identity_zones: 0,
-            unresolved_sparse_records: 0,
-            deferred_sparse_records: 0,
-            total_assets: downloaded + pending + failed,
-            downloaded,
-            pending,
-            policy_excluded: 0,
-            failed,
-            awaiting_provider_verification: 0,
-            source_deleted: 0,
-            oldest_provider_verification_at: None,
-            provider_checkpoint_status: None,
-            last_recovery_action: None,
-            last_full_enumeration_reason: None,
-            downloaded_bytes,
-            active_sync_started: None,
-            active_enumeration_zones: Vec::new(),
-            last_sync_completed: None,
-            last_sync_started: None,
-            last_sync_status: None,
-            last_sync_assets_failed: 0,
-            last_sync_enumeration_errors: 0,
-            last_sync_interrupted: false,
-            last_api_total_at_start: None,
-            last_api_total_at_start_partial: false,
-            last_inventory_drop_detected: false,
-            last_inventory_drop_previous_total: None,
-            last_inventory_drop_current_total: None,
-            last_inventory_drop_library: None,
-            metadata_capture: Vec::new(),
-        }
-    }
-
-    #[tokio::test]
-    async fn update_db_stats_sets_asset_count_gauges() {
-        let handle = MetricsHandle::new(None);
-        let mut summary = make_summary(100, 5, 2, 1_000_000);
-        summary.policy_excluded = 3;
-        summary.total_assets += 3;
-        handle.update_db_stats(&summary, 110);
-
-        let output = render_metrics(&handle).await;
-        assert!(
-            output.contains(r#"kei_db_assets_total{status="downloaded"} 100"#),
-            "downloaded count missing or wrong:\n{output}"
-        );
-        assert!(
-            output.contains(r#"kei_db_assets_total{status="pending"} 5"#),
-            "pending count missing or wrong:\n{output}"
-        );
-        assert!(
-            output.contains(r#"kei_db_assets_total{status="policy_excluded"} 3"#),
-            "policy-excluded count missing or wrong:\n{output}"
-        );
-        assert!(
-            output.contains(r#"kei_db_assets_total{status="failed"} 2"#),
-            "failed count missing or wrong:\n{output}"
-        );
-    }
-
-    #[tokio::test]
-    async fn update_db_stats_exports_verification_and_source_deleted_gauges() {
-        let handle = MetricsHandle::new(None);
-        let mut summary = make_summary(10, 2, 1, 1_000);
-        summary.awaiting_provider_verification = 2;
-        summary.source_deleted = 7;
-        summary.oldest_provider_verification_at = Some(Utc::now() - chrono::Duration::seconds(60));
-        handle.update_db_stats(&summary, 13);
-
-        let output = render_metrics(&handle).await;
-        assert!(
-            output.contains(r#"kei_db_assets_total{status="awaiting_provider_verification"} 2"#),
-            "output:\n{output}"
-        );
-        assert!(
-            output.contains(r#"kei_db_assets_total{status="source_deleted"} 7"#),
-            "output:\n{output}"
-        );
-        let age_line = output
-            .lines()
-            .find(|line| line.starts_with("kei_pending_provider_verification_age_seconds "))
-            .expect("verification age gauge");
-        let age = age_line
-            .split_once(' ')
-            .and_then(|(_, value)| value.parse::<i64>().ok())
-            .expect("integer verification age");
-        assert!((60..=65).contains(&age), "age line: {age_line}");
-    }
-
-    #[tokio::test]
-    async fn update_db_stats_sets_size_bytes_gauge() {
-        let handle = MetricsHandle::new(None);
-        let summary = make_summary(50, 0, 0, 2_048_000);
-        handle.update_db_stats(&summary, 50);
-
-        let output = render_metrics(&handle).await;
-        assert!(
-            output.contains(r#"kei_db_assets_size_bytes{status="downloaded"} 2048000"#),
-            "downloaded_bytes gauge missing or wrong:\n{output}"
-        );
-    }
-
-    #[tokio::test]
-    async fn update_db_stats_sets_last_sync_assets_seen_gauge() {
-        let handle = MetricsHandle::new(None);
-        let summary = make_summary(28_000, 3_000, 71, 0);
-        handle.update_db_stats(&summary, 31_071);
-
-        let output = render_metrics(&handle).await;
-        assert!(
-            output.contains("kei_db_last_sync_assets_seen 31071"),
-            "last_sync_assets_seen gauge missing or wrong:\n{output}"
-        );
-    }
-
-    #[tokio::test]
-    async fn update_db_stats_gauges_reflect_latest_call() {
-        let handle = MetricsHandle::new(None);
-        handle.update_db_stats(&make_summary(100, 10, 0, 500_000), 110);
-        // Second call should overwrite (gauges, not counters).
-        handle.update_db_stats(&make_summary(105, 5, 0, 525_000), 110);
-
-        let output = render_metrics(&handle).await;
-        assert!(
-            !output.contains("kei_db_assets_total{status=\"pending\"} 10"),
-            "stale pending value should not appear:\n{output}"
-        );
-        assert!(
-            output.contains("kei_db_last_sync_assets_seen 110"),
-            "assets_seen gauge wrong:\n{output}"
-        );
-    }
-
     #[tokio::test]
     async fn db_metric_names_present_in_output() {
         let handle = MetricsHandle::new(None);
-        handle.update_db_stats(&make_summary(1, 0, 0, 1024), 1);
+        handle.update_db_stats(
+            &crate::sync_core::state::Completeness {
+                done: 1,
+                bytes: [1024, 0, 0, 0],
+                ..Default::default()
+            },
+            1,
+        );
 
         let output = render_metrics(&handle).await;
         assert!(

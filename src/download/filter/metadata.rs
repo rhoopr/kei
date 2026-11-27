@@ -1,11 +1,6 @@
 //! Metadata payloads and preloaded album/people enrichment.
 
-use std::sync::Arc;
-
 use rustc_hash::FxHashMap;
-
-use crate::download::DownloadConfig;
-use crate::download::pipeline::MetadataFlags;
 
 /// Metadata values surfaced on a `DownloadTask` for write-out to embedded XMP
 /// / native EXIF / XMP sidecars.
@@ -94,11 +89,11 @@ impl MetadataPayload {
         mut self,
         albums: &[String],
         people: &[String],
-        flags: MetadataFlags,
+        (include_albums, include_people): (bool, bool),
     ) -> Self {
         // Linear scan: typical cardinalities are <10 each, so a HashSet
         // rebuild costs more than it saves.
-        if flags.contains(MetadataFlags::INCLUDE_ALBUMS) {
+        if include_albums {
             for album in albums {
                 if !self.keywords.iter().any(|k| k == album) {
                     self.keywords.push(album.clone());
@@ -107,7 +102,7 @@ impl MetadataPayload {
         }
         // Skip the allocation when people is empty (common: libraries
         // without face tagging never populate this side of the groupings).
-        if flags.contains(MetadataFlags::INCLUDE_PEOPLE) && !people.is_empty() {
+        if include_people && !people.is_empty() {
             self.people = people.to_vec();
         }
         self
@@ -132,7 +127,7 @@ impl AssetGroupings {
         &self,
         asset_id: &str,
         metadata: &crate::state::AssetMetadata,
-        flags: MetadataFlags,
+        flags: (bool, bool),
     ) -> MetadataPayload {
         let albums = self.albums.get(asset_id).map(Vec::as_slice).unwrap_or(&[]);
         let people = self.people.get(asset_id).map(Vec::as_slice).unwrap_or(&[]);
@@ -144,186 +139,5 @@ impl AssetGroupings {
             payload.observed_absent |= crate::state::types::embedded_absence::PEOPLE;
         }
         payload
-    }
-}
-
-#[cfg(test)]
-fn build_payload(
-    asset: &crate::icloud::photos::PhotoAsset,
-    config: &DownloadConfig,
-) -> Arc<MetadataPayload> {
-    build_selected_payload(asset, config, crate::state::VersionSizeKey::Original)
-}
-
-/// Keep source/rendition provenance aligned with the stable selected key.
-pub(in crate::download) fn build_selected_payload(
-    asset: &crate::icloud::photos::PhotoAsset,
-    config: &DownloadConfig,
-    version: crate::state::VersionSizeKey,
-) -> Arc<MetadataPayload> {
-    let metadata = super::versions::metadata_for_selected_version(asset, config, version);
-    let flags = MetadataFlags::from(config);
-    let mut payload = config
-        .asset_groupings
-        .metadata_payload(asset.state_id(), &metadata, flags);
-    if flags.contains(MetadataFlags::ORIENTATION)
-        && let Some((_, facts)) = asset
-            .rendition_facts()
-            .iter()
-            .find(|(key, _)| *key == version)
-        && let Some(checksum) = facts.checksum.as_deref()
-    {
-        payload.original_orientation =
-            crate::icloud::photos::metadata::original_orientation(&metadata, version, checksum);
-    }
-    if let Some(album) = config.album_name.as_deref().filter(|name| !name.is_empty())
-        && flags.contains(MetadataFlags::INCLUDE_ALBUMS)
-        && !payload.keywords.iter().any(|keyword| keyword == album)
-    {
-        payload.keywords.push(album.to_owned());
-    }
-    Arc::new(payload)
-}
-
-#[cfg(test)]
-mod tests {
-    #[cfg(feature = "xmp")]
-    use std::sync::Arc;
-
-    use crate::download::pipeline::MetadataFlags;
-    use crate::test_helpers::TestPhotoAsset;
-
-    use super::super::test_support::test_config;
-    #[cfg(feature = "xmp")]
-    use super::AssetGroupings;
-    use super::{MetadataPayload, build_payload};
-
-    // ── MetadataPayload + AssetGroupings tests ─────────────────────────
-
-    fn asset_metadata_with_keywords(keywords_json: &str) -> crate::state::AssetMetadata {
-        crate::state::AssetMetadata {
-            title: Some("Beach day".to_string()),
-            description: Some("Sunny afternoon".to_string()),
-            keywords: Some(keywords_json.to_string()),
-            rating: Some(4),
-            latitude: Some(37.7),
-            longitude: Some(-122.4),
-            altitude: Some(10.0),
-            is_hidden: true,
-            is_archived: false,
-            media_subtype: Some("portrait".to_string()),
-            burst_id: Some("burst-1".to_string()),
-            ..crate::state::AssetMetadata::default()
-        }
-    }
-
-    #[test]
-    fn metadata_payload_parses_keywords_json() {
-        let meta = asset_metadata_with_keywords(r#"["vacation","beach","sun"]"#);
-        let p = MetadataPayload::from_metadata(&meta);
-        assert_eq!(
-            p.keywords,
-            vec!["vacation".to_string(), "beach".into(), "sun".into()]
-        );
-    }
-
-    #[test]
-    fn metadata_payload_keywords_are_empty_on_bad_json() {
-        let meta = asset_metadata_with_keywords("not json");
-        let p = MetadataPayload::from_metadata(&meta);
-        assert!(
-            p.keywords.is_empty(),
-            "malformed keywords JSON must not poison payload"
-        );
-    }
-
-    #[test]
-    fn metadata_payload_description_falls_back_to_title() {
-        let mut meta = asset_metadata_with_keywords("[]");
-        meta.description = None;
-        let p = MetadataPayload::from_metadata(&meta);
-        assert_eq!(p.description, Some("Beach day".to_string()));
-    }
-
-    #[test]
-    fn metadata_payload_carries_all_new_fields() {
-        let meta = asset_metadata_with_keywords("[]");
-        let p = MetadataPayload::from_metadata(&meta);
-        assert_eq!(p.title, Some("Beach day".into()));
-        assert!(p.is_hidden);
-        assert!(!p.is_archived);
-        assert_eq!(p.media_subtype, Some("portrait".into()));
-        assert_eq!(p.burst_id, Some("burst-1".into()));
-    }
-
-    #[test]
-    fn with_asset_groupings_merges_albums_into_keywords() {
-        let meta = asset_metadata_with_keywords(r#"["sun"]"#);
-        let p = MetadataPayload::from_metadata(&meta).with_asset_groupings(
-            &["Favorites".into(), "Trip".into()],
-            &[],
-            MetadataFlags::INCLUDE_ALBUMS,
-        );
-        assert_eq!(p.keywords, vec!["sun", "Favorites", "Trip"]);
-    }
-
-    #[test]
-    fn with_asset_groupings_dedupes_existing_album_keywords() {
-        let meta = asset_metadata_with_keywords(r#"["Favorites"]"#);
-        let p = MetadataPayload::from_metadata(&meta).with_asset_groupings(
-            &["Favorites".into(), "Trip".into()],
-            &[],
-            MetadataFlags::INCLUDE_ALBUMS,
-        );
-        assert_eq!(
-            p.keywords,
-            vec!["Favorites", "Trip"],
-            "album already in keywords must not appear twice"
-        );
-    }
-
-    #[test]
-    fn with_asset_groupings_populates_people() {
-        let meta = asset_metadata_with_keywords("[]");
-        let p = MetadataPayload::from_metadata(&meta).with_asset_groupings(
-            &[],
-            &["Alice".into(), "Bob".into()],
-            MetadataFlags::INCLUDE_PEOPLE,
-        );
-        assert_eq!(p.people, vec!["Alice", "Bob"]);
-    }
-
-    #[test]
-    #[cfg(feature = "xmp")]
-    fn build_payload_reads_grouping_index_from_config() {
-        let asset = TestPhotoAsset::new("GROUP_1").build();
-        let mut groupings = AssetGroupings::default();
-        groupings
-            .albums
-            .insert("GROUP_1".into(), vec!["Favorites".into()]);
-        groupings
-            .people
-            .insert("GROUP_1".into(), vec!["Alice".into()]);
-        let mut config = test_config();
-        config.metadata.embed_xmp = true;
-        config.asset_groupings = Arc::new(groupings);
-        config.album_name = Some(Arc::from("Current pass"));
-        let disabled = build_payload(&asset, &config);
-        assert!(disabled.keywords.is_empty());
-        assert!(disabled.people.is_empty());
-        config.metadata.include_albums = true;
-        config.metadata.include_people = true;
-        let payload = build_payload(&asset, &config);
-        assert!(payload.keywords.contains(&"Favorites".to_string()));
-        assert!(payload.keywords.contains(&"Current pass".to_string()));
-        assert_eq!(payload.people, vec!["Alice".to_string()]);
-    }
-
-    #[test]
-    fn build_payload_is_empty_grouping_safe() {
-        let asset = TestPhotoAsset::new("EMPTY_1").build();
-        let config = test_config();
-        let payload = build_payload(&asset, &config);
-        assert!(payload.people.is_empty());
     }
 }

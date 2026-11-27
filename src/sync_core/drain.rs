@@ -199,6 +199,10 @@ async fn download_batch(
             row.size = file.size;
         }
         let path = config.directory.join(&row.path);
+        if row.sha256.is_some() {
+            // Settle a replacement a crash interrupted before comparing bytes.
+            core_io::recover_replacement(&path).await?;
+        }
         let replace = match &row.sha256 {
             None => None,
             Some(recorded) => match untouched(&path, recorded).await? {
@@ -242,6 +246,7 @@ async fn download_batch(
                     replace,
                     modified: seconds,
                     cancel,
+                    bandwidth: config.bandwidth.as_ref(),
                 })
                 .await;
                 (row, result)
@@ -275,6 +280,9 @@ enum Untouched {
 }
 
 /// Compare a local file with the hash kei recorded when it wrote it.
+// CONTRACT: REPLACE_REQUIRES_RECORDED_BYTES
+// A copy is replaced only while its bytes still hash to what kei recorded;
+// anything else is kept and reported as locally modified.
 async fn untouched(path: &Path, recorded: &str) -> anyhow::Result<Untouched> {
     let Some(expected) = core_io::parse_sha256(recorded) else {
         return Ok(Untouched::Changed);

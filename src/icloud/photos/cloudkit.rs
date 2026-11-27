@@ -38,22 +38,6 @@ pub(crate) struct ZoneId {
 pub(crate) struct QueryResponse {
     #[serde(default)]
     pub records: Vec<Record>,
-    #[serde(default, rename = "syncToken")]
-    pub sync_token: Option<String>,
-    /// CloudKit pagination cursor. Present iff there are more records;
-    /// callers must echo it in the next request body to fetch the next
-    /// page. Apple's `records/query` defaults to `resultsLimit=200`, so
-    /// a caller that ignores this field silently truncates any query
-    /// whose result set exceeds 200 rows.
-    #[serde(default, rename = "continuationMarker")]
-    pub continuation_marker: Option<String>,
-}
-
-/// Response from `/internal/records/query/batch`.
-#[derive(Debug, Deserialize)]
-pub(crate) struct BatchQueryResponse {
-    #[serde(default)]
-    pub batch: Vec<QueryResponse>,
 }
 
 /// A `CloudKit` record. Fields are kept as dynamic JSON because Apple's schema
@@ -71,25 +55,6 @@ pub(crate) struct Record {
     pub deleted: Option<bool>,
 }
 
-/// Response from `/changes/database`.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ChangesDatabaseResponse {
-    pub sync_token: String,
-    pub more_coming: bool,
-    #[serde(default)]
-    pub zones: Vec<ChangedZoneInfo>,
-}
-
-/// A zone that has changes, returned by `/changes/database`.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ChangedZoneInfo {
-    #[serde(rename = "zoneID")]
-    pub zone_id: ZoneId,
-    pub sync_token: String,
-}
-
 /// Response from `/changes/zone`.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ChangesZoneResponse {
@@ -100,8 +65,6 @@ pub(crate) struct ChangesZoneResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ChangesZoneResult {
-    #[serde(rename = "zoneID")]
-    pub zone_id: ZoneId,
     pub sync_token: String,
     pub more_coming: bool,
     #[serde(default)]
@@ -154,18 +117,6 @@ mod tests {
     }
 
     #[test]
-    fn test_batch_query_response() {
-        let json = r#"{
-            "batch": [
-                {"records": [{"recordName": "X", "recordType": "Y", "fields": {}}]}
-            ]
-        }"#;
-        let resp: BatchQueryResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.batch.len(), 1);
-        assert_eq!(resp.batch[0].records[0].record_name, "X");
-    }
-
-    #[test]
     fn test_query_response_empty() {
         let json = r#"{}"#;
         let resp: QueryResponse = serde_json::from_str(json).unwrap();
@@ -215,23 +166,13 @@ mod tests {
         }"#;
         let resp: QueryResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.records.len(), 1);
-        assert_eq!(resp.sync_token.as_deref(), Some("st-abc-123"));
-        assert_eq!(
-            resp.continuation_marker.as_deref(),
-            Some("cm-xyz-456"),
-            "continuationMarker must surface so paginated record queries can loop"
-        );
     }
 
     #[test]
     fn test_query_response_without_sync_token() {
         let json = r#"{"records": []}"#;
         let resp: QueryResponse = serde_json::from_str(json).unwrap();
-        assert!(resp.sync_token.is_none());
-        assert!(
-            resp.continuation_marker.is_none(),
-            "missing continuationMarker means single-page response — must be None"
-        );
+        assert!(resp.records.is_empty());
     }
 
     #[test]
@@ -270,70 +211,6 @@ mod tests {
     }
 
     #[test]
-    fn test_changes_database_response_with_zones() {
-        let json = r#"{
-            "syncToken": "db-token-1",
-            "moreComing": false,
-            "zones": [
-                {
-                    "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
-                    "syncToken": "zone-token-1"
-                },
-                {
-                    "zoneID": {"zoneName": "SharedSync-5678"},
-                    "syncToken": "zone-token-2"
-                }
-            ]
-        }"#;
-        let resp: ChangesDatabaseResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.sync_token, "db-token-1");
-        assert!(!resp.more_coming);
-        assert_eq!(resp.zones.len(), 2);
-        assert_eq!(resp.zones[0].zone_id.zone_name, "PrimarySync");
-        assert_eq!(resp.zones[0].sync_token, "zone-token-1");
-        assert_eq!(resp.zones[1].zone_id.zone_name, "SharedSync-5678");
-    }
-
-    #[test]
-    fn test_changes_database_response_no_changes() {
-        let json = r#"{
-            "syncToken": "db-token-2",
-            "moreComing": false,
-            "zones": []
-        }"#;
-        let resp: ChangesDatabaseResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.sync_token, "db-token-2");
-        assert!(!resp.more_coming);
-        assert!(resp.zones.is_empty());
-    }
-
-    #[test]
-    fn changes_database_response_missing_zones_defaults_empty() {
-        let json = r#"{
-            "syncToken": "db-token-no-zones",
-            "moreComing": false
-        }"#;
-        let resp: ChangesDatabaseResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.sync_token, "db-token-no-zones");
-        assert!(!resp.more_coming);
-        assert!(
-            resp.zones.is_empty(),
-            "missing zones must parse as an empty changes list"
-        );
-    }
-
-    #[test]
-    fn test_changed_zone_info() {
-        let json = r#"{
-            "zoneID": {"zoneName": "PrimarySync"},
-            "syncToken": "zt-abc"
-        }"#;
-        let info: ChangedZoneInfo = serde_json::from_str(json).unwrap();
-        assert_eq!(info.zone_id.zone_name, "PrimarySync");
-        assert_eq!(info.sync_token, "zt-abc");
-    }
-
-    #[test]
     fn test_changes_zone_response_with_records() {
         let json = r#"{
             "zones": [
@@ -351,7 +228,6 @@ mod tests {
         let resp: ChangesZoneResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.zones.len(), 1);
         let zone = &resp.zones[0];
-        assert_eq!(zone.zone_id.zone_name, "PrimarySync");
         assert_eq!(zone.sync_token, "zt-new");
         assert!(!zone.more_coming);
         assert_eq!(zone.records.len(), 2);

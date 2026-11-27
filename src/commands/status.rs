@@ -6,8 +6,6 @@
 use crate::cli;
 use crate::config;
 use crate::service::status::{render_oneline, service_state};
-#[cfg(test)]
-use crate::state;
 use crate::sync_core::state::{Completeness, FileState};
 
 use super::{LISTING_CAP, print_truncation_tail};
@@ -170,148 +168,8 @@ fn backup_line(
 
 const BACKUP_RECORD_SCOPE: &str = "Scope: recorded local state only; this does not establish iCloud completeness or verify local media checksums.";
 
-/// The previous engine's summary line. Its runner tests use it until that
-/// engine is removed.
-#[cfg(test)]
-pub(crate) fn backup_status_line(summary: &state::types::SyncSummary) -> String {
-    if summary.active_sync_started.is_some() {
-        return backup_record("sync is currently in progress");
-    }
-
-    if summary.last_sync_started.is_none() {
-        return backup_record("no sync has completed yet");
-    }
-
-    let mut reasons = Vec::new();
-    if summary
-        .last_recovery_action
-        .as_deref()
-        .is_some_and(|action| {
-            matches!(
-                action,
-                "await_retained_checkpoint_evidence"
-                    | "retained_checkpoint_retry_exhausted"
-                    | "repair_retained_checkpoint_evidence"
-            )
-        })
-    {
-        reasons.push(
-            "retained provider history is unavailable; recovery evidence is required".to_owned(),
-        );
-    }
-    if summary.unresolved_identity_zones > 0 {
-        reasons.push(format!(
-            "unresolved asset identity in {}; checkpoint replay is required",
-            count_phrase_s(summary.unresolved_identity_zones, "provider zone")
-        ));
-    }
-
-    if summary.last_sync_interrupted
-        || summary
-            .last_sync_status
-            .as_deref()
-            .is_some_and(|status| status == "interrupted")
-    {
-        reasons.push("last sync was interrupted".to_string());
-    } else if summary
-        .last_sync_status
-        .as_deref()
-        .is_some_and(|status| status != "complete")
-        && let Some(status) = &summary.last_sync_status
-    {
-        reasons.push(format!("last sync status is {status}"));
-    }
-    if summary.last_sync_completed.is_none() {
-        reasons.push("last sync did not record completion".to_string());
-    }
-    if summary.last_sync_assets_failed > 0 {
-        reasons.push(format!(
-            "{} failed in the last sync",
-            count_phrase_s(summary.last_sync_assets_failed, "asset")
-        ));
-    }
-    if summary.last_sync_enumeration_errors > 0 {
-        reasons.push(format!(
-            "{} occurred in the last sync",
-            count_phrase_s(summary.last_sync_enumeration_errors, "enumeration error")
-        ));
-    }
-    if summary.failed > 0 {
-        reasons.push(format!(
-            "{} {}",
-            count_phrase_s(summary.failed, "failed asset"),
-            remain_verb(summary.failed)
-        ));
-    }
-    if summary.pending > 0 {
-        reasons.push(format!(
-            "{} {}",
-            count_phrase_s(summary.pending, "pending asset"),
-            remain_verb(summary.pending)
-        ));
-    }
-    if summary.awaiting_provider_verification > 0 {
-        reasons.push(format!(
-            "{} awaiting provider verification",
-            count_phrase_s(summary.awaiting_provider_verification, "asset")
-        ));
-    }
-    let unattributed: u64 = summary
-        .metadata_capture
-        .iter()
-        .map(|capture| capture.unattributed_legacy_assets)
-        .sum();
-    if unattributed > 0 {
-        reasons.push(format!(
-            "{unattributed} preserved legacy records need attribution"
-        ));
-    }
-    let metadata_capture_remaining: u64 = summary
-        .metadata_capture
-        .iter()
-        .map(|capture| capture.remaining_assets)
-        .sum();
-    if metadata_capture_remaining > 0 {
-        reasons.push(format!(
-            "{} metadata capture {}",
-            count_phrase_s(metadata_capture_remaining, "asset"),
-            remain_verb(metadata_capture_remaining)
-        ));
-    }
-    let metadata_capture_failures: u64 = summary
-        .metadata_capture
-        .iter()
-        .map(|capture| capture.failed_assets)
-        .sum();
-    if metadata_capture_failures > 0 {
-        reasons.push(format!(
-            "{} metadata capture failure{} recorded",
-            metadata_capture_failures,
-            if metadata_capture_failures == 1 {
-                ""
-            } else {
-                "s"
-            }
-        ));
-    }
-    if summary.last_inventory_drop_detected {
-        reasons.push("inventory warning is active".to_string());
-    }
-
-    if reasons.is_empty() {
-        backup_record("last sync completed and no pending or failed assets are recorded")
-    } else {
-        backup_record(&reasons.join("; "))
-    }
-}
-
 fn backup_record(headline: &str) -> String {
     format!("Backup record: {headline}\n  {BACKUP_RECORD_SCOPE}")
-}
-
-#[cfg(test)]
-fn count_phrase_s(count: u64, singular: &str) -> String {
-    count_phrase(count, singular, &format!("{singular}s"))
 }
 
 fn count_phrase(count: u64, singular: &str, plural: &str) -> String {

@@ -10,19 +10,10 @@ use std::sync::Arc;
 use crate::password::SecretString;
 use crate::{cli, config};
 
-mod planning;
-mod precheck;
-mod reconcile;
-mod reporting;
 mod runner;
-mod session;
+pub(crate) mod session;
 mod watch;
 
-#[cfg(test)]
-pub(crate) mod test_support;
-
-pub(crate) use planning::count_passes;
-pub(crate) use reconcile::should_reconcile_this_cycle;
 pub(crate) use runner::run_sync;
 pub(crate) use session::should_wait_for_2fa;
 pub(crate) use watch::{SERVICE_MODE_DEFAULT_WATCH_INTERVAL, service_mode_default_interval};

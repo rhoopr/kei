@@ -47,8 +47,6 @@ mod xmp_write;
 use mp4_atom::FourCC;
 
 pub(crate) use boxes::{is_heif_content, is_heif_path};
-#[cfg(test)]
-pub(crate) use exif::{extract_exif_capture_time, extract_exif_tiff_bytes};
 pub(crate) use file::locate_exif_tiff;
 #[cfg(feature = "__fuzz_internals")]
 pub(crate) use fuzz::fuzz_rewrite_xmp_preserves;
@@ -59,14 +57,12 @@ pub(crate) use stream::FileLayout;
 #[cfg(test)]
 pub(crate) use test_support::{
     apple_multi_exif_heic, apple_multi_xmp_heic, apple_tmap_conflicting_xmp_heic,
-    apple_tmap_insertion_heic, set_test_file_item_extent,
+    set_test_file_item_extent,
 };
 #[cfg(test)]
 pub(crate) use test_writer::insert_xmp;
-#[cfg(any(test, feature = "__fuzz_internals"))]
+#[cfg(feature = "__fuzz_internals")]
 pub(crate) use xmp_read::extract_xmp_bytes;
-#[cfg(test)]
-pub(crate) use xmp_read::extract_xmp_strict;
 #[cfg(test)]
 pub(crate) use xmp_write::rewrite_xmp;
 

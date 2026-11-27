@@ -253,7 +253,6 @@ pub(crate) fn load_toml_config_with_source(
                 Some(config),
                 super::ConfigSource::File {
                     path: std::path::absolute(path)?,
-                    bytes: contents.into_bytes().into(),
                 },
             ))
         }

@@ -51,13 +51,3 @@ pub use runtime::{
     RuntimeConfig, ServerConfig, UiConfig, WatchConfig,
 };
 pub(crate) use runtime::{MediaExclusion, MediaKind, MediaSelection, parse_created_date_filter};
-#[cfg_attr(
-    not(test),
-    expect(
-        unused_imports,
-        reason = "preserve existing config facade paths and visibility"
-    )
-)]
-pub(crate) use templates::{
-    DEFAULT_FOLDER_STRUCTURE_ALBUMS, DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS,
-};

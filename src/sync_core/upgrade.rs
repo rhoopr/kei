@@ -85,6 +85,9 @@ pub(crate) async fn prepare(
 /// After a cycle that listed every zone completely, delete the old state
 /// file, its companions and its schema backups. Returns the bytes freed, or
 /// `None` when no cleanup was pending.
+// CONTRACT: UPGRADE_CLEANUP_REQUIRES_VALIDATED_STATE
+// The caller runs this only after a cycle in which every zone listed to the
+// end without error; the new state was integrity-checked before it was used.
 pub(crate) async fn finish(state: &State) -> anyhow::Result<Option<u64>> {
     let Some(legacy) = state.get_kv(LEGACY_KEY).await? else {
         return Ok(None);
@@ -104,7 +107,7 @@ fn building_path(target: &Path) -> PathBuf {
 }
 
 /// Remove a SQLite file and its companions; returns the bytes removed.
-async fn remove_sqlite_files(path: &Path) -> anyhow::Result<u64> {
+pub(crate) async fn remove_sqlite_files(path: &Path) -> anyhow::Result<u64> {
     let mut freed = 0;
     for suffix in ["", "-wal", "-shm", "-journal"] {
         let mut name = path.as_os_str().to_owned();

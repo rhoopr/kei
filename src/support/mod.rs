@@ -8,10 +8,7 @@ pub(crate) mod history;
 mod privacy;
 pub(crate) mod token_equivalence;
 
-pub(crate) use history::{
-    StorageComponent, StorageOutcome, begin, complete, observe, observe_scoped, record_storage,
-};
-pub(crate) use privacy::fixed_label;
+pub(crate) use history::{begin, complete, observe};
 
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -330,15 +327,19 @@ pub(crate) fn download_error_fields(
     }
 }
 
-pub(crate) fn observe_metadata(path: &Path, kind: &'static str, fields: Value) {
-    observe_scoped(
-        "metadata",
-        Some((&path.to_string_lossy(), "metadata")),
-        kind,
-        fields,
-    );
+/// Record a metadata-writing event. Paths stay out of support history.
+#[allow(
+    dead_code,
+    reason = "metadata writers wait for the opt-in metadata pass; it removes this allow"
+)]
+pub(crate) fn observe_metadata(_path: &Path, kind: &'static str, fields: Value) {
+    observe(kind, fields);
 }
 
+#[allow(
+    dead_code,
+    reason = "metadata writers wait for the opt-in metadata pass; it removes this allow"
+)]
 pub(crate) fn metadata_error(
     path: &Path,
     stage: &'static str,

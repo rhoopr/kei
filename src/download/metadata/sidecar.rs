@@ -695,7 +695,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_sidecar_refuses_existing_file_changed_after_read() {
+    async fn contract_xmp_sidecar_rewrite_requires_stable_input_refuses_changed_file() {
         let dir = tempfile::tempdir().unwrap();
         let media_path = dir.path().join("changed.jpg");
         let sidecar_path = dir.path().join("changed.jpg.xmp");

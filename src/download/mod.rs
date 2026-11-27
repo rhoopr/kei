@@ -1,70 +1,32 @@
-//! Download engine — streaming pipeline that starts downloading as soon as
-//! the first API page returns, rather than enumerating the entire library
-//! upfront. Uses a two-phase approach: (1) stream-and-download with bounded
-//! concurrency, then (2) cleanup pass with fresh CDN URLs for any failures.
+//! Local file work: path rules, transfer and publication, and metadata
+//! writers. The sync core drives these through `core_io`.
 
 pub(crate) mod core_io;
 pub mod error;
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "metadata writers wait for the opt-in metadata pass; it removes this allow"
+)]
 pub mod file;
 pub(crate) mod filter;
-pub(crate) mod finalize;
 #[cfg(feature = "xmp")]
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "metadata writers wait for the opt-in metadata pass; it removes this allow"
+)]
 pub(crate) mod heif;
 pub(crate) mod limiter;
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "metadata writers wait for the opt-in metadata pass; it removes this allow"
+)]
 pub mod metadata;
-pub(crate) mod metadata_rewrite;
 pub mod paths;
-pub(crate) mod pipeline;
-pub(crate) mod planner;
-pub(crate) mod recap;
-mod retry;
 
 pub(crate) use limiter::BandwidthLimiter;
-pub(crate) use metadata_rewrite::CaptureTimestampRepair;
+pub(crate) use metadata::CaptureTimestampRepair;
 
-use filter::DownloadTask;
-
-pub(crate) use filter::{AssetGroupings, determine_media_type};
-
-mod orchestration;
-
-pub(crate) use orchestration::config::{
-    DOWNLOAD_CONFIG_HASH_KEY, DownloadConfig, IndexingWindow, InventoryScope, compute_config_hash,
-    hash_download_config, hash_legacy_download_config, inventory_scope,
-    sync_coverage_fingerprint_json,
-};
-pub(crate) use orchestration::context::{ClaimedLegacyMasterStates, DownloadContext};
-use orchestration::context::{RecordedLocalFile, preload_download_context};
-pub use orchestration::dispatch::download_photos_with_sync;
-pub(crate) use orchestration::generation::drain_local_backfill;
-pub(crate) use orchestration::generation::has_due as has_due_selection_work;
-pub(crate) use orchestration::generation::recover_deleted_album_selection;
-pub(crate) use orchestration::maintenance::{
-    MetadataDrainOutcome, drain_pending_metadata_rewrites,
-};
-use orchestration::models::PENDING_RETRY_UNMATCHED_REASON;
-pub(super) use orchestration::models::PRODUCER_ENUMERATION_INCOMPLETE_REASON;
-pub(crate) use orchestration::models::{
-    CheckpointEvidence, DownloadControls, DownloadReporting, DownloadRunMode, DownloadStore,
-    InventoryMeasurement, RecoveryAction, block_sync_token_for_metadata_capture,
-    block_sync_token_for_unresolved_identity, sync_token_blocked_explanation,
-    sync_token_blocked_source,
-};
-pub use orchestration::models::{
-    DownloadOutcome, FullEnumerationReason, SkipBreakdown, SyncMode, SyncResult, SyncStats,
-};
-#[cfg(test)]
-pub(crate) use orchestration::reconciliation::reconcile_catalog_paths;
-pub(crate) use orchestration::reconciliation::reconcile_catalog_paths_with_client;
-use orchestration::selection::build_pass_configs_resolving_deferred_excludes;
-use orchestration::url_refresh::{RetryTaskKey, UrlRetrySource};
-
-#[expect(
-    unused_imports,
-    reason = "retain the existing crate-level type paths in the facade"
-)]
-pub(crate) use orchestration::{models::PassKey, reconciliation::PathReconciliationResult};
-
-pub(crate) mod legacy_preservation;
-
-pub(crate) mod sparse_target;
+pub use crate::sync_stats::SyncStats;

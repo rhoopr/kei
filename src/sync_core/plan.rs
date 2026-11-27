@@ -81,6 +81,8 @@ async fn plan_asset(
     if asset.purged || asset.sparse {
         return Ok(Some(Vec::new()));
     }
+    // CONTRACT: UNKNOWN_PROVIDER_IDENTITY_REMAINS_PENDING
+    // Without its master record a photo stays dirty and is planned later.
     let Some(master) = &asset.master_body else {
         return Ok(None);
     };
@@ -181,8 +183,11 @@ async fn plan_asset(
                         state,
                         &config.directory,
                         &relative,
-                        file.size,
-                        photo.id(),
+                        Collision {
+                            size: file.size,
+                            asset_id: photo.id(),
+                            size_suffix: size_suffix_first(config, file.rendition),
+                        },
                         &taken,
                     )
                     .await?
@@ -234,20 +239,39 @@ async fn carried_over(
 /// Pick a free path for a new copy: the derived path, then the asset's
 /// identity suffix, then numbered suffixes. A file already at a candidate
 /// with the expected size is adopted; anything else there is left alone.
+/// What a planned file needs when its preferred path is taken.
+struct Collision<'a> {
+    size: u64,
+    asset_id: &'a str,
+    /// Try `<stem>-<size><ext>` first, as icloudpd and earlier kei did.
+    size_suffix: bool,
+}
+
+/// Under the default file-match policy a colliding photo or video gets its
+/// size appended first, matching icloudpd and earlier kei. Live Photo
+/// videos, and the `name-id7` policy, go straight to the asset ID.
+fn size_suffix_first(config: &CoreConfig, rendition: &str) -> bool {
+    config.paths.file_match_policy == crate::types::FileMatchPolicy::NameSizeDedupWithSuffix
+        && !rendition.starts_with("live_")
+}
+
 async fn choose_path(
     state: &State,
     directory: &Path,
     relative: &str,
-    size: u64,
-    asset_id: &str,
+    collision: Collision<'_>,
     taken: &HashSet<String>,
 ) -> anyhow::Result<(String, bool)> {
-    let candidates =
-        [
-            relative.to_owned(),
-            paths::insert_asset_identity_suffix(relative, asset_id),
-        ]
-        .into_iter()
+    let Collision {
+        size,
+        asset_id,
+        size_suffix,
+    } = collision;
+    let candidates = std::iter::once(relative.to_owned())
+        .chain(size_suffix.then(|| paths::insert_suffix(relative, &size.to_string())))
+        .chain(std::iter::once(paths::insert_asset_identity_suffix(
+            relative, asset_id,
+        )))
         .chain((2..=MAX_ORDINAL).map(|ordinal| {
             paths::insert_asset_identity_ordinal_suffix(relative, asset_id, ordinal)
         }));
@@ -390,6 +414,23 @@ impl Albums {
         let row = self.rows.get(&key)?;
         row.folder.clone().or_else(|| components(&self.rows, &key))
     }
+}
+
+/// Every live album's current path, such as `Travel/Paris`, by zone.
+pub(crate) fn album_paths(rows: Vec<AlbumRow>) -> Vec<(String, String)> {
+    let rows: HashMap<_, _> = rows
+        .into_iter()
+        .map(|row| ((row.zone.clone(), row.name.clone()), row))
+        .collect();
+    let mut out: Vec<(String, String)> = rows
+        .iter()
+        .filter(|(_, row)| !row.deleted && !row.is_folder)
+        .filter_map(|(key, row)| {
+            components(&rows, key).map(|components| (row.zone.clone(), components.join("/")))
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 /// Current names from the top folder down to the album.

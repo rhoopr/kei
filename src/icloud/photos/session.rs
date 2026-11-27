@@ -37,61 +37,6 @@ async fn dump_body(dir: &std::path::Path, id: usize, kind: &str, body: &str) {
     }
 }
 
-/// Fixed diagnostic failures contain no URL, body, credentials or provider text.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DiagnosticLookupError {
-    Unavailable,
-    Request,
-    HttpStatus,
-    TooLarge,
-    Malformed,
-}
-
-/// Privacy-safe streaming: no ordinary error logs or debug body dumps.
-pub(crate) async fn diagnostic_bytes(
-    client: &reqwest::Client,
-    url: &str,
-    body: String,
-    headers: &[(&str, &str)],
-    limit: usize,
-) -> Result<Vec<u8>, DiagnosticLookupError> {
-    let mut builder = client.post(url).body(body);
-    for &(key, value) in headers {
-        builder = builder.header(key, value);
-    }
-    let mut response = builder
-        .send()
-        .await
-        .map_err(|_private_error| DiagnosticLookupError::Request)?;
-    if !response.status().is_success() {
-        return Err(DiagnosticLookupError::HttpStatus);
-    }
-    if response
-        .headers()
-        .get(reqwest::header::CONTENT_ENCODING)
-        .is_some_and(|value| value != "identity")
-    {
-        return Err(DiagnosticLookupError::Malformed);
-    }
-    if response.content_length().is_some_and(|n| n > limit as u64) {
-        return Err(DiagnosticLookupError::TooLarge);
-    }
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|_private_error| DiagnosticLookupError::Request)?
-    {
-        if chunk.len() > limit.saturating_sub(bytes.len()) {
-            return Err(DiagnosticLookupError::TooLarge);
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(bytes)
-}
-
-const DIAGNOSTIC_RESPONSE_BYTES: usize = 64 * 1024;
-
 /// Async HTTP session trait for the photos service.
 ///
 /// Abstracted as a trait so album/library code can be tested with stubs
@@ -104,35 +49,6 @@ pub trait PhotosSession: Send + Sync {
         body: String,
         headers: &[(&str, &str)],
     ) -> anyhow::Result<Value>;
-
-    /// Optional diagnostic transport: no retries, body dumps or error-body logs.
-    /// Adapters must opt in; falling back to ordinary post can expose secrets.
-    async fn post_diagnostic(
-        &self,
-        _url: &str,
-        _body: String,
-        _headers: &[(&str, &str)],
-    ) -> Result<Value, DiagnosticLookupError> {
-        Err(DiagnosticLookupError::Unavailable)
-    }
-
-    /// Bounded original changes response. Value-based test/session adapters can
-    /// use the default; live reqwest and SharedSession preserve original bytes.
-    async fn post_changes_body(
-        &self,
-        url: &str,
-        body: String,
-        headers: &[(&str, &str)],
-    ) -> anyhow::Result<Vec<u8>> {
-        let body = serde_json::to_vec(&self.post(url, body, headers).await?)?;
-        anyhow::ensure!(
-            body.len() <= super::inbox::MAX_CHANGES_PAGE_BYTES,
-            super::error::ShadowPageError::from(anyhow::anyhow!(
-                "Provider changes page exceeded the capture byte limit"
-            ))
-        );
-        Ok(body)
-    }
 
     /// Clone this session into a new boxed trait object.
     fn clone_box(&self) -> Box<dyn PhotosSession>;
@@ -157,49 +73,6 @@ impl PhotosSession for reqwest::Client {
             dump_body(dir, *id, "res", &json.to_string()).await;
         }
         Ok(json)
-    }
-
-    async fn post_diagnostic(
-        &self,
-        url: &str,
-        body: String,
-        headers: &[(&str, &str)],
-    ) -> Result<Value, DiagnosticLookupError> {
-        let bytes = diagnostic_bytes(self, url, body, headers, DIAGNOSTIC_RESPONSE_BYTES).await?;
-        serde_json::from_slice(&bytes).map_err(|_private_error| DiagnosticLookupError::Malformed)
-    }
-
-    async fn post_changes_body(
-        &self,
-        url: &str,
-        body: String,
-        headers: &[(&str, &str)],
-    ) -> anyhow::Result<Vec<u8>> {
-        let (mut response, _dump) = post_response(self, url, body, headers).await?;
-        let limit = super::inbox::MAX_CHANGES_PAGE_BYTES;
-        anyhow::ensure!(
-            response
-                .content_length()
-                .is_none_or(|size| size <= limit as u64),
-            super::error::ShadowPageError::from(anyhow::anyhow!(
-                "Provider changes page exceeded the capture byte limit"
-            ))
-        );
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
-            anyhow::ensure!(
-                chunk.len() <= limit.saturating_sub(bytes.len()),
-                super::error::ShadowPageError::from(anyhow::anyhow!(
-                    "Provider changes page exceeded the capture byte limit"
-                ))
-            );
-            bytes.extend_from_slice(&chunk);
-        }
-        #[cfg(debug_assertions)]
-        if let Some((dir, id)) = &_dump {
-            dump_body(dir, *id, "res", &String::from_utf8_lossy(&bytes)).await;
-        }
-        Ok(bytes)
     }
 
     fn clone_box(&self) -> Box<dyn PhotosSession> {
@@ -299,26 +172,6 @@ impl PhotosSession for crate::auth::SharedSession {
         PhotosSession::post(&client, url, body, headers).await
     }
 
-    async fn post_diagnostic(
-        &self,
-        url: &str,
-        body: String,
-        headers: &[(&str, &str)],
-    ) -> Result<Value, DiagnosticLookupError> {
-        let client = self.read().await.http_client().clone();
-        PhotosSession::post_diagnostic(&client, url, body, headers).await
-    }
-
-    async fn post_changes_body(
-        &self,
-        url: &str,
-        body: String,
-        headers: &[(&str, &str)],
-    ) -> anyhow::Result<Vec<u8>> {
-        let client = self.read().await.http_client().clone();
-        PhotosSession::post_changes_body(&client, url, body, headers).await
-    }
-
     fn clone_box(&self) -> Box<dyn PhotosSession> {
         Box::new(self.clone())
     }
@@ -350,9 +203,6 @@ pub(crate) fn is_session_error(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<HttpStatusError>()
         .is_some_and(|http| matches!(http.status, 401 | 403 | 421))
-        || error
-            .downcast_ref::<super::album::ProviderLookupError>()
-            .is_some_and(super::album::ProviderLookupError::is_authentication)
         || error
             .downcast_ref::<crate::icloud::error::ICloudError>()
             .is_some_and(crate::icloud::error::ICloudError::is_session_error)
@@ -580,21 +430,6 @@ fn classify_api_error(e: &anyhow::Error) -> RetryAction {
     RetryAction::Abort
 }
 
-fn classify_rate_limit_error(e: &anyhow::Error) -> bool {
-    if let Some(http_err) = e.downcast_ref::<HttpStatusError>() {
-        return matches!(http_err.status, 429 | 503);
-    }
-    e.downcast_ref::<reqwest::Error>()
-        .and_then(reqwest::Error::status)
-        .is_some_and(|status| matches!(status.as_u16(), 429 | 503))
-}
-
-#[derive(Debug)]
-pub(crate) struct RetriedPostResponse {
-    pub(crate) response: anyhow::Result<Value>,
-    pub(crate) rate_limit_observations: usize,
-}
-
 /// Retry a `session.post()` call with default exponential backoff.
 ///
 /// Inspects each response for `CloudKit` server errors (`serverErrorCode`)
@@ -628,65 +463,27 @@ pub async fn retry_post(
     result
 }
 
-pub(crate) async fn retry_post_changes_body(
-    session: &dyn PhotosSession,
-    url: &str,
-    body: &str,
-    headers: &[(&str, &str)],
-    retry_config: &RetryConfig,
-) -> anyhow::Result<Vec<u8>> {
-    retry::retry_with_backoff(retry_config, classify_api_error, || async {
-        let bytes = session
-            .post_changes_body(url, body.to_owned(), headers)
-            .await?;
-        anyhow::ensure!(
-            bytes.len() <= super::inbox::MAX_CHANGES_PAGE_BYTES,
-            super::error::ShadowPageError::from(anyhow::anyhow!(
-                "Provider changes page exceeded the capture byte limit"
-            ))
-        );
-        let value = super::changes_json::parse(&bytes)?;
-        check_cloudkit_errors(value)?;
-        Ok(bytes)
-    })
-    .await
-}
-
 /// Retry transport and HTTP failures while leaving record-level CloudKit
 /// errors in the response for a batch-aware caller to classify. This is used
 /// by `/records/lookup`, where one explicit `UNKNOWN_ITEM` is a successful
 /// deletion result and must not fail unrelated records in the same batch.
-/// Retain rate-limit observations even when every retry fails.
 pub(crate) async fn retry_post_allowing_record_errors(
     session: &dyn PhotosSession,
     url: &str,
     body: &str,
     headers: &[(&str, &str)],
     retry_config: &RetryConfig,
-) -> RetriedPostResponse {
-    let rate_limit_observations = AtomicUsize::new(0);
+) -> anyhow::Result<Value> {
     hydration_progress::request_started();
-    let response = retry::retry_with_backoff(
-        retry_config,
-        |error| {
-            if classify_rate_limit_error(error) {
-                rate_limit_observations.fetch_add(1, Ordering::Relaxed);
-            }
-            classify_api_error(error)
-        },
-        || async {
-            hydration_progress::attempt_started();
-            let result = session.post(url, body.to_owned(), headers).await;
-            hydration_progress::attempt_finished();
-            result
-        },
-    )
+    let response = retry::retry_with_backoff(retry_config, classify_api_error, || async {
+        hydration_progress::attempt_started();
+        let result = session.post(url, body.to_owned(), headers).await;
+        hydration_progress::attempt_finished();
+        result
+    })
     .await;
     hydration_progress::request_finished();
-    RetriedPostResponse {
-        response,
-        rate_limit_observations: rate_limit_observations.load(Ordering::Relaxed),
-    }
+    response
 }
 
 /// Errors from `changes/zone` when syncToken is invalid.
@@ -743,100 +540,6 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn missing_reference_transport_bounds_and_redacts_real_http_failures() {
-        use crate::test_helpers::TracingCapture;
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-        let (capture, _guard) = TracingCapture::install();
-        let server = MockServer::start().await;
-        for (route, status, body, expected) in [
-            ("valid", 200, "{}".to_owned(), Ok(serde_json::json!({}))),
-            (
-                "private-url",
-                421,
-                "private-response-token".to_owned(),
-                Err(DiagnosticLookupError::HttpStatus),
-            ),
-            (
-                "malformed",
-                200,
-                "private-invalid-json".to_owned(),
-                Err(DiagnosticLookupError::Malformed),
-            ),
-            (
-                "oversize",
-                200,
-                "x".repeat(DIAGNOSTIC_RESPONSE_BYTES + 1),
-                Err(DiagnosticLookupError::TooLarge),
-            ),
-        ] {
-            Mock::given(method("POST"))
-                .and(path(format!("/{route}")))
-                .respond_with(ResponseTemplate::new(status).set_body_string(body))
-                .expect(1)
-                .mount(&server)
-                .await;
-            assert_eq!(
-                PhotosSession::post_diagnostic(
-                    &reqwest::Client::new(),
-                    &format!("{}/{route}?token=private-query-token", server.uri()),
-                    "private-request-token".into(),
-                    &[]
-                )
-                .await,
-                expected
-            );
-        }
-        for event in capture.events() {
-            assert!(
-                event
-                    .fields
-                    .values()
-                    .all(|value| !value.contains("private-"))
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn missing_reference_transport_bounds_chunked_response() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 4096];
-            assert!(socket.read(&mut request).await.unwrap() > 0);
-            socket
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
-                )
-                .await
-                .unwrap();
-            let chunk = vec![b'x'; 4096];
-            for _ in 0..17 {
-                if socket.write_all(b"1000\r\n").await.is_err()
-                    || socket.write_all(&chunk).await.is_err()
-                    || socket.write_all(b"\r\n").await.is_err()
-                {
-                    return;
-                }
-            }
-            let _ = socket.write_all(b"0\r\n\r\n").await;
-        });
-        assert_eq!(
-            PhotosSession::post_diagnostic(
-                &reqwest::Client::new(),
-                &format!("http://{address}"),
-                "{}".into(),
-                &[]
-            )
-            .await,
-            Err(DiagnosticLookupError::TooLarge)
-        );
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
     async fn normal_photos_transport_retains_decode_error_retry_classification() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -858,89 +561,6 @@ mod tests {
         assert!(matches!(classify_api_error(&error), RetryAction::Retry));
     }
 
-    #[tokio::test]
-    async fn raw_changes_transport_preserves_bytes_and_bounds_content_length() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-        let server = MockServer::start().await;
-        let body = br#" { "number":9007199254740993.0, "unknown":[true,null] } "#;
-        Mock::given(method("POST"))
-            .and(path("/original"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.as_slice()))
-            .mount(&server)
-            .await;
-        let client = reqwest::Client::new();
-        assert_eq!(
-            PhotosSession::post_changes_body(
-                &client,
-                &format!("{}/original", server.uri()),
-                "{}".into(),
-                &[]
-            )
-            .await
-            .unwrap(),
-            body
-        );
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let oversized = super::super::inbox::MAX_CHANGES_PAGE_BYTES + 1;
-        let response = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 4096];
-            assert!(socket.read(&mut request).await.unwrap() > 0);
-            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {oversized}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
-        });
-        let error = PhotosSession::post_changes_body(
-            &client,
-            &format!("http://{address}"),
-            "{}".into(),
-            &[],
-        )
-        .await
-        .unwrap_err();
-        response.await.unwrap();
-        assert!(error.to_string().contains("capture byte limit"));
-    }
-
-    #[tokio::test]
-    async fn raw_changes_transport_bounds_chunked_response_without_declared_length() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 4096];
-            assert!(socket.read(&mut request).await.unwrap() > 0);
-            socket
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
-                )
-                .await
-                .unwrap();
-            let chunk = vec![b'x'; 1024 * 1024];
-            for _ in 0..17 {
-                if socket.write_all(b"100000\r\n").await.is_err()
-                    || socket.write_all(&chunk).await.is_err()
-                    || socket.write_all(b"\r\n").await.is_err()
-                {
-                    return;
-                }
-            }
-            let _ = socket.write_all(b"0\r\n\r\n").await;
-        });
-        let error = PhotosSession::post_changes_body(
-            &reqwest::Client::new(),
-            &format!("http://{address}"),
-            "{}".into(),
-            &[],
-        )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("capture byte limit"));
-        server.await.unwrap();
-    }
-
     #[test]
     fn provider_session_error_classification_uses_typed_status_not_body() {
         for status in [400, 401, 403, 404, 410, 421, 429, 500, 503] {
@@ -956,14 +576,6 @@ mod tests {
         assert!(!is_session_error(&anyhow::anyhow!(
             "HTTP 421 Invalid global session"
         )));
-        let error = super::super::album::ProviderLookupError::Authentication {
-            status: 421,
-            message: "private response".into(),
-        };
-        assert_eq!(error.diagnostic(), "authentication");
-        assert!(is_session_error(
-            &anyhow::Error::new(error).context("lookup")
-        ));
     }
 
     #[test]
@@ -1398,37 +1010,6 @@ mod tests {
             session.call_count.load(std::sync::atomic::Ordering::SeqCst),
             2
         );
-    }
-
-    /// Build a reqwest::Error with the given HTTP status code (no network needed).
-    fn reqwest_status_error(status: u16) -> anyhow::Error {
-        let http_resp = http::Response::builder()
-            .status(status)
-            .body(Vec::<u8>::new())
-            .unwrap();
-        let resp = reqwest::Response::from(http_resp);
-        resp.error_for_status().unwrap_err().into()
-    }
-
-    #[test]
-    fn test_post_503_is_retryable() {
-        let err = reqwest_status_error(503);
-        assert_eq!(classify_api_error(&err), RetryAction::Retry);
-        assert!(classify_rate_limit_error(&err));
-    }
-
-    #[test]
-    fn test_post_429_is_retryable() {
-        let err = reqwest_status_error(429);
-        assert_eq!(classify_api_error(&err), RetryAction::Retry);
-        assert!(classify_rate_limit_error(&err));
-    }
-
-    #[test]
-    fn test_post_421_aborts() {
-        let err = reqwest_status_error(421);
-        assert_eq!(classify_api_error(&err), RetryAction::Abort);
-        assert!(!classify_rate_limit_error(&err));
     }
 
     // ── Gap: empty records array passes through cleanly ──────────────

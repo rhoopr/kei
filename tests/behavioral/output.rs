@@ -65,7 +65,7 @@ friendly = false
 
     let body = std::fs::read_to_string(&report_path).expect("sync_report.json");
     let json: serde_json::Value = serde_json::from_str(&body).expect("valid report JSON");
-    assert_eq!(json["version"], "3", "schema version");
+    assert_eq!(json["version"], "5", "schema version");
     assert!(json["kei_version"].as_str().is_some_and(|v| !v.is_empty()));
     assert!(
         json["timestamp"]
@@ -89,11 +89,6 @@ friendly = false
     assert_eq!(json["options"]["dry_run"], false);
     assert_eq!(json["stats"]["assets_seen"], 3);
     assert_eq!(json["stats"]["downloaded"], 2);
-    assert_eq!(json["stats"]["skipped"]["by_state"], 1);
-    assert_eq!(json["stats"]["bytes_downloaded"], 4096);
-    assert_eq!(json["stats"]["disk_bytes_written"], 4096);
-    assert_eq!(json["stats"]["photos_downloaded"], 1);
-    assert_eq!(json["stats"]["videos_downloaded"], 1);
     assert!(
         json.get("failed_assets").is_none(),
         "clean success report should omit failed_assets: {json}"

@@ -230,8 +230,7 @@ impl PhotoLibrary {
             &[("Content-type", "text/plain")],
             self.retry_config(),
         )
-        .await
-        .response?;
+        .await?;
         let records = response
             .get("records")
             .and_then(Value::as_array)

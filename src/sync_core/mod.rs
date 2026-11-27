@@ -9,7 +9,10 @@ pub(crate) mod drain;
 pub(crate) mod plan;
 pub(crate) mod runner;
 pub(crate) mod state;
+mod support;
 pub(crate) mod upgrade;
+
+pub(crate) use support::support_summary;
 
 use std::path::PathBuf;
 
@@ -42,6 +45,8 @@ pub(crate) struct CoreConfig {
     pub(crate) concurrency: usize,
     pub(crate) retry: RetryConfig,
     pub(crate) transfer: Transfer,
+    /// One shared byte budget for every download, when a limit is set.
+    pub(crate) bandwidth: Option<crate::download::BandwidthLimiter>,
 }
 
 /// Which owed copies a cycle works on.
@@ -80,6 +85,9 @@ pub(crate) struct CycleReport {
     /// Photos moved to a Shared Library that is not selected. They are
     /// not saved; selecting that library saves them.
     pub(crate) unselected_shared: u64,
+    /// iCloud refused the session. Sign in again and repeat the cycle;
+    /// everything already observed stays recorded.
+    pub(crate) session_expired: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -90,6 +98,8 @@ pub(crate) struct ZoneReport {
     pub(crate) caught_up: bool,
     /// iCloud rejected the saved position, so this cycle started a full listing.
     pub(crate) position_reset: bool,
+    /// The zone had no saved position, so this cycle listed it from the start.
+    pub(crate) full_listing: bool,
     pub(crate) plan: plan::PlanStats,
     pub(crate) drain: drain::DrainStats,
     /// Why observation stopped early, if it did.
@@ -135,6 +145,7 @@ pub(crate) async fn run_cycle(
             ..ZoneReport::default()
         };
         if let Err(error) = observe(state, library, cancel, &mut zone_report).await {
+            report.session_expired |= crate::icloud::photos::session::is_session_error(&error);
             tracing::warn!(zone = %zone, error = %format!("{error:#}"), "Could not read iCloud changes; owed downloads continue");
             zone_report.error = Some(format!("{error:#}"));
         }
@@ -145,6 +156,8 @@ pub(crate) async fn run_cycle(
             match library.smart_folder_members(&folder).await {
                 Ok(members) => state.replace_smart_members(&zone, &folder, members).await?,
                 Err(error) => {
+                    report.session_expired |=
+                        crate::icloud::photos::session::is_session_error(&error);
                     tracing::warn!(zone = %zone, folder = %folder, error = %format!("{error:#}"), "Could not read a smart folder; its copies wait");
                     zone_report
                         .error
@@ -172,6 +185,7 @@ pub(crate) async fn run_cycle(
         match drain::drain_zone(state, library, config, client, cancel).await {
             Ok(stats) => zone_report.drain = stats,
             Err(error) => {
+                report.session_expired |= crate::icloud::photos::session::is_session_error(&error);
                 tracing::warn!(zone = %zone_report.zone, error = %format!("{error:#}"), "Downloads stopped early; owed copies are retried next cycle");
                 zone_report
                     .error
@@ -220,6 +234,7 @@ async fn observe(
 ) -> anyhow::Result<()> {
     let zone = library.zone_name();
     let mut position = state.position(zone).await?;
+    report.full_listing = position.is_none();
     let mut reset = false;
     for _ in 0..MAX_PAGES_PER_CYCLE {
         if cancel.is_cancelled() {
@@ -235,6 +250,7 @@ async fn observe(
                 report.position_reset = true;
                 continue;
             }
+            Err(FeedError::Other(error)) => return Err(error),
             Err(error) => return Err(error.into()),
         };
         anyhow::ensure!(

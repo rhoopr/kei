@@ -13,7 +13,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::icloud::photos::feed::Observation;
 
-const SCHEMA_VERSION: i64 = 1;
+pub(crate) const SCHEMA_VERSION: i64 = 1;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS kv (
@@ -231,6 +231,8 @@ pub(crate) struct Completeness {
     pub(crate) pending: u64,
     pub(crate) failed: u64,
     pub(crate) modified: u64,
+    /// Bytes iCloud reports for the copies in each count above, in order.
+    pub(crate) bytes: [u64; 4],
 }
 
 #[derive(Clone)]
@@ -330,6 +332,16 @@ impl State {
         .await
     }
 
+    /// Write a consistent copy of the database to `path`.
+    pub(crate) async fn copy_to(&self, path: &Path) -> anyhow::Result<()> {
+        let path = path.to_string_lossy().into_owned();
+        self.with(move |conn| {
+            conn.execute("VACUUM INTO ?1", [path])?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Check the database file's integrity.
     pub(crate) async fn validate(&self) -> anyhow::Result<()> {
         self.with(|conn| {
@@ -389,6 +401,9 @@ impl State {
     }
 
     /// Store one page's observations and the position after it, atomically.
+    // CONTRACT: POSITION_COMMITS_WITH_OBSERVATIONS
+    // The zone position moves only in the transaction that records the page
+    // it covers; downloads stay owed rows that survive a restart.
     pub(crate) async fn commit_page(
         &self,
         zone: &str,
@@ -660,6 +675,9 @@ impl State {
         let (zone, asset) = (zone.to_owned(), asset.to_owned());
         self.with(move |conn| {
             let tx = conn.transaction()?;
+            // CONTRACT: SYNC_NEVER_DELETES
+            // A copy that is no longer planned only stops being wanted; its
+            // row and its file stay.
             tx.execute(
                 "UPDATE files SET wanted = 0 WHERE zone = ?1 AND asset = ?2",
                 params![zone, asset],
@@ -953,20 +971,34 @@ impl State {
     pub(crate) async fn completeness(&self) -> anyhow::Result<Completeness> {
         self.with(|conn| {
             let mut out = Completeness::default();
-            let mut stmt =
-                conn.prepare("SELECT state, COUNT(*) FROM files WHERE wanted = 1 GROUP BY state")?;
+            let mut stmt = conn.prepare(
+                "SELECT state, COUNT(*), TOTAL(size) FROM files WHERE wanted = 1 GROUP BY state",
+            )?;
             let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, f64>(2)?,
+                ))
             })?;
             for row in rows {
-                let (state, count) = row?;
+                let (state, count, bytes) = row?;
                 let count = u64::try_from(count)?;
-                match FileState::parse(&state)? {
-                    FileState::Done => out.done += count,
-                    FileState::Pending | FileState::Adopt => out.pending += count,
-                    FileState::Failed => out.failed += count,
-                    FileState::Modified => out.modified += count,
-                }
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "TOTAL of non-negative integer sizes; a metric, not an exact count"
+                )]
+                let bytes = bytes as u64;
+                let [done, pending, failed, modified] = &mut out.bytes;
+                let (count_slot, bytes_slot) = match FileState::parse(&state)? {
+                    FileState::Done => (&mut out.done, done),
+                    FileState::Pending | FileState::Adopt => (&mut out.pending, pending),
+                    FileState::Failed => (&mut out.failed, failed),
+                    FileState::Modified => (&mut out.modified, modified),
+                };
+                *count_slot += count;
+                *bytes_slot += bytes;
             }
             Ok(out)
         })
@@ -1401,7 +1433,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn page_and_position_commit_together() {
+    async fn contract_position_commits_with_observations() {
         let state = State::open_in_memory().unwrap();
         assert_eq!(state.position("Z").await.unwrap(), None);
         state

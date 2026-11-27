@@ -48,7 +48,7 @@ pub(super) fn export(
     let state = if username.is_empty() {
         json!({"status": "account_unavailable"})
     } else {
-        crate::state::db::support::collect(&directory, &username, domain.as_str())
+        crate::sync_core::support_summary(&directory, &username, domain.as_str())
     };
     let health = read_json(&directory.join("health.json"), 32 * 1024).map(|v| {
         let mut safe = super::privacy::numbers(
@@ -107,7 +107,7 @@ pub(super) fn export(
             "target_os": std::env::consts::OS, "target_arch": std::env::consts::ARCH,
             "xmp_feature": cfg!(feature = "xmp"), "debug_assertions": cfg!(debug_assertions),
             "install_method": install_method(), "docker_digest": "unavailable",
-            "supported_state_schema": crate::state::schema::SCHEMA_VERSION,
+            "supported_state_schema": crate::sync_core::state::SCHEMA_VERSION,
         },
         "configuration": {"status": config_status, "scope": "current_file_and_bootstrap_environment",
             "values": configuration(toml.as_ref(), explicit),

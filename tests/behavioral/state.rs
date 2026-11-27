@@ -22,18 +22,15 @@ use rusqlite::OptionalExtension;
 /// migration constant directly.
 #[test]
 fn behavioral_helper_schema_matches_production() {
-    // Production version as of this commit. Bump in lockstep with
-    // `pub(crate) const SCHEMA_VERSION` in `src/state/schema.rs` *and*
-    // update the DDL in `create_state_db` in support to match the new
-    // shape. The fresh-DB DDL emitted by a real binary run can be
-    // dumped via `sqlite3 <db> '.schema'` for reference.
+    // The last schema the previous engine wrote. The helper builds that
+    // shape so upgrade paths see what released versions left behind.
     const PRODUCTION_SCHEMA_VERSION: i32 = 49;
-    let production_schema = include_str!("../../src/state/schema.rs");
+    let production_schema = include_str!("../../src/state/db/account.rs");
     assert!(
         production_schema.contains(&format!(
-            "pub(crate) const SCHEMA_VERSION: i32 = {PRODUCTION_SCHEMA_VERSION};"
+            "LAST_LEGACY_SCHEMA_VERSION: i32 = {PRODUCTION_SCHEMA_VERSION};"
         )),
-        "behavioral production-version pin must match the actual schema owner"
+        "behavioral production-version pin must match the upgrade owner"
     );
     assert_eq!(
         HELPER_SCHEMA_VERSION, PRODUCTION_SCHEMA_VERSION,

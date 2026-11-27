@@ -190,6 +190,39 @@ fn recovery_restores_uncommitted_bytes_at_each_interruption_boundary() {
     }
 }
 
+#[tokio::test]
+async fn sync_core_recovery_settles_an_interrupted_replacement_before_comparison() {
+    for stage in [Stage::Displaced, Stage::Committed] {
+        let dir = TempDir::new().unwrap();
+        let (target, _part, journal) = prepare(dir.path());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            publish_journal(&journal, |current| {
+                assert_ne!(current, stage, "simulated interruption");
+                Ok(())
+            })
+            .unwrap();
+        }));
+        assert!(result.is_err());
+        drop(journal);
+        crate::download::core_io::recover_replacement(&target)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            if stage == Stage::Committed {
+                b"replacement".as_slice()
+            } else {
+                b"original".as_slice()
+            }
+        );
+        assert!(!directory_path(&target).unwrap().exists());
+        // Without a journal there is nothing to do.
+        crate::download::core_io::recover_replacement(&target)
+            .await
+            .unwrap();
+    }
+}
+
 #[test]
 fn concurrent_edit_before_displacement_is_restored_and_retained() {
     let dir = TempDir::new().unwrap();
@@ -321,125 +354,6 @@ fn empty_initialization_and_partial_cleanup_are_recoverable() {
     assert!(!directory_path(&target).unwrap().exists());
 }
 
-#[cfg(feature = "xmp")]
-#[tokio::test]
-async fn production_sidecar_retry_recovers_interruption_and_reaches_steady_state() {
-    use crate::download::metadata_rewrite::run_pending;
-    use crate::download::pipeline::MetadataFlags;
-    use crate::state::{SqliteStateDb, types::AssetMetadata};
-    use std::sync::Arc;
-    use tokio_util::sync::CancellationToken;
-
-    for stage in [Stage::Displaced, Stage::Installed, Stage::Committed] {
-        let dir = TempDir::new().unwrap();
-        let media = dir.path().join("photo.jpg");
-        fs::write(&media, crate::test_helpers::minimal_jpeg_with_source_gps()).unwrap();
-        let checksum = crate::download::file::compute_sha256(&media).await.unwrap();
-        let db_path = dir.path().join("state.db");
-        let db = SqliteStateDb::open(&db_path).await.unwrap();
-        let record = crate::test_helpers::TestAssetRecord::new("SIDECAR_RECOVERY")
-            .filename("photo.jpg")
-            .metadata(AssetMetadata {
-                description: Some("Before".into()),
-                metadata_hash: Some("before".into()),
-                ..AssetMetadata::default()
-            })
-            .build();
-        db.upsert_seen(&record).await.unwrap();
-        db.mark_downloaded(
-            "PrimarySync",
-            "SIDECAR_RECOVERY",
-            "original",
-            &media,
-            &checksum,
-            None,
-        )
-        .await
-        .unwrap();
-        db.record_metadata_write_failure("PrimarySync", "SIDECAR_RECOVERY", "original")
-            .await
-            .unwrap();
-        let initial = run_pending(
-            &db,
-            MetadataFlags::XMP_SIDECAR,
-            Arc::from(".kei-tmp"),
-            &CancellationToken::new(),
-        )
-        .await;
-        assert_eq!(initial.applied, 1);
-        let target = media.with_file_name("photo.jpg.xmp");
-        let part = dir.path().join("prepared.xmp");
-        fs::copy(&target, &part).unwrap();
-        let journal = Journal::create(
-            &confined(&part).unwrap(),
-            confined(&target).unwrap(),
-            fingerprint_regular_file_blocking(&target).unwrap(),
-            fingerprint_regular_file_blocking(&part).unwrap(),
-        )
-        .unwrap();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            publish_journal(&journal, |current| {
-                assert_ne!(current, stage, "simulated interruption");
-                Ok(())
-            })
-            .unwrap();
-        }));
-        assert!(result.is_err());
-        drop(journal);
-        let updated = crate::test_helpers::TestAssetRecord::new("SIDECAR_RECOVERY")
-            .filename("photo.jpg")
-            .metadata(AssetMetadata {
-                description: Some("After".into()),
-                metadata_hash: Some("after".into()),
-                ..AssetMetadata::default()
-            })
-            .build();
-        db.upsert_seen(&updated).await.unwrap();
-        db.record_metadata_write_failure("PrimarySync", "SIDECAR_RECOVERY", "original")
-            .await
-            .unwrap();
-        drop(db);
-        let db = SqliteStateDb::open(&db_path).await.unwrap();
-        let recovered = run_pending(
-            &db,
-            MetadataFlags::XMP_SIDECAR,
-            Arc::from(".kei-tmp"),
-            &CancellationToken::new(),
-        )
-        .await;
-        assert_eq!(recovered.applied, 1);
-        assert_eq!(recovered.failed, 0);
-        assert!(fs::read_to_string(&target).unwrap().contains("After"));
-        assert!(!directory_path(&target).unwrap().exists());
-        assert!(
-            db.get_pending_metadata_rewrites(10)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            crate::download::file::compute_sha256(&media).await.unwrap(),
-            checksum
-        );
-        let steady = run_pending(
-            &db,
-            MetadataFlags::XMP_SIDECAR,
-            Arc::from(".kei-tmp"),
-            &CancellationToken::new(),
-        )
-        .await;
-        assert_eq!(steady.applied, 0);
-        assert_eq!(steady.failed, 0);
-        assert!(!fs::read_dir(dir.path()).unwrap().any(|entry| {
-            entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".kei-xmp-")
-        }));
-    }
-}
-
 #[test]
 fn unsupported_rename_flags_exercise_the_production_publication_routes() {
     use std::os::unix::process::CommandExt;
@@ -457,18 +371,13 @@ fn unsupported_rename_flags_exercise_the_production_publication_routes() {
         + FLAGS_ARGUMENT * std::mem::size_of::<u64>()
         + if cfg!(target_endian = "big") { 4 } else { 0 };
     let routes = [
-        "sync_loop::runner::tests::primary_layout::local_policy_adjusted_still_requires_strictly_newer_cloud_time",
-        #[cfg(feature = "xmp")]
-        "sync_loop::runner::tests::primary_layout::local_policy_metadata_keeps_preserved_disposition_and_mtime",
+        "sync_core::tests::contract_replace_requires_recorded_bytes_new_versions_replace_only_untouched_files",
+        "sync_core::tests::confirmed_damage_is_replaced_by_the_next_sync_only_while_unchanged",
         "download::file::replacement::tests::approved_truncated_publish_replaces_only_expected_bytes",
         #[cfg(feature = "xmp")]
         "download::metadata::sidecar::tests::write_sidecar_creates_xmp_file_next_to_media",
         #[cfg(feature = "xmp")]
         "download::metadata::sidecar::tests::write_sidecar_is_atomic_rewrite",
-        #[cfg(feature = "xmp")]
-        "download::metadata_rewrite::queued::tests::drain_clears_previously_owned_sidecar_fields",
-        #[cfg(feature = "xmp")]
-        "download::metadata_rewrite::queued::tests::drain_establishes_a_checksum_baseline_when_none_was_recorded",
     ];
     for error in [libc::EOPNOTSUPP, libc::EINVAL, libc::ENOSYS] {
         for route in &routes {
@@ -554,7 +463,7 @@ fn unsupported_rename_flags_exercise_the_production_publication_routes() {
 
 #[cfg(feature = "xmp")]
 #[test]
-fn prepared_cleanup_requires_both_owned_inode_and_output_bytes() {
+fn contract_temp_file_delete_requires_durable_ownership_of_inode_and_bytes() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("prepared.xmp");
     fs::write(&path, b"owned output").unwrap();
@@ -587,229 +496,6 @@ fn recovery_preserves_user_directories_that_only_share_the_prefix() {
         fs::read(user_directory.join("manifest.json")).unwrap(),
         b"user metadata"
     );
-}
-
-fn recovery_owner() -> crate::state::db::account::AccountOwner {
-    crate::state::db::account::AccountOwner::authenticated(
-        "replacement-recovery@example.invalid",
-        "com",
-        &serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"replacement-recovery"}}))
-            .unwrap(),
-    )
-    .unwrap()
-}
-
-fn recovery_pass(db: &std::sync::Arc<crate::state::SqliteStateDb>) -> crate::commands::AlbumPass {
-    use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, PhotosSession};
-    use serde_json::{Value, json};
-    use std::sync::Arc;
-
-    #[derive(Clone)]
-    struct EmptySelection;
-    #[async_trait::async_trait]
-    impl PhotosSession for EmptySelection {
-        async fn post(
-            &self,
-            url: &str,
-            _body: String,
-            _headers: &[(&str, &str)],
-        ) -> anyhow::Result<Value> {
-            if url.contains("/internal/records/query/batch?") {
-                return Ok(json!({"batch":[{"records":[{"fields":{"itemCount":{"value":0}}}]}]}));
-            }
-            anyhow::ensure!(
-                url.contains("/records/query?"),
-                "unexpected recovery fixture request"
-            );
-            Ok(json!({"records":[],"syncToken":"recovery-selection-token"}))
-        }
-
-        fn clone_box(&self) -> Box<dyn PhotosSession> {
-            Box::new(self.clone())
-        }
-    }
-
-    let mut album = PhotoAlbum::new(
-        PhotoAlbumConfig {
-            params: Arc::new(std::collections::HashMap::new()),
-            service_endpoint: Arc::from("https://fixture.invalid"),
-            name: Arc::from(""),
-            list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
-            obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
-            query_filter: None,
-            page_size: 100,
-            zone_id: Arc::new(json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})),
-            retry_config: crate::retry::RetryConfig::default(),
-            container_id: None,
-            cross_zone_sources: Vec::new(),
-        },
-        Box::new(EmptySelection),
-    );
-    album.set_shadow_capture(
-        crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), recovery_owner(), "com"),
-        Arc::from("private"),
-    );
-    crate::commands::AlbumPass {
-        kind: crate::commands::PassKind::Unfiled,
-        album,
-        exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
-    }
-}
-
-#[tokio::test]
-async fn production_download_recovers_before_work_but_dry_run_does_not_mutate() {
-    use crate::download::{DownloadConfig, DownloadControls, download_photos_with_sync};
-    use std::sync::Arc;
-    use tokio_util::sync::CancellationToken;
-
-    let dir = TempDir::new().unwrap();
-    let (target, part, journal) = prepare(dir.path());
-    assert!(
-        publish_journal(&journal, |stage| {
-            anyhow::ensure!(stage != Stage::Displaced, "simulated interruption");
-            Ok(())
-        })
-        .is_err()
-    );
-    drop(journal);
-    let db_path = dir.path().join("state.db");
-    let db = Arc::new(
-        crate::state::SqliteStateDb::open_owned(&db_path, &recovery_owner())
-            .await
-            .unwrap(),
-    );
-    let mut config = DownloadConfig::test_default();
-    config.directory = Arc::from(dir.path());
-    config.state_db = Some(db.clone());
-    let config = Arc::new(config);
-    download_photos_with_sync(
-        &reqwest::Client::new(),
-        &[recovery_pass(&db)],
-        Arc::clone(&config),
-        DownloadControls::dry_run_hidden(),
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-    assert!(!target.exists());
-    assert!(directory_path(&target).unwrap().exists());
-    assert_eq!(
-        fs::read(directory_path(&target).unwrap().join("original")).unwrap(),
-        b"original"
-    );
-    assert_eq!(fs::read(&part).unwrap(), b"replacement");
-    let result = download_photos_with_sync(
-        &reqwest::Client::new(),
-        &[recovery_pass(&db)],
-        Arc::clone(&config),
-        DownloadControls::download_hidden(),
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        result.sync_token.as_deref(),
-        Some("recovery-selection-token")
-    );
-    assert_eq!(fs::read(&target).unwrap(), b"original");
-    assert!(!directory_path(&target).unwrap().exists());
-    let mut reopened_config = config.as_ref().clone();
-    reopened_config.state_db = None;
-    drop(config);
-    drop(db);
-    let db = Arc::new(
-        crate::state::SqliteStateDb::open_owned(&db_path, &recovery_owner())
-            .await
-            .unwrap(),
-    );
-    reopened_config.state_db = Some(db.clone());
-    let result = download_photos_with_sync(
-        &reqwest::Client::new(),
-        &[recovery_pass(&db)],
-        Arc::new(reopened_config),
-        DownloadControls::download_hidden(),
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        result.sync_token.as_deref(),
-        Some("recovery-selection-token")
-    );
-    assert_eq!(fs::read(&target).unwrap(), b"original");
-    assert!(!directory_path(&target).unwrap().exists());
-}
-
-#[tokio::test]
-async fn production_download_keeps_checkpoint_when_recovery_is_unresolved() {
-    use crate::download::{DownloadConfig, DownloadControls, download_photos_with_sync};
-    use crate::state::{ScopedDbSyncToken, SqliteStateDb};
-    use std::sync::Arc;
-    use tokio_util::sync::CancellationToken;
-
-    let dir = TempDir::new().unwrap();
-    let (target, part, journal) = prepare(dir.path());
-    assert!(
-        publish_journal(&journal, |stage| {
-            if stage == Stage::Displaced {
-                fs::write(&target, b"concurrent user file")?;
-            }
-            Ok(())
-        })
-        .is_err()
-    );
-    drop(journal);
-    let db_path = dir.path().join("state.db");
-    let db = Arc::new(
-        SqliteStateDb::open_owned(&db_path, &recovery_owner())
-            .await
-            .unwrap(),
-    );
-    let checkpoint = ScopedDbSyncToken {
-        provider: "icloud".into(),
-        account: "test-account".into(),
-        shape_version: 1,
-        scope_hash: "test-scope".into(),
-        selected_zones_json: "[\"PrimarySync\"]".into(),
-        scope_json: "{}".into(),
-        token: "previous-checkpoint".into(),
-    };
-    db.upsert_scoped_db_sync_token(checkpoint).await.unwrap();
-    let mut config = DownloadConfig::test_default();
-    config.directory = Arc::from(dir.path());
-    config.state_db = Some(db.clone());
-    let result = download_photos_with_sync(
-        &reqwest::Client::new(),
-        &[recovery_pass(&db)],
-        Arc::new(config),
-        DownloadControls::download_hidden(),
-        CancellationToken::new(),
-    )
-    .await;
-    let error = result.unwrap_err();
-    assert!(
-        format!("{error:#}").contains("Concurrent replacement target preserved"),
-        "{error:#}"
-    );
-    drop(db);
-    let db = SqliteStateDb::open_owned(&db_path, &recovery_owner())
-        .await
-        .unwrap();
-    assert_eq!(
-        db.get_scoped_db_sync_token("icloud", "test-account", 1, "test-scope")
-            .await
-            .unwrap()
-            .unwrap()
-            .token,
-        "previous-checkpoint"
-    );
-    assert_eq!(fs::read(&target).unwrap(), b"concurrent user file");
-    assert_eq!(fs::read(&part).unwrap(), b"replacement");
-    assert_eq!(
-        fs::read(directory_path(&target).unwrap().join("original")).unwrap(),
-        b"original"
-    );
-    assert!(directory_path(&target).unwrap().exists());
 }
 
 #[test]
@@ -1261,152 +947,4 @@ pub(super) fn terminal_sync_fault(path: &crate::fs_util::ConfinedPath) -> anyhow
         return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
     }
     Ok(())
-}
-
-#[cfg(feature = "xmp")]
-#[test]
-fn terminal_sidecar_cleanup_retires_marker_across_restarts() {
-    for mode in ["descriptors", "enotempty"] {
-        let root = TempDir::new().unwrap();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "download::file::replacement_recovery::tests::terminal_sidecar_worker",
-                "--exact",
-                "--nocapture",
-            ])
-            .env("KEI_TEST_TERMINAL_ROOT", root.path())
-            .env("KEI_TEST_TERMINAL_MODE", mode)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
-            "mode={mode}\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-}
-
-#[cfg(feature = "xmp")]
-#[tokio::test]
-async fn terminal_sidecar_worker() {
-    use crate::download::metadata_rewrite::run_pending;
-    use crate::download::pipeline::MetadataFlags;
-    use crate::state::{SqliteStateDb, types::AssetMetadata};
-    use std::os::unix::fs::MetadataExt;
-    use std::sync::Arc;
-    use tokio_util::sync::CancellationToken;
-    let Some(root) = std::env::var_os("KEI_TEST_TERMINAL_ROOT") else {
-        return;
-    };
-    let root = std::path::PathBuf::from(root);
-    let media = root.join("photo.jpg");
-    fs::write(&media, crate::test_helpers::minimal_jpeg_with_source_gps()).unwrap();
-    let checksum = crate::download::file::compute_sha256(&media).await.unwrap();
-    let historic = root.join(".kei-xmp-historical.kei-tmp");
-    fs::write(&historic, b"historical retained bytes").unwrap();
-    let db_path = root.join("state.db");
-    let db = SqliteStateDb::open(&db_path).await.unwrap();
-    for description in ["Before", "After"] {
-        let record = crate::test_helpers::TestAssetRecord::new("TERMINAL_SIDECAR")
-            .filename("photo.jpg")
-            .metadata(AssetMetadata {
-                description: Some(description.into()),
-                metadata_hash: Some(description.into()),
-                ..AssetMetadata::default()
-            })
-            .build();
-        db.upsert_seen(&record).await.unwrap();
-        if description == "Before" {
-            db.mark_downloaded(
-                "PrimarySync",
-                "TERMINAL_SIDECAR",
-                "original",
-                &media,
-                &checksum,
-                None,
-            )
-            .await
-            .unwrap();
-        }
-        db.record_metadata_write_failure("PrimarySync", "TERMINAL_SIDECAR", "original")
-            .await
-            .unwrap();
-        let report = run_pending(
-            &db,
-            MetadataFlags::XMP_SIDECAR,
-            Arc::from(".kei-tmp"),
-            &CancellationToken::new(),
-        )
-        .await;
-        assert_eq!(report.applied, 1);
-        assert_eq!(report.failed, 0);
-        assert!(
-            db.get_pending_metadata_rewrites(10)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-    }
-    let target = root.join("photo.jpg.xmp");
-    let bytes = fs::read(&target).unwrap();
-    assert!(String::from_utf8_lossy(&bytes).contains("After"));
-    let snapshot = fs::metadata(&target).unwrap();
-    assert_eq!(snapshot.nlink(), 1);
-    let entries = || {
-        let mut entries: Vec<_> = fs::read_dir(&root)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .filter(|name| name.to_string_lossy().starts_with(".kei-"))
-            .collect();
-        entries.sort();
-        entries
-    };
-    let before = entries();
-    assert_eq!(
-        before
-            .iter()
-            .filter(|name| name.to_string_lossy().starts_with(".kei-xmp-"))
-            .count(),
-        1
-    );
-    drop(db);
-    for _ in 0..2 {
-        recover_tree_blocking(&root).unwrap();
-        let db = SqliteStateDb::open(&db_path).await.unwrap();
-        let quiet = run_pending(
-            &db,
-            MetadataFlags::XMP_SIDECAR,
-            Arc::from(".kei-tmp"),
-            &CancellationToken::new(),
-        )
-        .await;
-        assert_eq!(quiet.applied, 0);
-        assert_eq!(quiet.failed, 0);
-        assert!(
-            db.get_pending_metadata_rewrites(10)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(fs::read(&target).unwrap(), bytes);
-        let current = fs::metadata(&target).unwrap();
-        assert_eq!(
-            (
-                current.ino(),
-                current.mtime(),
-                current.mtime_nsec(),
-                current.nlink()
-            ),
-            (snapshot.ino(), snapshot.mtime(), snapshot.mtime_nsec(), 1)
-        );
-        assert_eq!(entries(), before);
-        assert_eq!(fs::read(&historic).unwrap(), b"historical retained bytes");
-        assert_eq!(
-            crate::download::file::compute_sha256(&media).await.unwrap(),
-            checksum
-        );
-        drop(db);
-    }
 }

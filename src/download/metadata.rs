@@ -109,3 +109,13 @@ fn exif_datetime_to_iso(s: &str) -> String {
         s.to_owned()
     }
 }
+
+/// Whether an explicitly requested metadata repair may replace an existing
+/// embedded capture timestamp.
+#[must_use]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum CaptureTimestampRepair {
+    #[default]
+    Preserve,
+    ReplaceWithCaptureLocal,
+}

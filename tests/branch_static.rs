@@ -657,15 +657,9 @@ fn focused_scenario_catalog_lists_every_runner_slice() {
 fn config_reconciliation_scenario_pins_transition_seed_tests() {
     let scenario = repo_file("scripts/test-scenarios/config-reconciliation.sh");
     let required = [
-        "path_reconciliation_copies_catalog_file_without_provider_inventory",
         "local_reconciliation_copy_preserves_source_and_refuses_conflict",
-        "download_config_hash_drift_stages_reconciliation_without_clearing_token",
-        "download_config_revert_clears_pending_reconciliation",
-        "run_cycle_date_bound_expansion_preserves_existing_media_and_reaches_steady_state",
-        "run_cycle_download_config_hash_drift_keeps_source_incremental",
-        "run_cycle_multi_pass_persists_base_download_config_hash",
-        "unchanged_multi_pass_second_cycle_is_not_download_config_hash_drift",
-        "run_cycle_capture_offset_drives_date_filter_path_and_sidecar",
+        "plans_keep_paths_and_replace_only_through_pending",
+        "the_date_range_limits_which_photos_are_saved",
     ];
 
     let missing = missing_required_fragments(&scenario, &required);
@@ -2114,29 +2108,15 @@ fn typed_error_downcasts_stay_in_named_classifier_boundaries() {
         "classify_api_error",
         "classify_auth_flow_error",
         "classify_auth_retry_error",
-        "classify_catalog_projection_error",
         "classify_cli_parse_exit",
         "classify_conditional_publish_error",
-        "classify_download_task_error",
         "classify_exit_error",
-        "bridge_error_reason", // Provider-owned diagnostic for wrapped changes/zone failures.
         "classify_heif_metadata_limit",
-        "classify_incremental_error",
-        "classify_legacy_file_error",
-        "classify_legacy_inventory_error",
-        "classify_provider_lookup_error",
-        "classify_rate_limit_error",
-        "classify_reconciliation_io_error",
-        "classify_selection_confirmation_error",
-        "classify_selection_incremental_error",
-        "classify_shadow_page_error",
         "classify_srp_post_error",
         "classify_support_error",
         "classify_sync_auth_error",
         "indexing_unavailable", // Provider-owned classifier for wrapped indexing failures.
         "is_session_error",
-        "is_directory_collision",
-        "is_operational_storage_error",
         "map_library_init_error",
     ]
     .into_iter()

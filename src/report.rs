@@ -14,7 +14,6 @@ use serde::Serialize;
 
 use crate::download::SyncStats;
 use crate::fs_util::atomic_install;
-use crate::state::AssetRecord;
 
 /// Cap on `failed_assets` entries so an account with hundreds of thousands of
 /// failures doesn't blow up the report JSON. The tail count is preserved in
@@ -32,11 +31,11 @@ pub(crate) struct FailedAssetEntry {
 }
 
 impl FailedAssetEntry {
-    pub(crate) fn from_record(r: &AssetRecord) -> Self {
+    pub(crate) fn from_listed(file: &crate::sync_core::state::ListedFile) -> Self {
         Self {
-            id: r.id.to_string(),
-            version_size: r.version_size.as_str().to_string(),
-            error_message: r.last_error.clone(),
+            id: file.asset.clone(),
+            version_size: file.rendition.clone(),
+            error_message: file.last_error.clone(),
         }
     }
 }
@@ -195,25 +194,7 @@ fn edited_naming_is_default(value: &crate::types::EditedNaming) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::download::SkipBreakdown;
-
-    #[test]
-    fn primary_layout_report_inventory_is_distinct_from_network_counters() {
-        let mut stats = crate::download::SyncStats::default();
-        let json = serde_json::to_value(&stats).unwrap();
-        assert!(json.get("primary_layout").is_none());
-        stats.primary_layout = Some(crate::state::types::PrimaryLayoutSummary {
-            bound_families: 5,
-            preserved_files: 12,
-            pending_operations: 2,
-            held_operations: 1,
-        });
-        let json = serde_json::to_value(&stats).unwrap();
-        assert_eq!(json["primary_layout"]["preserved_files"], 12);
-        assert_eq!(json["primary_layout"]["held_operations"], 1);
-        assert_eq!(json["downloaded"], 0);
-        assert_eq!(json["bytes_downloaded"], 0);
-    }
+    use crate::sync_stats::SkipBreakdown;
 
     #[test]
     fn report_serialization_roundtrip() {

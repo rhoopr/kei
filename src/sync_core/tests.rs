@@ -224,6 +224,7 @@ impl Harness {
                 max_delay_secs: 0,
             },
             transfer: Transfer::All,
+            bandwidth: None,
         };
         if let Some(tweak) = *self.tweak.lock().unwrap() {
             tweak(&mut config);
@@ -500,7 +501,7 @@ async fn an_expired_url_is_refreshed_once_in_the_same_cycle() {
 }
 
 #[tokio::test]
-async fn new_versions_replace_only_untouched_files() {
+async fn contract_replace_requires_recorded_bytes_new_versions_replace_only_untouched_files() {
     let h = Harness::new().await;
     library_with_album(&h).await;
     h.run().await;
@@ -520,7 +521,7 @@ async fn new_versions_replace_only_untouched_files() {
 }
 
 #[tokio::test]
-async fn album_paths_are_stable_and_departed_copies_stay() {
+async fn contract_sync_never_deletes_album_paths_are_stable_and_departed_copies_stay() {
     let h = Harness::new().await;
     library_with_album(&h).await;
     h.run().await;
@@ -550,7 +551,7 @@ async fn album_paths_are_stable_and_departed_copies_stay() {
 }
 
 #[tokio::test]
-async fn a_photo_waits_for_its_master_and_name_collisions_get_suffixes() {
+async fn contract_unknown_provider_identity_remains_pending_until_its_master_arrives() {
     let h = Harness::new().await;
     h.push(asset("A1", "M1"));
     let report = h.run().await;
@@ -770,11 +771,7 @@ async fn legacy_state(
     owner: &crate::state::db::account::AccountOwner,
     copies: &[(&str, PathBuf, u64, String, String)],
 ) {
-    drop(
-        crate::state::SqliteStateDb::open_owned(path, owner)
-            .await
-            .unwrap(),
-    );
+    crate::test_helpers::legacy_state_db(path, owner);
     let conn = rusqlite::Connection::open(path).unwrap();
     for (master, local, size, sha256, checksum) in copies {
         conn.execute(
@@ -800,7 +797,7 @@ fn checksum_of(record: &Value) -> String {
 }
 
 #[tokio::test]
-async fn an_upgrade_reuses_recorded_copies_then_removes_the_old_state() {
+async fn contract_upgrade_cleanup_requires_validated_state_reuses_copies_then_removes_old_state() {
     let h = Harness::new().await;
     h.push(album("AL", "Trip"));
     let m1 = h.master("M1", "IMG_0001.JPG", &jpeg("one")).await;
@@ -1028,4 +1025,215 @@ async fn confirmed_damage_is_replaced_by_the_next_sync_only_while_unchanged() {
     let report = h.run().await;
     assert_eq!(report.completeness.modified, 1);
     assert_eq!(h.file("2023/IMG_0001.JPG").unwrap(), jpeg("one"));
+}
+
+/// Libraries written by icloudpd are adopted in place by `import-existing`.
+/// Paths, sizes and names come from icloudpd's own test fixtures; nothing is
+/// downloaded, so a divergence shows up as an owed copy.
+mod icloudpd_layout {
+    use super::*;
+    use crate::download::paths;
+    use chrono::TimeZone;
+
+    /// Capture time that renders as `folder` (`Y/M/D`) in local time; 18:00
+    /// keeps daylight-saving changes from crossing midnight.
+    fn local_day_ms(folder: &str) -> f64 {
+        let parts: Vec<u32> = folder.split('/').map(|s| s.parse().unwrap()).collect();
+        chrono::Local
+            .with_ymd_and_hms(parts[0] as i32, parts[1], parts[2], 18, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis() as f64
+    }
+
+    fn item_type(filename: &str) -> &'static str {
+        let lower = filename.to_lowercase();
+        if lower.ends_with(".heic") {
+            "public.heic"
+        } else if lower.ends_with(".mov") {
+            "com.apple.quicktime-movie"
+        } else if lower.ends_with(".mp4") {
+            "public.mpeg-4"
+        } else if lower.ends_with(".dng") {
+            "com.adobe.raw-image"
+        } else {
+            "public.jpeg"
+        }
+    }
+
+    fn photo(h: &Harness, name: &str, filename: &str, size: u64, folder: &str, mov: Option<u64>) {
+        let kind = item_type(filename);
+        let mut fields = json!({
+            "filenameEnc": {"value": filename, "type": "STRING"},
+            "itemType": {"value": kind},
+            "resOriginalFileType": {"value": kind},
+            "resOriginalRes": {"value": {
+                "size": size, "fileChecksum": format!("ck-{name}"),
+                "downloadURL": "https://p01.icloud-content.com/never-fetched"
+            }}
+        });
+        if let Some(mov) = mov {
+            fields["resOriginalVidComplRes"] = json!({"value": {
+                "size": mov, "fileChecksum": format!("ck-{name}-mov"),
+                "downloadURL": "https://p01.icloud-content.com/never-fetched-mov"
+            }});
+            fields["resOriginalVidComplFileType"] = json!({"value": "com.apple.quicktime-movie"});
+        }
+        h.push(json!({"recordName": name, "recordType": "CPLMaster", "fields": fields}));
+        let mut child = asset(&format!("{name}-asset"), name);
+        child["fields"]["assetDate"] = json!({"value": local_day_ms(folder)});
+        h.push(child);
+    }
+
+    fn stage(h: &Harness, relative: &str, size: u64) {
+        let path = h.photos().join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, vec![0_u8; usize::try_from(size).unwrap()]).unwrap();
+    }
+
+    fn dated(config: &mut CoreConfig) {
+        config.transfer = Transfer::AdoptOnly;
+        config.paths.folder_structure = "%Y/%m/%d".into();
+    }
+
+    fn dated_id7(config: &mut CoreConfig) {
+        dated(config);
+        config.paths.file_match_policy = crate::types::FileMatchPolicy::NameId7;
+    }
+
+    fn flat(config: &mut CoreConfig) {
+        config.transfer = Transfer::AdoptOnly;
+        config.paths.folder_structure = String::new();
+    }
+
+    fn yearly(config: &mut CoreConfig) {
+        config.transfer = Transfer::AdoptOnly;
+        config.paths.folder_structure = "%Y".into();
+    }
+
+    /// Adopt every staged file and download nothing.
+    async fn adopts_all(h: &Harness, tweak: fn(&mut CoreConfig), copies: u64) {
+        *h.tweak.lock().unwrap() = Some(tweak);
+        let before = sorted_files(&h.photos());
+        let report = h.run().await;
+        assert_eq!(report.zones[0].drain.downloaded, 0);
+        assert_eq!(
+            (report.completeness.done, report.completeness.pending),
+            (copies, 0),
+            "{report:?}"
+        );
+        assert_eq!(sorted_files(&h.photos()), before);
+    }
+
+    #[tokio::test]
+    async fn default_layout_and_size_suffixed_collisions() {
+        let h = Harness::new().await;
+        for (name, folder, filename, size) in [
+            ("DEF0", "2018/07/30", "IMG_7408.JPG", 1_151_066),
+            ("DEF1", "2018/07/30", "IMG_7407.JPG", 656_257),
+            ("DEF2", "2018/07/31", "IMG_7409.JPG", 100_000),
+            ("DUP1", "2018/07/30", "IMG_DUP.JPG", 100_000),
+            ("DUP2", "2018/07/30", "IMG_DUP.JPG", 200_000),
+        ] {
+            photo(&h, name, filename, size, folder, None);
+        }
+        for (relative, size) in [
+            ("2018/07/30/IMG_7408.JPG", 1_151_066),
+            ("2018/07/30/IMG_7407.JPG", 656_257),
+            ("2018/07/31/IMG_7409.JPG", 100_000),
+            ("2018/07/30/IMG_DUP.JPG", 100_000),
+            ("2018/07/30/IMG_DUP-200000.JPG", 200_000),
+        ] {
+            stage(&h, relative, size);
+        }
+        adopts_all(&h, dated, 5).await;
+    }
+
+    #[tokio::test]
+    async fn name_id7_layout() {
+        let h = Harness::new().await;
+        for (name, folder, filename, size) in [
+            ("REC_FOR_7408", "2018/07/30", "IMG_7408.JPG", 1_151_066),
+            ("REC_FOR_7409", "2018/07/31", "IMG_7409.JPG", 100_000),
+        ] {
+            photo(&h, name, filename, size, folder, None);
+            stage(
+                &h,
+                &format!("{folder}/{}", paths::apply_name_id7(filename, name)),
+                size,
+            );
+        }
+        adopts_all(&h, dated_id7, 2).await;
+    }
+
+    #[tokio::test]
+    async fn live_photo_layouts() {
+        let h = Harness::new().await;
+        photo(
+            &h,
+            "LIVEJ",
+            "IMG_7408.JPG",
+            1_151_066,
+            "2018/07/30",
+            Some(2_000_000),
+        );
+        photo(
+            &h,
+            "LIVEH",
+            "IMG_5000.HEIC",
+            800_000,
+            "2018/07/30",
+            Some(3_000_000),
+        );
+        for (relative, size) in [
+            ("2018/07/30/IMG_7408.JPG", 1_151_066),
+            ("2018/07/30/IMG_7408.MOV", 2_000_000),
+            ("2018/07/30/IMG_5000.HEIC", 800_000),
+            ("2018/07/30/IMG_5000_HEVC.MOV", 3_000_000),
+        ] {
+            stage(&h, relative, size);
+        }
+        adopts_all(&h, dated, 4).await;
+
+        let h = Harness::new().await;
+        photo(
+            &h,
+            "REC_LIVE_HEIC",
+            "IMG_5000.HEIC",
+            800_000,
+            "2018/07/30",
+            Some(3_000_000),
+        );
+        let image = paths::apply_name_id7("IMG_5000.HEIC", "REC_LIVE_HEIC");
+        let movie = paths::live_photo_mov_path_suffix(&image);
+        stage(&h, &format!("2018/07/30/{image}"), 800_000);
+        stage(&h, &format!("2018/07/30/{movie}"), 3_000_000);
+        adopts_all(&h, dated_id7, 2).await;
+    }
+
+    #[tokio::test]
+    async fn video_raw_and_folder_structure_layouts() {
+        let h = Harness::new().await;
+        photo(&h, "VID0", "IMG_VID1.MOV", 5_000_000, "2018/07/30", None);
+        photo(&h, "VID1", "IMG_VID2.MP4", 10_000_000, "2018/07/31", None);
+        photo(&h, "RAW0", "IMG_RAW.DNG", 25_000_000, "2018/07/31", None);
+        stage(&h, "2018/07/30/IMG_VID1.MOV", 5_000_000);
+        stage(&h, "2018/07/31/IMG_VID2.MP4", 10_000_000);
+        stage(&h, "2018/07/31/IMG_RAW.DNG", 25_000_000);
+        adopts_all(&h, dated, 3).await;
+
+        let h = Harness::new().await;
+        photo(&h, "FLAT1", "IMG_FLAT1.JPG", 100_000, "2018/07/30", None);
+        photo(&h, "FLAT2", "IMG_FLAT2.JPG", 200_000, "2018/07/30", None);
+        stage(&h, "IMG_FLAT1.JPG", 100_000);
+        stage(&h, "IMG_FLAT2.JPG", 200_000);
+        adopts_all(&h, flat, 2).await;
+
+        let h = Harness::new().await;
+        photo(&h, "Y1", "IMG_Y1.JPG", 100_000, "2018/07/30", None);
+        photo(&h, "Y2", "IMG_Y2.JPG", 200_000, "2018/12/31", None);
+        stage(&h, "2018/IMG_Y1.JPG", 100_000);
+        stage(&h, "2018/IMG_Y2.JPG", 200_000);
+        adopts_all(&h, yearly, 2).await;
+    }
 }

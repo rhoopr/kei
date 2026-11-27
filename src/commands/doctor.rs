@@ -694,7 +694,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let username = "doctor@example.com";
         let path = state_db_path(username, dir.path(), "com").expect("state db path");
-        let _db = state::SqliteStateDb::open_owned(
+        crate::test_helpers::legacy_state_db(
             &path,
             &state::db::account::AccountOwner::authenticated(
                 username,
@@ -703,11 +703,7 @@ mod tests {
                     .unwrap(),
             )
             .unwrap(),
-        )
-        .await
-        .expect("create state db");
-
-        drop(_db);
+        );
 
         // A previous-engine file is upgraded on first use.
         let check = check_state_db(username, dir.path(), "com", Some(dir.path())).await;

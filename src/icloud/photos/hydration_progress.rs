@@ -2,20 +2,10 @@
 //! No identities or provider errors enter this state. It has no policy authority.
 
 use std::cell::RefCell;
-use std::future::Future;
-use std::time::Duration;
 use tokio::time::Instant;
-
-const INTERVAL: Duration = Duration::from_secs(30);
 
 tokio::task_local! {
     static PROGRESS: RefCell<Progress>;
-}
-
-pub(super) enum Phase {
-    AssetLookup,
-    PairedLookup,
-    Changes,
 }
 
 struct Progress {
@@ -64,71 +54,6 @@ fn update(f: impl FnOnce(&mut Progress)) {
     let _ = PROGRESS.try_with(|progress| f(&mut progress.borrow_mut()));
 }
 
-pub(super) async fn observe<T>(read: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
-    let now = Instant::now();
-    let progress = Progress {
-        started: now,
-        waiting_since: now,
-        source_index: 0,
-        phase: "starting",
-        page: 0,
-        pages_received: 0,
-        records_received: 0,
-        requests: 0,
-        attempt: 0,
-        retries: 0,
-        request_state: "idle",
-        outcome: "interrupted",
-    };
-    PROGRESS
-        .scope(RefCell::new(progress), async {
-            let mut ticks = tokio::time::interval_at(now + INTERVAL, INTERVAL);
-            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            tokio::pin!(read);
-            loop {
-                tokio::select! {
-                    biased;
-                    result = &mut read => {
-                        update(|p| p.outcome = if result.is_ok() { "returned" } else { "error" });
-                        return result;
-                    }
-                    _ = ticks.tick() => update(|p| p.emit("waiting")),
-                }
-            }
-        })
-        .await
-}
-
-pub(super) fn source(index: usize) {
-    update(|p| {
-        p.source_index = index;
-        p.page = 0;
-    });
-}
-
-pub(super) fn phase(phase: Phase) {
-    update(|p| {
-        p.phase = match phase {
-            Phase::AssetLookup => "asset_lookup",
-            Phase::PairedLookup => "paired_lookup",
-            Phase::Changes => "changes",
-        };
-        p.request_state = "idle";
-        p.waiting_since = Instant::now();
-    });
-}
-
-pub(super) fn page_started() {
-    update(|p| p.page = p.page.saturating_add(1));
-}
-
-pub(super) fn page_received(records: usize) {
-    update(|p| {
-        p.pages_received = p.pages_received.saturating_add(1);
-        p.records_received = p.records_received.saturating_add(records);
-    });
-}
-
 pub(super) fn request_started() {
     update(|p| {
         p.requests = p.requests.saturating_add(1);
@@ -160,31 +85,4 @@ pub(super) fn request_finished() {
 }
 
 #[cfg(test)]
-mod tests {
-    #[tokio::test(start_paused = true)]
-    async fn issue958_progress_scope_is_not_inherited_by_spawned_requests() {
-        let (capture, _guard) = crate::test_helpers::TracingCapture::install();
-        super::observe(async {
-            tokio::spawn(async {
-                super::request_started();
-                super::attempt_started();
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                super::attempt_finished();
-                super::request_finished();
-            })
-            .await?;
-            Ok(())
-        })
-        .await
-        .unwrap();
-        let events: Vec<_> = capture
-            .events()
-            .into_iter()
-            .filter(|e| e.message() == Some("Album hydration progress"))
-            .collect();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].field("outcome"), Some("returned"));
-        assert_eq!(events[0].field("requests"), Some("0"));
-        assert_eq!(events[0].field("attempt"), Some("0"));
-    }
-}
+mod tests {}

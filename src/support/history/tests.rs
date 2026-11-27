@@ -3,7 +3,7 @@ use super::{
 };
 use serde_json::json;
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicU64, Ordering},
     mpsc,
 };
@@ -96,8 +96,6 @@ fn groups_and_queue_have_explicit_omission_counts() {
         sender,
         generation: Arc::new(AtomicU64::new(0)),
         dropped: Arc::new(AtomicU64::new(0)),
-        aliases: Arc::new(Mutex::new(std::collections::HashMap::new())),
-        alias_namespace: uuid::Uuid::new_v4(),
     };
     for _ in 0..(QUEUE + 5) {
         recorder.send(Message::Observe(
@@ -115,8 +113,6 @@ fn diagnostic_layer_runs_below_log_filter_and_ignores_private_fields() {
         sender,
         generation: Arc::new(AtomicU64::new(0)),
         dropped: Arc::new(AtomicU64::new(0)),
-        aliases: Arc::new(Mutex::new(std::collections::HashMap::new())),
-        alias_namespace: uuid::Uuid::new_v4(),
     };
     let subscriber = tracing_subscriber::registry().with(recorder).with(
         tracing_subscriber::fmt::layer()
@@ -321,8 +317,6 @@ fn dropped_cycle_handoff_cannot_overwrite_prior_completed_evidence() {
         sender,
         generation: Arc::new(AtomicU64::new(0)),
         dropped: Arc::new(AtomicU64::new(0)),
-        aliases: Arc::new(Mutex::new(Default::default())),
-        alias_namespace: uuid::Uuid::new_v4(),
     };
     let mut history = History {
         schema_version: 1,
@@ -846,67 +840,6 @@ fn issue956_child_reference_status_crosses_tracing_and_reopen_without_private_va
 }
 
 #[test]
-fn storage_reuse_counters_saturate_and_preserve_last_stop() {
-    let mut reuse = super::StorageReuse::default();
-    reuse.inbox.new = u64::MAX;
-    reuse.inbox.exact = u64::MAX;
-    reuse.inbox.equivalent = u64::MAX;
-    reuse.inbox.capacity_rejected = u64::MAX;
-    reuse.inbox.single_item_limit = u64::MAX;
-    reuse.record(
-        super::StorageComponent::Inbox,
-        super::StorageOutcome::New,
-        Some((7, 11)),
-    );
-    reuse.record(
-        super::StorageComponent::Inbox,
-        super::StorageOutcome::Exact,
-        None,
-    );
-    reuse.record(
-        super::StorageComponent::Inbox,
-        super::StorageOutcome::Equivalent,
-        None,
-    );
-    reuse.record(
-        super::StorageComponent::Inbox,
-        super::StorageOutcome::CapacityRejected,
-        Some((8, 11)),
-    );
-    assert!(reuse.inbox.observed);
-    assert!(!reuse.catalogue.observed);
-    assert_eq!(reuse.inbox.new, u64::MAX);
-    assert_eq!(reuse.inbox.exact, u64::MAX);
-    assert_eq!(reuse.inbox.equivalent, u64::MAX);
-    assert_eq!(reuse.inbox.capacity_rejected, u64::MAX);
-    assert_eq!(reuse.inbox.last_reason, super::ReuseReason::Capacity);
-    assert_eq!(reuse.inbox.last_observed_used, Some(8));
-    assert_eq!(reuse.inbox.last_observed_limit, Some(11));
-    reuse.record(
-        super::StorageComponent::Selection,
-        super::StorageOutcome::SingleItemLimit,
-        None,
-    );
-    assert_eq!(reuse.selection.single_item_limit, 1);
-    assert_eq!(
-        reuse.selection.last_reason,
-        super::ReuseReason::SingleItemLimit
-    );
-    assert_eq!(reuse.selection.last_observed_used, None);
-    reuse.record(
-        super::StorageComponent::Selection,
-        super::StorageOutcome::Exact,
-        Some((3, 9)),
-    );
-    assert_eq!(
-        reuse.selection.last_reason,
-        super::ReuseReason::SingleItemLimit
-    );
-    assert_eq!(reuse.selection.last_observed_used, Some(3));
-    assert_eq!(reuse.selection.last_observed_limit, Some(9));
-}
-
-#[test]
 fn historical_compaction_evidence_survives_new_cycles_and_reopen() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("support.json");
@@ -979,10 +912,8 @@ fn older_storage_and_migration_fields_default_without_rejecting_history() {
             }
         }]
     });
+    // Histories from earlier releases still read; their storage counters are dropped.
     let history: History = serde_json::from_value(value).unwrap();
-    assert_eq!(history.cycles[0].storage_reuse.inbox.new, 1);
-    assert_eq!(history.cycles[0].storage_reuse.catalogue.new, 0);
-    assert_eq!(history.cycles[0].storage_reuse.inbox.single_item_limit, 0);
     assert_eq!(
         history.cycles[0].transport_compaction.logical_charge_before,
         None
@@ -1011,16 +942,16 @@ fn unknown_fixed_enum_labels_do_not_escape_from_stored_history() {
         "previous_history_unavailable": false,
         "cycles": [cycle]
     });
+    // Retired sections are dropped on read, so their labels cannot escape either.
     value["cycles"][0]["storage_reuse"] = json!({"inbox":{"last_reason":"PRIVATE_ENUM_CANARY"}});
     std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
     let (clean, status) = read(&path);
-    assert_eq!(status, "invalid_or_interrupted");
+    assert_eq!(status, "available");
     assert!(
         !serde_json::to_string(&clean)
             .unwrap()
             .contains("PRIVATE_ENUM_CANARY")
     );
-    value["cycles"][0]["storage_reuse"] = json!({});
     value["cycles"][0]["transport_compaction"] = json!({"reason":"PRIVATE_ENUM_CANARY"});
     std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
     let (clean, status) = read(&path);

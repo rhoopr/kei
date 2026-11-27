@@ -80,6 +80,7 @@ pub(crate) struct Fetch<'a> {
     /// Capture time for the file's modification time.
     pub(crate) modified: i64,
     pub(crate) cancel: &'a CancellationToken,
+    pub(crate) bandwidth: Option<&'a super::BandwidthLimiter>,
 }
 
 /// Download one copy, verify it, publish it and sync its parent directory.
@@ -109,6 +110,7 @@ pub(crate) async fn fetch(request: Fetch<'_>) -> Result<String, FetchError> {
         },
         DownloadLimits {
             shutdown_token: Some(request.cancel),
+            bandwidth_limiter: request.bandwidth,
             ..DownloadLimits::default()
         },
         crate::personality::Mode::Off,
@@ -135,6 +137,19 @@ pub(crate) async fn fetch(request: Fetch<'_>) -> Result<String, FetchError> {
         .await
         .map_err(|error| FetchError::Failed(error.into()))?;
     Ok(hex(&fingerprint.sha256))
+}
+
+/// Finish or undo a replacement at `path` that a crash interrupted, so its
+/// bytes can be compared. Does nothing when no replacement was in progress.
+pub(crate) async fn recover_replacement(path: &Path) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || super::file::recover_file_replacement(&path)).await??;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = path;
+    Ok(())
 }
 
 /// SHA-256 and size of a regular file kei is about to adopt or replace.

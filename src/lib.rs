@@ -32,12 +32,15 @@ mod cli;
 mod commands;
 mod config;
 mod credential;
-mod cycle_reporter;
 mod download;
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "metadata writers wait for the opt-in metadata pass; it removes this allow"
+)]
 mod fs_util;
 mod health;
 mod icloud;
-mod inventory_diagnostic;
 mod metrics;
 mod notifications;
 mod password;
@@ -51,8 +54,8 @@ mod shutdown;
 mod state;
 mod support;
 mod sync_core;
-mod sync_cycle;
 mod sync_loop;
+mod sync_stats;
 mod systemd;
 mod types;
 mod upgrade_hints;
@@ -556,19 +559,6 @@ use commands::{
 
 /// Get the independent owner expected by offline commands.
 // Used by previous-engine tests until that engine is removed.
-#[cfg(test)]
-async fn get_db_path(
-    globals: &config::GlobalArgs,
-    toml: Option<&TomlConfig>,
-) -> anyhow::Result<PathBuf> {
-    let (username, _, domain, cookie_dir) =
-        config::resolve_auth(globals, &cli::PasswordArgs::default(), toml)?;
-    if username.is_empty() {
-        anyhow::bail!("Set your iCloud username with ICLOUD_USERNAME or [auth].username.");
-    }
-    Ok(state::db::account::state_path(&cookie_dir, &username, domain.as_str()).await?)
-}
-
 /// RAII guard that writes the current PID to a file on creation and removes
 /// it when dropped.
 #[derive(Debug)]
@@ -744,8 +734,9 @@ async fn run(
     if let cli::Command::Doctor(args) = &cli.command
         && args.missing_reference_inventory
     {
-        return inventory_diagnostic::run(&config::bootstrap_config(cli.config.as_deref())?.0)
-            .await;
+        anyhow::bail!(
+            "`doctor --missing-reference-inventory` is no longer available: the sync engine no longer tracks missing parent references."
+        );
     }
     // Diagnostics can be shared with support. Don't echo a private config path
     // in their stderr fallback after the command has redacted its report.
@@ -2021,14 +2012,11 @@ pub mod __fuzz {
     /// is `serde_json::from_slice::<T>(data)` with the result discarded.
     pub fn cloudkit_try_all(data: &[u8]) {
         use crate::icloud::photos::cloudkit::{
-            BatchQueryResponse, ChangesDatabaseResponse, ChangesZoneResponse, ChangesZoneResult,
-            QueryResponse, Record, ZoneId, ZoneListResponse,
+            ChangesZoneResponse, ChangesZoneResult, QueryResponse, Record, ZoneId, ZoneListResponse,
         };
         let _ = serde_json::from_slice::<ZoneListResponse>(data);
         let _ = serde_json::from_slice::<QueryResponse>(data);
-        let _ = serde_json::from_slice::<BatchQueryResponse>(data);
         let _ = serde_json::from_slice::<Record>(data);
-        let _ = serde_json::from_slice::<ChangesDatabaseResponse>(data);
         let _ = serde_json::from_slice::<ChangesZoneResponse>(data);
         let _ = serde_json::from_slice::<ChangesZoneResult>(data);
         let _ = serde_json::from_slice::<ZoneId>(data);
@@ -2064,7 +2052,7 @@ pub mod __fuzz {
     /// `()` on success / discard so the harness doesn't name internal types.
     /// Inputs that don't deserialize as a `Record` are skipped.
     pub fn photo_asset_from_record_json(master: Value, asset: Value) {
-        use crate::icloud::photos::asset::{PhotoAsset, RequiredAssetFields};
+        use crate::icloud::photos::asset::PhotoAsset;
         use crate::icloud::photos::cloudkit::Record;
         let Ok(master) = serde_json::from_value::<Record>(master) else {
             return;
@@ -2072,7 +2060,7 @@ pub mod __fuzz {
         let Ok(asset) = serde_json::from_value::<Record>(asset) else {
             return;
         };
-        let _ = PhotoAsset::try_from_records(master, &asset, RequiredAssetFields::Downloadable);
+        let _ = PhotoAsset::from_records(master, &asset);
     }
 
     /// Run the path-component sanitizers over an arbitrary `&str`. Splits
@@ -2090,10 +2078,6 @@ pub mod __fuzz {
             None => (s, None),
         };
         let _ = paths::expand_named_token(template, paths::TOKEN_ALBUM, album);
-
-        for size in [0u64, 1, u64::MAX] {
-            let _ = paths::add_dedup_suffix(s, size);
-        }
     }
 
     /// Walk an HEIC byte buffer for the embedded XMP packet. Defense-in-depth
@@ -2133,7 +2117,7 @@ pub mod __fuzz {
     /// `Option<Self>`.
     pub fn state_enums_from_str(s: &str) {
         let _ = crate::state::VersionSizeKey::from_str(s);
-        let _ = crate::state::AssetStatus::from_str(s);
-        let _ = crate::state::MediaType::from_str(s);
+        let _ = crate::state::types::AssetStatus::from_str(s);
+        let _ = crate::state::types::MediaType::from_str(s);
     }
 }

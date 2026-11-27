@@ -83,62 +83,12 @@ generation checks and independent-process exclusion remain in force. Blocking
 generation writes retain the shared guard until completion even if their caller
 is canceled, so cleanup cannot unlock while a generation write is pending.
 
-## Account ownership and legacy adoption
+## Account ownership and state files
 
-Writable download dispatch requires a state store before provisional, full or incremental routing can start. `sync_loop/runner.rs` supplies authenticated owned state and fails startup if opening it fails. `download/orchestration/dispatch.rs` also rejects missing state at its entry boundary, before provider calls or local file work. Dry-run and filename previews may enumerate without a store and do not create one.
+Each account's sync state is one SQLite file, `<account>.sync.db`, opened through `src/sync_core/access.rs`. The file records the configured account and, after the first signed-in run, the authenticated provider identity. Offline commands check the configured account; `sync` and `import-existing` also check, or first record, the provider identity. A mismatch refuses before anything is read or changed. State reset checks ownership before confirmation and requires `--yes` when the process cannot prompt. An absent state file is a successful no-op.
 
-`state/db/account.rs::open_sync_state` is the shared authenticated startup boundary for sync and import. It checks the configured namespace and authenticated provider identity before creating directories, resolves the state path, and delegates schema upgrades and matched config backups to `SqliteStateDb::open_owned_with_config`. Unowned legacy state still requires explicit ownership evidence; this boundary does not infer ownership from an account-like filename.
+Configured login and realm determine collision-resistant names for state, auth artifacts and encrypted credentials. Watch validation, replacement sessions and initialization retries keep the authenticated principal pinned. A changed or missing identity stops before further provider or state work.
 
-Configured login and realm determine collision-resistant names for state,
-auth artifacts and encrypted credentials. Account-owner format version 1 is
-independent of the application schema version and must be checked before its
-migrations. Production connections require an owner expectation; unbound
-connection helpers are restricted to tests. All state commands, including
-read-only export and reset, enforce this boundary. State reset checks ownership
-before confirmation and requires `--yes` when the process input mode cannot
-prompt. An absent database remains a successful no-op. Sync and import require a
-usable authenticated provider identity and pin it independently of filenames.
-Watch validation, replacement sessions and initialization retries retain that
-principal pin. Changed or missing authenticated identity stops before further
-provider or state work; it cannot become a recoverable quiet-watch warning.
+A previous release's `<account>.db` is read only to upgrade. `state/db/account.rs` opens it read-only after checking its account owner; the sync core carries verified copies into a scratch file, checks its integrity and renames it into place. The previous file is never written. After the first cycle in which every zone listed to the end without error, it is removed with its `-wal`, `-shm` and `-journal` companions and the `.kei-schema-backup-*` bundles whose manifest names it. See [the sync core](../sync-core.md#upgrade).
 
-Legacy discovery fails closed rather than creating fresh state over retained
-debt. Explicit `migrate-state` requires verified operator ownership
-confirmation and a fresh login under the account lock. SQLite backup retains
-rows, unknown tables and committed WAL content, then binding, schema migration
-and integrity validation occur in a private stage. Same-directory publication
-refuses replacement and fsyncs the file and parent. The legacy source and
-companions remain. Conflicting scoped provenance is rejected, not rewritten.
-Legacy session and encrypted credential files are preserved and ignored;
-keyring identity remains unchanged. See [account migration](../account-state-migration.md)
-for operator steps and compatibility limits.
-
-## Owned-schema upgrade backups
-
-`kei status` counts sparse references preserved in the v0.30 upgrade snapshot separately from current unresolved references. The archived count is informational: it does not schedule retries, hold a checkpoint or certify recovery of an original.
-
-Schema 38 establishes the v0.30 fresh-start boundary in the existing database. Before older migration steps interpret provider payloads, `state/schema.rs` copies historical catalog, selection, work, active-generation and sparse-identity rows into `historical_v030_*` tables and clears their active counterparts. It clears the old shadow inbox directly; the pre-upgrade recovery bundle holds the original pages, records and receipts. It preserves zone and scoped database cursors, configuration checkpoints and historical identity holds in the other snapshots, then removes their active authority. Retirement and schema advancement share one transaction. A failed upgrade restores the prior active state.
-
-Schema 45 drops the three shadow-inbox archive tables created by earlier v0.30 builds. Cleanup commits with a compaction-pending marker. The writable opener takes an exclusive SQLite lock, checkpoints the WAL and checks for at least 8 MiB of free database pages before running `VACUUM`. It checkpoints again to measure the physical file. A busy database or insufficient disk space leaves the marker for a later open. If a previous vacuum already reclaimed the pages, startup clears the marker without another rewrite.
-
-The next selected-library sync uses the existing full-enumeration path to establish current work and a new checkpoint. Current provider failures, unresolved identities and unfinished current work retain their retry and checkpoint guards. Subsequent opens do not repeat retirement. Historical snapshots have no runtime writers or replay consumers. Current inbox capture remains active; removing that subsystem is a later simplification boundary.
-
-Asset records, local path and ownership evidence, metadata work, temporary-file ownership and publication journals remain with their existing owners. The transition does not write media or sidecars. Historical provider destinations retain their original path and progress bytes in the snapshot without keeping obsolete plans executable.
-
-Schema 44 records one historical deletion check per eligible downloaded iCloud identity present at upgrade. Fresh databases start empty. A current observation retires the check, including an in-flight lookup. After current work succeeds, or on a quiet watch cycle, sync spends at most one five-second exact lookup on up to 32 candidates in a selected, indexed library. An omitted record, provider error, duplicate record or mismatched zone or owner leaves the check retryable after one hour. A confirmed live record retires the check. An explicit deletion or expungement of the exact asset or master marks its downloaded renditions deleted, retaining any provider deletion time. Protected historical records and prepared capture repairs retain their guards. The check writes no file and neither schedules downloads nor gates checkpoints or backup health.
-
-`kei manifest` includes deleted renditions. JSON and CSV expose `is_deleted` independently of download `status`. `deleted_at` is a UTC timestamp when known, otherwise JSON null or an empty CSV field.
-
-`config/source.rs` retains the exact configuration bytes loaded at startup, or the absence of a configuration file. Debug output redacts both bytes and paths. Command dispatch passes this context to `SqliteStateDb::open_owned_with_config`; production has no context-free writable opener. CLI overrides, environment values and credentials are not included in the snapshot.
-
-For an existing older schema, the opener validates account ownership and holds a SQLite immediate transaction through backup publication and migration commit. `state/db/migration_backup.rs` copies the committed database through a separate read connection, including WAL content, into a private `.kei-schema-backup-tmp-<uuid>` directory beside the database. It writes the loaded configuration or records its absence, restoration instructions, and a checksum manifest. Exclusive creation prevents replacing earlier evidence. On Unix, files and directories are synced before the completion manifest is published without replacement. On Windows, creation-time protected owner-only ACLs secure the bundle and its contents; a native write-through, no-overwrite directory move publishes the completed `.partial` stage. A directory ending in `.partial`, or a bundle without `manifest.json`, is incomplete.
-
-The migration commits a receipt for that bundle with the new schema. Under a writer lock, a separate read-only connection rechecks account ownership, the receipt and schema version, runs `integrity_check`, and requires `foreign_key_check` to return no violations. Failure stops startup and keeps the backup. Success retires only the recorded files and empty directory, before inbox compaction needs disk space. Receipt removal commits in WAL mode after file deletion, so an interrupted cleanup can reopen without a hot rollback journal. A replaced bundle, mismatched file identity, size or timestamp, extra entry or copied live database cannot authorize deletion. Older backups and failed attempts without a committed receipt remain untouched. Long-term rollback requires the operator's own matched backup.
-
-Backup failure refuses migration. Migration failure rolls back the upgrade transaction and retains the completed backup. Fresh and already-current databases do not create upgrade backups. Missing configuration context refuses an old-schema upgrade. Platforms outside Unix and Windows refuse old-schema upgrades. Windows storage must support persistent ACLs. The Windows publication contract uses the repository's native write-through operation; it does not claim POSIX directory-fsync equivalence or physical power-loss survival. Native Windows runtime qualification remains pending.
-
-Windows publication retains the populated stage's original identity and parent confinement through the directory move. Before releasing its no-delete handle, it opens and validates a rename-compatible handle. The published directory must match the original identity; substituting another directory cannot authorize migration.
-
-Restore instructions are in each bundle's `restore.txt`. Stop every state writer, verify the manifest checksums and matching database/account, and preserve the current database together with its `-journal`, `-wal` and `-shm` companions before installing the standalone snapshot. Never attach newer companions to the restored database. Restore the recorded configuration with a compatible previous binary and reapply invocation/environment settings separately. The bundle contains no media; rollback is supported before subsequent media or metadata changes, or with a separately matched media backup.
-
-An interrupted DELETE-mode migration can leave a hot rollback journal. If SQLite requires writable recovery before the account-owner header can be read, the opener refuses with restoration guidance. It does not recover a potentially foreign database before validating ownership. Preserve the journal; deleting it or forcing writable recovery bypasses this boundary. Restore a verified, matching backup instead.
+Legacy discovery fails closed rather than creating fresh state over an unowned file. Explicit `migrate-state` requires verified operator ownership confirmation and a fresh login under the account lock. SQLite backup retains rows, unknown tables and committed WAL content; binding and integrity validation happen in a private stage. Same-directory publication refuses replacement and fsyncs the file and parent. The legacy source and companions remain. Legacy session and encrypted credential files are preserved and ignored; keyring identity remains unchanged. See [account migration](../account-state-migration.md) for operator steps and compatibility limits.
