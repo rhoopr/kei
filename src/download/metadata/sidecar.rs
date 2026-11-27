@@ -128,6 +128,7 @@ struct SidecarPublication {
     tmp_path: PathBuf,
     sidecar_path: PathBuf,
     expected: Option<crate::download::file::ExistingFileFingerprint>,
+    #[cfg(target_os = "linux")]
     output: crate::download::file::ExistingFileFingerprint,
     #[cfg(target_os = "linux")]
     identity: crate::fs_util::FileIdentity,
@@ -219,6 +220,7 @@ fn prepare_sidecar_write(
         tmp_path,
         sidecar_path,
         expected,
+        #[cfg(target_os = "linux")]
         output: fingerprint_bytes(&bytes)?,
         #[cfg(target_os = "linux")]
         identity: crate::fs_util::file_identity(&temp)?,
