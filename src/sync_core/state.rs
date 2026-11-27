@@ -482,6 +482,20 @@ impl State {
         .await
     }
 
+    /// Live albums of `zone` the catalog holds without a name.
+    pub(crate) async fn unnamed_albums(&self, zone: &str) -> anyhow::Result<u64> {
+        let zone = zone.to_owned();
+        self.with(move |conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM albums WHERE zone = ?1 AND title IS NULL AND deleted = 0",
+                [zone],
+                |row| row.get(0),
+            )?;
+            Ok(u64::try_from(count)?)
+        })
+        .await
+    }
+
     /// Forget a zone's position so it is listed again from the start. The
     /// zone stays listed, so planning carries on with what is recorded.
     pub(crate) async fn relist(&self, zone: &str) -> anyhow::Result<()> {

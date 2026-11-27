@@ -28,7 +28,9 @@ use std::path::Path;
 use std::time::Duration;
 use tempfile::tempdir;
 
-const TIMEOUT_SYNC: u64 = 180;
+/// A first sync lists the whole library, whatever the date bounds; that
+/// takes about six minutes on a 40k-record account.
+const TIMEOUT_SYNC: u64 = 1800;
 const TIMEOUT_CMD: u64 = 30;
 
 // ── Command builders ──────────────────────────────────────────────────
@@ -64,8 +66,8 @@ fn sync_cmd(username: &str, password: &str, cookie_dir: &Path, dir: &Path) -> as
         .env("KEI_DATA_DIR", cookie_dir);
     cmd.args([
         "sync",
-        "--password",
-        password,
+        "--password-file",
+        &common::password_file(password),
         "--config",
         config_path.to_str().unwrap(),
         "--no-progress-bar",
@@ -111,8 +113,8 @@ fn import_cmd(
         "--config",
         config_path.to_str().unwrap(),
         "import-existing",
-        "--password",
-        password,
+        "--password-file",
+        &common::password_file(password),
     ]);
     cmd
 }
@@ -131,8 +133,8 @@ fn recovery_sync_cmd(
         .env("KEI_DATA_DIR", cookie_dir);
     cmd.args([
         "sync",
-        "--password",
-        password,
+        "--password-file",
+        &common::password_file(password),
         "--config",
         config_path.to_str().unwrap(),
         "--no-progress-bar",
@@ -419,8 +421,8 @@ fn import_existing_with_nonexistent_directory_fails() {
                 "--config",
                 config_path.to_str().unwrap(),
                 "import-existing",
-                "--password",
-                &password,
+                "--password-file",
+                &common::password_file(&password),
             ])
             .timeout(std::time::Duration::from_secs(60))
             .assert()
@@ -509,8 +511,8 @@ fn import_existing_custom_folder_structure() {
             .env("KEI_DATA_DIR", &cookie_dir)
             .args([
                 "sync",
-                "--password",
-                &password,
+                "--password-file",
+                &common::password_file(&password),
                 "--config",
                 config_path.to_str().unwrap(),
                 "--no-progress-bar",
@@ -540,8 +542,8 @@ fn import_existing_custom_folder_structure() {
                 "--config",
                 import_config.to_str().unwrap(),
                 "import-existing",
-                "--password",
-                &password,
+                "--password-file",
+                &common::password_file(&password),
                 "--recent",
                 "5",
             ])
@@ -744,7 +746,11 @@ fn login_with_existing_session() {
         common::cmd()
             .env("ICLOUD_USERNAME", &username)
             .env("KEI_DATA_DIR", &cookie_dir)
-            .args(["login", "--password", &password])
+            .args([
+                "login",
+                "--password-file",
+                &common::password_file(&password),
+            ])
             .timeout(Duration::from_secs(60))
             .assert()
             .success();

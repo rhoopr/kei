@@ -67,6 +67,28 @@ impl PhotosSession for FakeICloud {
             let position = body["zones"][0]["syncToken"]
                 .as_str()
                 .map(ToOwned::to_owned);
+            // Like iCloud, return only the fields the request names.
+            let keys: Option<HashSet<String>> =
+                body["zones"][0]["desiredKeys"].as_array().map(|keys| {
+                    keys.iter()
+                        .filter_map(|k| k.as_str().map(ToOwned::to_owned))
+                        .collect()
+                });
+            let project = |records: &[Value]| -> Vec<Value> {
+                records
+                    .iter()
+                    .map(|record| {
+                        let mut record = record.clone();
+                        if let (Some(keys), Some(fields)) = (
+                            &keys,
+                            record.get_mut("fields").and_then(Value::as_object_mut),
+                        ) {
+                            fields.retain(|key, _| keys.contains(key));
+                        }
+                        record
+                    })
+                    .collect()
+            };
             if zone != "PrimarySync" {
                 let log = world.other_logs.get(&zone).cloned().unwrap_or_default();
                 let start = position.as_deref().map_or(0, |position| {
@@ -82,7 +104,7 @@ impl PhotosSession for FakeICloud {
                     "zoneID": {"zoneName": zone},
                     "syncToken": format!("{zone}@{end}"),
                     "moreComing": end < log.len(),
-                    "records": log.get(start..end).unwrap_or_default(),
+                    "records": project(log.get(start..end).unwrap_or_default()),
                 }]}));
             }
             world.requested_positions.push(position.clone());
@@ -98,7 +120,7 @@ impl PhotosSession for FakeICloud {
                 position.trim_start_matches('p').parse::<usize>().unwrap()
             });
             let end = (start + world.page_size).min(world.log.len());
-            let records = world.log.get(start..end).unwrap_or_default().to_vec();
+            let records = project(world.log.get(start..end).unwrap_or_default());
             world.pages_served += 1;
             if let Some((after, token)) = &world.cancel_after_pages
                 && world.pages_served >= *after
@@ -1036,6 +1058,69 @@ async fn photos_with_one_name_planned_together_get_distinct_paths() {
 }
 
 #[tokio::test]
+#[tracing_test::traced_test]
+async fn a_photo_in_an_album_without_a_name_waits_instead_of_vanishing() {
+    let h = Harness::new().await;
+    *h.tweak.lock().unwrap() = Some(|config| {
+        config.albums = AlbumSelector::All {
+            excluded: Default::default(),
+        };
+    });
+    h.push(json!({
+        "recordName": "AL", "recordType": "CPLAlbum",
+        "fields": {"albumType": {"value": 0}}
+    }));
+    let m1 = h.master("M1", "IMG_0001.JPG", &jpeg("one")).await;
+    h.push(m1);
+    h.push(asset("A1", "M1"));
+    h.push(member("A1", "AL"));
+
+    let report = h.run().await;
+    assert_eq!(report.zones[0].plan.waiting, 1, "{report:?}");
+    assert!(sorted_files(&h.photos()).is_empty());
+    assert!(logs_contain(
+        "Some albums arrived without a name; their photos wait until iCloud reports it"
+    ));
+
+    // The name arrives: the photo is saved in its album.
+    h.push(album("AL", "Trip"));
+    let report = h.run().await;
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(sorted_files(&h.photos()), ["Trip/IMG_0001.JPG"]);
+}
+
+#[tokio::test]
+async fn a_catalog_saved_without_album_names_is_listed_again_once() {
+    let h = Harness::new().await;
+    library_with_album(&h).await;
+    h.run().await;
+    assert_eq!(
+        sorted_files(&h.photos()),
+        ["2023/IMG_0001.JPG", "Trip/IMG_0002.JPG"]
+    );
+    // A catalog from a build that did not ask for album fields.
+    let db = rusqlite::Connection::open(h.root.path().join("state.sync.db")).unwrap();
+    db.execute("UPDATE albums SET title = NULL, folder = NULL", [])
+        .unwrap();
+    drop(db);
+    h.take_positions();
+
+    let report = h.run().await;
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(h.take_positions()[0], None, "listed from the start");
+    assert_eq!(report.zones[0].drain.downloaded, 0);
+    assert_eq!(
+        h.state().await.unnamed_albums("PrimarySync").await.unwrap(),
+        0
+    );
+
+    // Once is enough.
+    let quiet = h.run().await;
+    assert_eq!(h.take_positions(), [Some("p6".to_owned())]);
+    assert_eq!(quiet.zones[0].drain, drain::DrainStats::default());
+}
+
+#[tokio::test]
 async fn a_rejected_position_relists_without_downloading_again() {
     let h = Harness::new().await;
     library_with_album(&h).await;
@@ -1308,7 +1393,8 @@ async fn the_date_range_limits_which_photos_are_saved() {
     h.push(new);
     h.push(with_fields(
         asset("A2", "M2"),
-        json!({"assetDate": {"value": 1_735_689_600_000.0_f64}}),
+        // 2025-06-15 12:00 UTC: 2025 in every time zone.
+        json!({"assetDate": {"value": 1_749_988_800_000.0_f64}}),
     ));
 
     let report = h.run().await;

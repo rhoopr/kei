@@ -180,6 +180,7 @@ pub(crate) async fn run_cycle(
             zone: zone.clone(),
             ..ZoneReport::default()
         };
+        repair_album_names(state, &zone).await?;
         let indexing = indexing::Indexing::check(library).await;
         indexing::before_observe(state, &zone, indexing).await?;
         if let Err(error) = observe(state, library, cancel, &mut zone_report).await {
@@ -362,6 +363,23 @@ async fn follow_directory_change(state: &State, directory: &std::path::Path) -> 
         );
     }
     state.set_kv(DIRECTORY_KEY, &current).await
+}
+
+/// Earlier builds did not ask the feed for album fields, so their catalogs
+/// hold albums without names, and iCloud resends an album only when it
+/// changes. List such a zone from the start once to fetch them. Planning
+/// carries on meanwhile; photos in those albums wait.
+async fn repair_album_names(state: &State, zone: &str) -> anyhow::Result<()> {
+    let key = format!("album_names_relisted:{zone}");
+    if state.get_kv(&key).await?.is_some() || state.unnamed_albums(zone).await? == 0 {
+        return Ok(());
+    }
+    tracing::warn!(
+        zone,
+        "Some saved albums have no name; listing the library again once to fetch them"
+    );
+    state.relist(zone).await?;
+    state.set_kv(&key, "1").await
 }
 
 fn smart_read_key(zone: &str, folder: &str) -> String {

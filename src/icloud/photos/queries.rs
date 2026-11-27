@@ -144,6 +144,22 @@ pub(crate) static IDENTITY_LOOKUP_KEYS_VALUES: LazyLock<Vec<Value>> = LazyLock::
         .collect()
 });
 
+/// Keys the change feed asks for: every photo field kei stores, the
+/// sparse-share evidence, and the album fields. iCloud returns only the
+/// fields a request names, so an album without these arrives without its
+/// name, kind or parent.
+pub(crate) static FEED_KEYS_VALUES: LazyLock<Vec<Value>> = LazyLock::new(|| {
+    IDENTITY_LOOKUP_KEYS_VALUES
+        .iter()
+        .cloned()
+        .chain(
+            ["albumNameEnc", "albumName", "albumType", "parentId"]
+                .into_iter()
+                .map(|key| Value::String(key.to_owned())),
+        )
+        .collect()
+});
+
 pub(crate) fn item_type_from_str(s: &str) -> Option<AssetItemType> {
     match s {
         "public.heic"

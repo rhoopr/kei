@@ -144,8 +144,9 @@ pub(super) fn ensure_selection(username: &str, password: &str, cookies: &Path) {
             let output = super::cmd()
                 .env("ICLOUD_USERNAME", username)
                 .env("KEI_DATA_DIR", data.path())
-                .args(["sync", "--password", password, "--config", config.to_str().expect("config path"), "--only-print-filenames", "--no-progress-bar"])
-                .timeout(Duration::from_secs(180))
+                .args(["sync", "--password-file", &super::password_file(password), "--config", config.to_str().expect("config path"), "--only-print-filenames", "--no-progress-bar"])
+                // The preflight lists the whole library on fresh state.
+                .timeout(Duration::from_secs(1800))
                 .assert().success().get_output().clone();
             let count = eligible_inventory(&output.stdout).expect("live selection preflight");
             eprintln!("Live selection: primary library, albums=none, unfiled=true, fixed lower date={}, eligible filenames={count}", require_fixed_date());

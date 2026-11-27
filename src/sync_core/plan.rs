@@ -72,6 +72,15 @@ pub(crate) async fn plan_zone(
         stats.planned += plans.len() as u64;
         state.apply_plans(zone, plans).await?;
     }
+    let unresolved = albums.unresolved();
+    if unresolved > 0 && !matches!(config.albums, AlbumSelector::None) {
+        tracing::warn!(
+            zone,
+            albums = unresolved,
+            waiting = stats.waiting,
+            "Some albums arrived without a name; their photos wait until iCloud reports it"
+        );
+    }
     Ok(stats)
 }
 
@@ -121,6 +130,15 @@ async fn plan_asset(
             continue;
         }
         member_of_any = true;
+        // An album whose name iCloud has not reported cannot be matched
+        // against the selection or given a folder. Hold the photo rather
+        // than leave it out of every placement.
+        if in_library
+            && !matches!(config.albums, AlbumSelector::None)
+            && !albums.resolved(album_zone, album)
+        {
+            return Ok(None);
+        }
         if !in_library || !albums.selected(album_zone, album) {
             continue;
         }
@@ -460,6 +478,24 @@ impl Albums {
             .map(|(key, _)| key.clone())
             .collect();
         Self { rows, selected }
+    }
+
+    /// The album has a fixed folder, or a name for it and every parent.
+    fn resolved(&self, zone: &str, album: &str) -> bool {
+        self.folder(zone, album).is_some()
+    }
+
+    /// Live albums whose name or parent iCloud has not reported.
+    fn unresolved(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|(key, row)| {
+                !row.deleted
+                    && !row.is_folder
+                    && row.folder.is_none()
+                    && components(&self.rows, key).is_none()
+            })
+            .count()
     }
 
     fn selected(&self, zone: &str, album: &str) -> bool {

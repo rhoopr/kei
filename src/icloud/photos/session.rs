@@ -1,4 +1,5 @@
 use super::hydration_progress;
+#[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 

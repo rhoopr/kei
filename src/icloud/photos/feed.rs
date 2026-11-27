@@ -16,7 +16,7 @@ use super::PhotoLibrary;
 use super::asset::{PhotoAsset, SparseShareEvidence, classify_change_reason};
 use super::cloudkit::{ChangesZoneResponse, Record};
 use super::queries::{
-    DESIRED_KEYS, DESIRED_KEYS_VALUES, IDENTITY_LOOKUP_KEYS_VALUES, build_changes_zone_request,
+    DESIRED_KEYS, DESIRED_KEYS_VALUES, FEED_KEYS_VALUES, build_changes_zone_request,
 };
 use super::session::{check_changes_zone_error, retry_post, retry_post_allowing_record_errors};
 use super::types::ChangeReason;
@@ -105,11 +105,9 @@ impl PhotoLibrary {
             .and_then(|zones| zones.get_mut(0))
             .and_then(Value::as_object_mut)
         {
-            // Include the sparse-share fields so stand-ins are recognized.
-            zone.insert(
-                "desiredKeys".into(),
-                Value::Array(IDENTITY_LOOKUP_KEYS_VALUES.clone()),
-            );
+            // Include the sparse-share fields so stand-ins are recognized,
+            // and the album fields so albums arrive with their names.
+            zone.insert("desiredKeys".into(), Value::Array(FEED_KEYS_VALUES.clone()));
         }
         let response = retry_post(
             self.session(),

@@ -174,7 +174,7 @@ Without `just`, run the raw commands directly:
 
 ```sh
 cargo test --lib --test cli --test behavioral
-cargo test --all-features --test sync --test state_auth -- --ignored --test-threads=1
+KEI_LIVE_SKIP_CREATED_BEFORE=2025-01-01 cargo test --all-features --no-fail-fast --test sync --test state_auth -- --ignored --test-threads=1
 ./tests/shell/concurrency.sh
 ```
 
@@ -260,6 +260,8 @@ opt-in (nightly + cargo-fuzz), excluded from `just gate`, and run via
    the session expires (typically months).
 
 3. Choose an explicit fixed lower capture date containing at least one eligible primary-library asset. Set `KEI_LIVE_SKIP_CREATED_BEFORE` to that `YYYY-MM-DD` before running an authorized general live sync route, for example `KEI_LIVE_SKIP_CREATED_BEFORE=2025-01-01 just test live`. Replace the example date with your own narrowly chosen bound; all selected dates at or after it can download, so this is not a ten-item cap. An unset, invalid or rolling value fails closed before provider preflight.
+
+Each live test starts from empty state, and a first sync lists the whole library whatever the date bounds, so every test pays one full listing: about six minutes on a 40k-record account. Live commands time out after 30 minutes. Passwords reach `kei` through `--password-file` with a private temporary file, so a failed command never prints them.
 
 General live tests read the selectors in `tests/data/live-selection.toml`: albums `none`, unfiled enabled and the primary library. Rust `tests/common/live_selection.rs` and shell `tests/shell/lib.sh` add `[filters].skip_created_before` from `KEI_LIVE_SKIP_CREATED_BEFORE` to each generated config. Set optional `KEI_LIVE_SKIP_CREATED_AFTER` to an inclusive fixed upper capture date when the approved fixture is a closed interval. Missing upper dates retain lower-bound-only selection; empty, malformed or inverted dates fail before live authentication. Rust scenarios may narrow the configured interval but cannot widen it. Both bounds reach shell, cross-zone and release-binary sync configs. No named album, filename or media format is required. A filename-only preflight reports the eligible count and fails on an empty selection without downloading media. It uses isolated config/state paths and can reuse or refresh cached authentication.
 
