@@ -3,7 +3,7 @@ set -euo pipefail
 
 # --ignored and --exact alone still succeed when a rename or cfg selects zero.
 # Check both the ignored catalog and the execution summary.
-test_name=sync_core::tests::copies_stress_one_photo_in_600_albums_finishes_then_reopens_quietly
+test_name=sync_core::tests::copies_stress_600_album_copies_with_sidecars_stay_quiet_across_reopens
 cargo_bin="${CARGO:-cargo}"
 if [[ $# -gt 1 || ($# -eq 1 && "$1" != --check) ]]; then
     echo "usage: $0 [--check]" >&2

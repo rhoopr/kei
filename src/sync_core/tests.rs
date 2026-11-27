@@ -929,45 +929,167 @@ async fn primary_naming_moves_a_live_photos_still_and_motion_together_in_an_albu
     assert_eq!(contents(&h), pair("still", "motion"));
 }
 
-/// Run by `scripts/test-copies-stress.sh`: one photo in 600 albums gets 600
-/// copies in one cycle, and reopening the state finds nothing left to do.
-#[tokio::test]
+/// A tiny valid JPEG whose pixel density encodes `n`, so every photo's
+/// bytes differ.
+#[cfg(feature = "xmp")]
+fn tiny_jpeg(n: u16) -> Vec<u8> {
+    let [hi, lo] = n.to_be_bytes();
+    vec![
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, hi, lo,
+        0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
+    ]
+}
+
+/// Every file under `root` with its bytes and modification time.
+#[cfg(feature = "xmp")]
+fn snapshot(root: &Path) -> std::collections::BTreeMap<String, (Vec<u8>, std::time::SystemTime)> {
+    sorted_files(root)
+        .into_iter()
+        .map(|file| {
+            let path = root.join(&file);
+            let bytes = std::fs::read(&path).unwrap();
+            let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+            (file, (bytes, modified))
+        })
+        .collect()
+}
+
+/// Run by `scripts/test-copies-stress.sh`. 300 photos, each in two albums,
+/// give 600 copies with XMP sidecars across six cycles that each reopen the
+/// state. Unrelated feed records, a settings change that plans every photo
+/// again, and one photo joining an unselected album must download nothing
+/// and rewrite only that photo's two sidecars; every other file keeps its
+/// bytes and modification time.
+#[cfg(feature = "xmp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "copies stress; run by scripts/test-copies-stress.sh"]
-async fn copies_stress_one_photo_in_600_albums_finishes_then_reopens_quietly() {
-    const ALBUMS: usize = 600;
-    let h = Harness::new().await;
-    h.world.0.lock().unwrap().page_size = 200;
-    let m1 = h.master("M1", "IMG_0001.JPG", &jpeg("one")).await;
-    h.push(m1);
-    h.push(asset("A1", "M1"));
-    for index in 0..ALBUMS {
-        let id = format!("AL{index:03}");
-        h.push(album(&id, &format!("Album {index:03}")));
-        h.push(member("A1", &id));
+async fn copies_stress_600_album_copies_with_sidecars_stay_quiet_across_reopens() {
+    use crate::download::metadata_pass::{CaptureTimestampRepair, MetadataFlags, Settings};
+    const PHOTOS: u16 = 300;
+    const COPIES: u64 = 2 * PHOTOS as u64;
+
+    fn selection(config: &mut CoreConfig) {
+        config.albums = AlbumSelector::Named {
+            included: ["Album A".to_owned(), "Album B".to_owned()].into(),
+            excluded: Default::default(),
+        };
+        config.metadata = Some(Settings {
+            flags: MetadataFlags::XMP_SIDECAR | MetadataFlags::INCLUDE_ALBUMS,
+            repair: CaptureTimestampRepair::Preserve,
+            temp_suffix: ".kei-part".into(),
+        });
+    }
+    fn replanned(config: &mut CoreConfig) {
+        selection(config);
+        // Changes the planning fingerprint; no copy's path depends on it.
+        config.unfiled = false;
     }
 
+    let h = Harness::new().await;
+    h.world.0.lock().unwrap().page_size = 200;
+    *h.tweak.lock().unwrap() = Some(selection);
+    h.push(album("ALA", "Album A"));
+    h.push(album("ALB", "Album B"));
+    for n in 0..PHOTOS {
+        let (asset_name, master) = (format!("A{n:04}"), format!("M{n:04}"));
+        let record = h
+            .master(&master, &format!("IMG_{n:04}.JPG"), &tiny_jpeg(n + 1))
+            .await;
+        h.push(record);
+        h.push(asset(&asset_name, &master));
+        h.push(member(&asset_name, "ALA"));
+        h.push(member(&asset_name, "ALB"));
+    }
+    let media_requests = async || {
+        h.server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path().starts_with("/media/"))
+            .count()
+    };
+
+    // Cycle 1: every copy is downloaded once and gets its sidecar.
     let first = h.run().await;
     assert!(first.complete(), "{first:?}");
-    assert_eq!(first.zones[0].drain.downloaded, ALBUMS as u64);
-    let files = sorted_files(&h.photos());
-    assert_eq!(files.len(), ALBUMS);
-    assert!(
-        files
-            .iter()
-            .all(|file| h.file(file).unwrap() == jpeg("one"))
-    );
+    assert_eq!(first.zones[0].drain.downloaded, COPIES);
+    assert_eq!(first.zones[0].metadata.written, COPIES, "{first:?}");
+    let saved = snapshot(&h.photos());
+    assert_eq!(saved.len(), 2 * COPIES as usize);
+    for n in 0..PHOTOS {
+        for album_folder in ["Album A", "Album B"] {
+            let media = format!("{album_folder}/IMG_{n:04}.JPG");
+            assert_eq!(saved[&media].0, tiny_jpeg(n + 1), "{media}");
+            let xmp = String::from_utf8(saved[&format!("{media}.xmp")].0.clone()).unwrap();
+            assert!(
+                xmp.contains("Album A") && xmp.contains("Album B"),
+                "{media}: {xmp}"
+            );
+        }
+    }
+    let downloads = media_requests().await;
     h.take_lookups();
 
-    for _ in 0..2 {
-        let quiet = h.run().await;
-        assert!(quiet.complete(), "{quiet:?}");
-        assert_eq!(quiet.zones[0].plan.planned, 0);
-        assert_eq!(quiet.zones[0].drain, drain::DrainStats::default());
-        assert!(
-            h.take_lookups().is_empty(),
-            "a quiet reopen looks nothing up"
+    let quiet = |report: &CycleReport, cycle: &str| {
+        assert!(report.complete(), "{cycle}: {report:?}");
+        assert_eq!(
+            report.zones[0].drain,
+            drain::DrainStats::default(),
+            "{cycle}"
         );
-        assert_eq!(sorted_files(&h.photos()), files);
+        assert_eq!(report.zones[0].metadata.written, 0, "{cycle}");
+    };
+
+    // Cycle 2: unrelated records arrive.
+    h.push(json!({"recordName": "OPAQUE-1", "recordType": "FutureOpaque", "fields": {}}));
+    h.push(album("ALC", "Album C"));
+    let report = h.run().await;
+    quiet(&report, "unrelated records");
+    assert!(h.take_lookups().is_empty());
+    assert_eq!(media_requests().await, downloads);
+    assert_eq!(
+        snapshot(&h.photos()),
+        saved,
+        "unrelated records rewrote files"
+    );
+
+    // Cycle 3: a settings change plans every photo again.
+    *h.tweak.lock().unwrap() = Some(replanned);
+    let report = h.run().await;
+    quiet(&report, "replanned");
+    assert_eq!(report.zones[0].plan.planned, u64::from(PHOTOS));
+    assert_eq!(report.zones[0].metadata.unchanged, COPIES, "{report:?}");
+    assert!(h.take_lookups().is_empty());
+    assert_eq!(media_requests().await, downloads);
+    assert_eq!(snapshot(&h.photos()), saved, "planning again rewrote files");
+
+    // Cycle 4: one photo joins an unselected album. Only its sidecars change.
+    h.push(member("A0000", "ALC"));
+    let report = h.run().await;
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(report.zones[0].drain, drain::DrainStats::default());
+    assert_eq!(report.zones[0].metadata.written, 2, "{report:?}");
+    assert_eq!(media_requests().await, downloads);
+    let changed = snapshot(&h.photos());
+    let differing: Vec<&String> = saved
+        .keys()
+        .filter(|file| saved[*file] != changed[*file])
+        .collect();
+    assert_eq!(
+        differing,
+        ["Album A/IMG_0000.JPG.xmp", "Album B/IMG_0000.JPG.xmp"]
+    );
+    assert!(String::from_utf8_lossy(&changed["Album A/IMG_0000.JPG.xmp"].0).contains("Album C"));
+
+    // Cycles 5 and 6: nothing changes, nothing is touched.
+    for cycle in ["quiet", "quiet again"] {
+        let report = h.run().await;
+        quiet(&report, cycle);
+        assert_eq!(report.zones[0].plan.planned, 0, "{cycle}");
+        assert!(h.take_lookups().is_empty(), "{cycle}");
+        assert_eq!(media_requests().await, downloads, "{cycle}");
+        assert_eq!(snapshot(&h.photos()), changed, "{cycle}");
     }
 }
 
