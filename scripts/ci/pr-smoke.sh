@@ -6,21 +6,20 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.."
 
 groups=(
     ::contract_
-    sync_loop::runner::tests::checkpoints::
-    download::file::transfer::tests::
-    download::orchestration::fixture_tests::
-    private_unchanged_sidecar_packets_survive_reseeds_and_two_quiet_reopens
+    sync_core::tests::
+    sync_core::state::tests::
+    sync_core::plan::
+    download::file::
+    download::metadata_pass::
     icloud::photos::asset::
     download::paths::
-    state::db::
-    state::schema::
     commands::import::
-    download::filter::
     selection::tests::
+    fs_util::
 )
 sentinels=(
-    download::orchestration::fixture_tests::recovery::bundled_no_overwrite_preserves_existing_media
-    sync_loop::runner::tests::checkpoints::run_cycle_durable_retry_survives_checkpoint_commit_failure
+    download::file::publication::tests::contract_file_publish_no_overwrite_destination_already_exists
+    sync_core::tests::an_interrupted_listing_resumes_from_its_last_saved_page
     download::file::transfer::tests::attempt_download_happy_path_writes_and_renames
 )
 
@@ -28,8 +27,7 @@ log="$(mktemp)"
 trap 'rm -f "$log"' EXIT
 
 cargo test --locked --lib --all-features -- "${groups[@]}" --test-threads=2 \
-    --skip download::filter::collisions::tests::post_rename_pre_state_sigkill_child \
-    --skip state::db::legacy_preservation::path_cache::tests::legacy_path_cache_benchmark \
+    --skip sync_core::tests::copies_stress \
     --format pretty --color never --show-output >"$log" 2>&1 || {
     tail -200 "$log" >&2
     exit 1

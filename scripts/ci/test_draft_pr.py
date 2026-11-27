@@ -38,21 +38,20 @@ class PullRequestTests(unittest.TestCase):
             cargo.write_text('#!/bin/sh\nprintf "%s\\n" "$LIBTEST_OUTPUT"\nexit "$CARGO_STATUS"\n')
             cargo.chmod(0o755)
             names = [
-                "download::orchestration::fixture_tests::recovery::bundled_no_overwrite_preserves_existing_media",
-                "sync_loop::runner::tests::checkpoints::run_cycle_durable_retry_survives_checkpoint_commit_failure",
+                "download::file::publication::tests::contract_file_publish_no_overwrite_destination_already_exists",
+                "sync_core::tests::an_interrupted_listing_resumes_from_its_last_saved_page",
                 "download::file::transfer::tests::attempt_download_happy_path_writes_and_renames",
-                "sync_cycle::tests::contract_example",
-                "queue::private_unchanged_sidecar_packets_survive_reseeds_and_two_quiet_reopens",
-                "icloud::photos::asset::example", "download::paths::example", "state::db::example",
-                "state::schema::example", "commands::import::example", "download::filter::example",
-                "selection::tests::example",
+                "sync_core::state::tests::example", "sync_core::plan::tests::example",
+                "download::metadata_pass::tests::example", "icloud::photos::asset::example",
+                "download::paths::example", "commands::import::example", "selection::tests::example",
+                "fs_util::tests::example",
             ]
             success = "\n".join(f"test {name} ... ok" for name in names)
-            success += "\ntest result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;"
+            success += "\ntest result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;"
             skipped = "test fixture ... skipping sync_loop::tests: loopback bind is not permitted on this host: denied\n"
             for output, code, expected in [
-                (success, 0, True), (success, 1, False), (success.replace("state::schema::", "other::"), 0, False),
-                (success.replace("bundled_no_overwrite_preserves_existing_media", "other"), 0, False),
+                (success, 0, True), (success, 1, False), (success.replace("commands::import::", "other::"), 0, False),
+                (success.replace("its_last_saved_page", "other"), 0, False),
                 (success.replace("0 ignored", "1 ignored"), 0, False),
                 (skipped + success, 0, False),
             ]:

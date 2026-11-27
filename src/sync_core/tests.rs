@@ -883,6 +883,48 @@ async fn primary_naming_moves_a_live_photos_still_and_motion_together_in_an_albu
     assert_eq!(contents(&h), pair("still", "motion"));
 }
 
+/// Run by `scripts/test-copies-stress.sh`: one photo in 600 albums gets 600
+/// copies in one cycle, and reopening the state finds nothing left to do.
+#[tokio::test]
+#[ignore = "copies stress; run by scripts/test-copies-stress.sh"]
+async fn copies_stress_one_photo_in_600_albums_finishes_then_reopens_quietly() {
+    const ALBUMS: usize = 600;
+    let h = Harness::new().await;
+    h.world.0.lock().unwrap().page_size = 200;
+    let m1 = h.master("M1", "IMG_0001.JPG", &jpeg("one")).await;
+    h.push(m1);
+    h.push(asset("A1", "M1"));
+    for index in 0..ALBUMS {
+        let id = format!("AL{index:03}");
+        h.push(album(&id, &format!("Album {index:03}")));
+        h.push(member("A1", &id));
+    }
+
+    let first = h.run().await;
+    assert!(first.complete(), "{first:?}");
+    assert_eq!(first.zones[0].drain.downloaded, ALBUMS as u64);
+    let files = sorted_files(&h.photos());
+    assert_eq!(files.len(), ALBUMS);
+    assert!(
+        files
+            .iter()
+            .all(|file| h.file(file).unwrap() == jpeg("one"))
+    );
+    h.take_lookups();
+
+    for _ in 0..2 {
+        let quiet = h.run().await;
+        assert!(quiet.complete(), "{quiet:?}");
+        assert_eq!(quiet.zones[0].plan.planned, 0);
+        assert_eq!(quiet.zones[0].drain, drain::DrainStats::default());
+        assert!(
+            h.take_lookups().is_empty(),
+            "a quiet reopen looks nothing up"
+        );
+        assert_eq!(sorted_files(&h.photos()), files);
+    }
+}
+
 #[tokio::test]
 async fn a_rejected_position_relists_without_downloading_again() {
     let h = Harness::new().await;

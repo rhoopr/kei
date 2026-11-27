@@ -1633,7 +1633,7 @@ fn copies_stress_runs_in_main_and_qualification_checks() {
     assert!(!ci.contains("  schedule:\n"));
     assert_eq!(
         repo_file("justfile")
-            .matches(" -- --skip download::orchestration::queue_projection::tests::private_600_")
+            .matches(" --skip sync_core::tests::copies_stress")
             .count(),
         2
     );
@@ -1695,7 +1695,7 @@ esac
         );
         for call in invocations {
             assert!(
-                call.starts_with("download::orchestration::queue_projection::tests::private_600_")
+                call.starts_with("sync_core::tests::copies_stress_")
             );
             assert!(call.contains(" --ignored --exact "));
         }

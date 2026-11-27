@@ -288,8 +288,9 @@ impl ConfinedPath {
         self.open_regular_with_access(ConfinedAccess::Read)
     }
 
-    // Only Linux replacement journals read optional entries.
-    #[cfg(target_os = "linux")]
+    // Linux replacement journals and XMP sidecar reconciliation read
+    // optional entries.
+    #[cfg(any(target_os = "linux", feature = "xmp"))]
     pub(crate) fn open_optional_regular(&self) -> std::io::Result<Option<std::fs::File>> {
         // A missing namespace is not a missing leaf in the retained parent.
         self.validate_namespace()?;
