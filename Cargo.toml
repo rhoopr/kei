@@ -42,7 +42,6 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-m
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "cookies", "json", "stream", "http2"] }
 bytes = "1"
 futures-util = "0.3"
-tokio-stream = "0.1"
 tokio-util = "0.7"
 cookie = "0.18"
 
