@@ -153,7 +153,7 @@ just test                       # all-feature offline tests
 just test offline               # all-feature/no-default suites + scenario catalog checks
 just test scenario NAME         # focused behavior slice from scripts/test-scenarios/
 just test scenarios             # every focused offline scenario slice
-just test live                  # live lookup + sync + state_auth + import-existing against iCloud
+just test live                  # live sync + state_auth + import-existing against iCloud (runs all, then fails)
 just test live-shell            # discovered live shell suites
 just test live-smoke            # release-binary live CLI/import smokes
 just test concurrency           # shell: concurrent/resume/partial-fail

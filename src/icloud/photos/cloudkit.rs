@@ -65,7 +65,12 @@ pub(crate) struct ChangesZoneResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ChangesZoneResult {
+    /// Absent, like `moreComing`, when the zone carries a `serverErrorCode`
+    /// such as `BAD_REQUEST` for a refused position; the error is checked
+    /// first and an empty position is never stored.
+    #[serde(default)]
     pub sync_token: String,
+    #[serde(default)]
     pub more_coming: bool,
     #[serde(default)]
     pub records: Vec<Record>,
@@ -249,6 +254,19 @@ mod tests {
         assert_eq!(result.server_error_code.as_deref(), Some("ZONE_NOT_FOUND"));
         assert_eq!(result.reason.as_deref(), Some("Zone does not exist"));
         assert!(result.records.is_empty());
+    }
+
+    #[test]
+    fn a_refused_position_parses_without_sync_token_or_more_coming() {
+        // The shape iCloud returned for a corrupt saved position.
+        let json = r#"{
+            "zoneID": {"zoneName": "PrimarySync"},
+            "serverErrorCode": "BAD_REQUEST",
+            "reason": "Unknown sync continuation type"
+        }"#;
+        let result: ChangesZoneResult = serde_json::from_str(json).unwrap();
+        assert_eq!(result.server_error_code.as_deref(), Some("BAD_REQUEST"));
+        assert!(result.sync_token.is_empty() && !result.more_coming);
     }
 
     #[test]

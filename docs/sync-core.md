@@ -84,9 +84,9 @@ Every command that reads state uses `src/sync_core/access.rs`. It resolves `<acc
 | Command | Behavior on the sync core |
 |---|---|
 | `status` | Saved, owed, failed and locally modified copies (a copy counts as locally modified once kei needed its bytes, for a new version or a metadata write, and found them changed; `verify --checksums` checks every copy), copies carried over from the previous state, each library's resume point, and the last run. `--failed`, `--pending` and `--downloaded` list paths. |
-| `verify` | Checks every saved copy exists; `--checksums` compares it with its recorded SHA-256. |
+| `verify` | Checks every saved copy exists; `--checksums` compares it with its recorded SHA-256. Paths are under the configured download folder, or without a config the folder the last sync recorded. |
 | `manifest` | Exports every copy row as JSON or CSV: library, photo, version, relative path, album, size, SHA-256, state and whether it is still selected. |
-| `reconcile` | Owes again every saved, selected copy whose file is missing (`--dry-run` only lists them). `--inspect-path` prints a copy's fingerprint; `--confirm-damage` owes it again so the next sync replaces exactly those bytes. |
+| `reconcile` | Uses the configured download folder, or without one the folder the last sync recorded, as `verify` does. Owes again every saved, selected copy whose file is missing (`--dry-run` only lists them). `--inspect-path` prints a copy's fingerprint; `--confirm-damage` owes it again so the next sync replaces exactly those bytes. |
 | `reset state` | Deletes the previous and current state files after checking ownership of each. |
 | `reset sync-token` | Forgets every library's position, so the next sync lists each again. Saved copies stay. |
 | `import-existing` | Runs one cycle that adopts local files at planned paths with the expected size and downloads nothing. `--dry-run` plans into a scratch copy of the current state, as `sync --dry-run` does, and reports matches without writing state. |

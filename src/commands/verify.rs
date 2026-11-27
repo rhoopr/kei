@@ -26,7 +26,8 @@ pub(crate) async fn run_verify(
         println!("Run a sync first to create the database.");
         return Ok(());
     };
-    let directory = super::download_directory(toml)
+    let directory = super::state_directory(toml, &state)
+        .await?
         .context("Set [download].directory in the config file to verify downloaded files.")?;
     let mut targets: Vec<(String, String, Option<String>)> = state
         .list_files(&[FileState::Done])

@@ -99,12 +99,9 @@ pub(crate) async fn run(run: Run<'_>) -> anyhow::Result<()> {
             if run.shutdown.is_cancelled() {
                 return Ok(());
             }
-            anyhow::ensure!(
-                report.completeness.failed == 0
-                    && report.zones.iter().all(|zone| zone.error.is_none()),
-                "Sync finished with {} failed downloads; they are retried every run at first, then up to once a day",
-                report.completeness.failed
-            );
+            if let Some(message) = exit_problem(&report) {
+                anyhow::bail!(message);
+            }
             return Ok(());
         };
         // Let another kei process use the session while this one sleeps.
@@ -390,6 +387,25 @@ fn core_config(config: &Config, retry: RetryConfig) -> CoreConfig {
     }
 }
 
+/// Why a one-shot sync exits unsuccessfully, if it does: a library that
+/// could not be read or written comes first, since it says more than a
+/// download count.
+fn exit_problem(report: &CycleReport) -> Option<String> {
+    if let Some(zone) = report.zones.iter().find(|zone| zone.error.is_some()) {
+        return Some(format!(
+            "Sync of {} did not finish: {}. Saved progress is kept and the next run continues from it",
+            zone.zone,
+            zone.error.as_deref().unwrap_or_default()
+        ));
+    }
+    (report.completeness.failed > 0).then(|| {
+        format!(
+            "Sync finished with {} failed downloads; they are retried every run at first, then up to once a day",
+            report.completeness.failed
+        )
+    })
+}
+
 fn log_report(report: &CycleReport) {
     for zone in &report.zones {
         tracing::info!(
@@ -440,4 +456,36 @@ fn log_report(report: &CycleReport) {
         complete = report.complete(),
         "Backup status"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync_core::ZoneReport;
+
+    #[test]
+    fn an_unreadable_library_is_named_before_the_download_count() {
+        let mut report = CycleReport::default();
+        report.zones.push(ZoneReport {
+            zone: "PrimarySync".into(),
+            error: Some("iCloud returned a malformed changes page".into()),
+            ..ZoneReport::default()
+        });
+        let message = exit_problem(&report).unwrap();
+        assert!(
+            message.contains("Sync of PrimarySync did not finish"),
+            "{message}"
+        );
+        assert!(message.contains("malformed changes page"), "{message}");
+        assert!(!message.contains("failed downloads"), "{message}");
+
+        report.zones[0].error = None;
+        assert_eq!(exit_problem(&report), None);
+        report.completeness.failed = 2;
+        assert!(
+            exit_problem(&report)
+                .unwrap()
+                .contains("2 failed downloads")
+        );
+    }
 }

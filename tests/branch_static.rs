@@ -2183,13 +2183,11 @@ fn live_test_recipe_forces_all_features_after_nodefault_phase() {
         .and_then(|tail| tail.split(";;").next())
         .expect("justfile must have a live test recipe case");
 
-    for suite in ["sync", "state_auth", "import_existing_live"] {
-        let expected = format!("cargo test --all-features --test {suite}");
-        assert!(
-            live_case.contains(&expected),
-            "`just test live` must rebuild {suite}'s child binary with XMP after full-test's no-default phase"
-        );
-    }
+    assert!(
+        live_case.contains("for suite in sync state_auth import_existing_live; do")
+            && live_case.contains("cargo test --all-features --test \"$suite\""),
+        "`just test live` must rebuild each suite's child binary with XMP after full-test's no-default phase"
+    );
 }
 
 #[test]
@@ -2775,7 +2773,7 @@ fi
 
 #[cfg(target_os = "linux")]
 #[test]
-fn full_test_live_dispatch_reaches_lookup_only_and_propagates_failure() {
+fn full_test_live_dispatch_runs_every_live_suite_and_propagates_failure() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let scripts = root.join("scripts/just");
@@ -2805,7 +2803,6 @@ printf '%s\n' "$call" >> "$CALL_LOG"
     );
     let log = root.join("calls");
     let expected = [
-        "test\t--all-features\t--lib\ticloud::photos::album::lookup::tests::live_targeted_record_lookup_distinguishes_present_and_missing\t--\t--exact\t--ignored\t--test-threads=1",
         "test\t--all-features\t--test\tsync\t--\t--ignored\t--test-threads=1",
         "test\t--all-features\t--test\tstate_auth\t--\t--ignored\t--test-threads=1",
         "test\t--all-features\t--test\timport_existing_live\t--\t--ignored\t--test-threads=1",
@@ -2842,7 +2839,10 @@ printf '%s\n' "$call" >> "$CALL_LOG"
             assert_eq!(calls, expected);
         } else {
             assert!(!output.status.success(), "must propagate {fail}");
-            assert_eq!(calls.last().unwrap(), fail, "must stop after child failure");
+            assert_eq!(
+                calls, expected,
+                "one failure must not hide the other suites"
+            );
         }
     }
     for upper in ["", "3d", "2025-02-30", "2025-01-01"] {

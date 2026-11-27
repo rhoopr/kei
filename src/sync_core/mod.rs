@@ -37,6 +37,15 @@ const PLAN_CONFIG_KEY: &str = "plan_config";
 /// Kv key holding the download folder the saved copies were checked against.
 const DIRECTORY_KEY: &str = "download_directory";
 
+/// The download folder the last sync used, which saved paths are relative to.
+pub(crate) async fn recorded_directory(state: &State) -> anyhow::Result<Option<PathBuf>> {
+    Ok(state
+        .get_kv(DIRECTORY_KEY)
+        .await?
+        .filter(|directory| !directory.is_empty())
+        .map(PathBuf::from))
+}
+
 /// Settings the sync core reads.
 #[derive(Debug, Clone)]
 pub(crate) struct CoreConfig {

@@ -111,8 +111,9 @@ impl PhotosSession for FakeICloud {
             if let Some(position) = &position
                 && world.rejected.contains(position)
             {
+                // As iCloud answers: no position and no moreComing.
                 return Ok(json!({"zones": [{
-                    "zoneID": {"zoneName": "PrimarySync"}, "syncToken": "", "moreComing": false,
+                    "zoneID": {"zoneName": "PrimarySync"},
                     "serverErrorCode": "BAD_REQUEST", "reason": "Unknown sync continuation type"
                 }]}));
             }
@@ -479,6 +480,20 @@ async fn full_listing_saves_unfiled_and_album_copies_then_stays_quiet() {
     assert!(
         h.take_lookups().is_empty(),
         "a quiet cycle looks nothing up"
+    );
+}
+
+/// `verify` and `reconcile` fall back to the folder the last sync recorded
+/// when no config names one, as the previous release's absolute paths did.
+#[tokio::test]
+async fn a_sync_records_the_folder_its_saved_paths_are_under() {
+    let h = Harness::new().await;
+    library_with_album(&h).await;
+    assert!(h.run().await.complete());
+    let state = h.state().await;
+    assert_eq!(
+        super::recorded_directory(&state).await.unwrap(),
+        Some(h.photos())
     );
 }
 
