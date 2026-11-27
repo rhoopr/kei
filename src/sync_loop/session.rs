@@ -484,28 +484,6 @@ pub(super) async fn initialize_libraries(
                 }
             }
         };
-        if crate::icloud::error::ICloudError::indexing_unavailable(&error)
-            && let Some(seconds) = config.watch.interval
-        {
-            drop(live);
-            tracing::warn!(
-                seconds,
-                "Indexing readiness unavailable; deferring library discovery"
-            );
-            systemd.notify_status("Waiting for iCloud indexing readiness");
-            tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
-            pending_auth = Some(
-                authenticate_before_discovery(
-                    config,
-                    password_provider,
-                    notifier,
-                    input_mode,
-                    Some(released_generation),
-                )
-                .await?,
-            );
-            continue;
-        }
         if should_retry_session_init(&error, retried_after_session_error) {
             tracing::warn!(
                 %error,
@@ -1318,46 +1296,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn indexing_watch_startup_retries_discovery_after_exhaustion() {
-        indexing_watch_startup(RetryAuth::Cached).await;
-    }
-
-    #[tokio::test]
-    async fn indexing_watch_startup_waits_for_2fa_on_discovery_retry() {
-        indexing_watch_startup(RetryAuth::TwoFactor).await;
-    }
-
-    enum RetryAuth {
-        Cached,
-        TwoFactor,
-    }
-
-    async fn indexing_watch_startup(retry_auth: RetryAuth) {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use tokio::sync::Notify;
-        use tracing::instrument::WithSubscriber;
-        use tracing_subscriber::layer::SubscriberExt;
-        use wiremock::matchers::{path, path_regex};
+    async fn unknown_indexing_state_does_not_hold_up_discovery() {
+        use wiremock::matchers::path_regex;
         use wiremock::{Mock, ResponseTemplate};
 
-        struct TwoFaWaitStarted(Arc<Notify>);
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TwoFaWaitStarted {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                let fields = event.metadata().fields();
-                if fields.field("wait_mode").is_some() && fields.field("poll_secs").is_some() {
-                    self.0.notify_one();
-                }
-            }
-        }
-
-        let server = crate::start_wiremock_or_skip!(
-            "indexing_watch_startup_retries_discovery_after_exhaustion"
-        );
+        let server =
+            crate::start_wiremock_or_skip!("unknown_indexing_state_does_not_hold_up_discovery");
         let directory = tempfile::tempdir().unwrap();
         let base = server.uri();
         let username = "startup@example.invalid";
@@ -1372,52 +1316,16 @@ mod tests {
             auth::session::Session::new(directory.path(), username, "https://www.icloud.com", None)
                 .await
                 .unwrap();
-        let verified = Arc::new(AtomicBool::new(false));
-        if matches!(retry_auth, RetryAuth::TwoFactor) {
-            let verified = verified.clone();
-            let validated = serde_json::to_value(&data).unwrap();
-            Mock::given(path("/setup/ws/1/validate"))
-                .respond_with(move |_: &wiremock::Request| {
-                    if verified.load(Ordering::SeqCst) {
-                        ResponseTemplate::new(200).set_body_json(&validated)
-                    } else {
-                        ResponseTemplate::new(401)
-                    }
-                })
-                .expect(2)
-                .mount(&server)
-                .await;
-            let mut challenge = serde_json::to_value(&data).unwrap();
-            challenge["dsInfo"]["hsaVersion"] = serde_json::json!(2);
-            challenge["dsInfo"]["hasICloudQualifyingDevice"] = serde_json::json!(true);
-            challenge["hsaChallengeRequired"] = serde_json::json!(true);
-            Mock::given(path("/setup/ws/1/accountLogin"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(challenge))
-                .expect(1)
-                .mount(&server)
-                .await;
-        } else {
-            session.save_validation_cache(&data).await;
-        }
-        let probes = std::sync::atomic::AtomicUsize::new(0);
+        session.save_validation_cache(&data).await;
+        // Every readiness probe gets a state kei does not know. Discovery
+        // still finishes in one pass; each cycle decides what waits.
         Mock::given(path_regex("/private/records/query$"))
-            .respond_with(move |_: &wiremock::Request| {
-                // Fail the first qualified probe and both retries. The next
-                // watch startup must rebuild the service before publishing it.
-                let n = probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let state = match n {
-                    0 => "RUNNING",
-                    1..=3 => "UNKNOWN",
-                    _ => "FINISHED",
-                };
-                ResponseTemplate::new(200).set_body_json(
-                    serde_json::json!({"records":[{"fields":{"state":{"value":state}}}]}),
-                )
-            })
-            .expect(7)
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"records":[{"fields":{"state":{"value":"UNKNOWN"}}}]}),
+            ))
             .mount(&server)
             .await;
-        Mock::given(path_regex("/private/zones/list$")).respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}}]}))).expect(2).mount(&server).await;
+        Mock::given(path_regex("/private/zones/list$")).respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}}]}))).expect(1).mount(&server).await;
         Mock::given(path_regex("/shared/zones/list$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"zones":[]})))
             .expect(1)
@@ -1426,7 +1334,7 @@ mod tests {
         let mut config = make_run_cycle_config();
         config.auth.username = username.to_owned();
         config.auth.cookie_directory = directory.path().to_owned();
-        config.watch.interval = Some(1);
+        config.watch.interval = None;
         let password_provider: crate::password::PasswordProvider =
             std::sync::Arc::new(|| panic!("indexing must not invalidate credentials"));
         let notifier = crate::notifications::Notifier::new(None);
@@ -1445,36 +1353,7 @@ mod tests {
                 crate::InputMode::NoInput,
             )),
         );
-        let (_, mut service, selected) = if matches!(retry_auth, RetryAuth::TwoFactor) {
-            let waiting = Arc::new(Notify::new());
-            let subscriber = tracing_subscriber::registry().with(TwoFaWaitStarted(waiting.clone()));
-            let complete_2fa = async {
-                waiting.notified().await;
-                // Simulate submit-code's validation-cache-only handoff after
-                // the worker is waiting. Authentication will validate online
-                // again rather than trust the cache that woke it.
-                verified.store(true, Ordering::SeqCst);
-                let cache = serde_json::json!({
-                    "validated_at": chrono::Utc::now().timestamp(),
-                    "account_data": data,
-                });
-                tokio::fs::write(
-                    auth::validation_cache_file_path(directory.path(), username, "com"),
-                    serde_json::to_vec(&cache)?,
-                )
-                .await?;
-                Ok::<_, anyhow::Error>(())
-            };
-            tokio::time::timeout(std::time::Duration::from_secs(60), async {
-                tokio::try_join!(initialize.with_subscriber(subscriber), complete_2fa)
-            })
-            .await
-            .expect("discovery did not resume after 2FA")
-            .unwrap()
-            .0
-        } else {
-            initialize.await.unwrap()
-        };
+        let (_, mut service, selected) = initialize.await.unwrap();
         assert_eq!(selected.len(), 1);
         assert!(selected[0].is_qualified_private_primary());
         assert!(!selected[0].last_indexing_finished());

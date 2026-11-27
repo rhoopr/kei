@@ -30,6 +30,9 @@ pub(crate) struct DrainStats {
     pub(crate) bytes: u64,
     pub(crate) adopted: u64,
     pub(crate) failed: u64,
+    /// Failures of copies that had not failed before this cycle. A copy
+    /// that fails the same way every cycle does not count again.
+    pub(crate) newly_failed: u64,
     pub(crate) modified: u64,
     /// Copies whose photo or version iCloud did not return; still owed.
     pub(crate) waiting: u64,
@@ -76,7 +79,7 @@ pub(crate) async fn drain_zone(
                     state
                         .mark_failed(row.id, "iCloud refused the download URL twice")
                         .await?;
-                    stats.failed += 1;
+                    stats.fail(&row);
                 }
             }
         }
@@ -104,6 +107,14 @@ impl Tally {
             zone: zone.to_owned(),
             owed,
             progress: super::progress::Progress::start(),
+        }
+    }
+
+    /// Count a copy that failed this cycle.
+    fn fail(&mut self, row: &FileRow) {
+        self.stats.failed += 1;
+        if row.state != FileState::Failed {
+            self.stats.newly_failed += 1;
         }
     }
 
@@ -166,7 +177,7 @@ async fn adopt(
             state
                 .mark_failed(row.id, "A different file now occupies this path")
                 .await?;
-            stats.failed += 1;
+            stats.fail(row);
         }
         Ok(None) => {
             // The file went away; download it instead.
@@ -174,7 +185,7 @@ async fn adopt(
         }
         Err(error) => {
             state.mark_failed(row.id, &format!("{error:#}")).await?;
-            stats.failed += 1;
+            stats.fail(row);
         }
     }
     Ok(())
@@ -345,7 +356,7 @@ async fn download_batch(
             Err(FetchError::Failed(error)) => {
                 tracing::warn!(path = %row.path, error = %format!("{error:#}"), "Download failed; it will be retried");
                 state.mark_failed(row.id, &format!("{error:#}")).await?;
-                stats.failed += 1;
+                stats.fail(&row);
                 stats.tick();
             }
         }

@@ -41,6 +41,9 @@ pub(crate) struct FeedPage {
     /// Position after this page. Store it with the page's observations.
     pub(crate) sync_token: String,
     pub(crate) more_coming: bool,
+    /// Malformed records left out of `observations`. The position still
+    /// advances past them, so one bad record cannot stall a library.
+    pub(crate) skipped: u64,
 }
 
 /// A record from the feed, reduced to what the catalog stores.
@@ -141,18 +144,12 @@ impl PhotoLibrary {
                 anyhow::anyhow!("iCloud returned a changes page without a sync position").into(),
             );
         }
-        let observations = zone
-            .records
-            .into_iter()
-            .map(observe)
-            .collect::<anyhow::Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect();
+        let (observations, skipped) = observe_page(zone.records);
         Ok(FeedPage {
             observations,
             sync_token: zone.sync_token,
             more_coming: zone.more_coming,
+            skipped,
         })
     }
 
@@ -309,6 +306,30 @@ pub(crate) fn current_asset(master: Record, asset: &Record) -> PhotoAsset {
     PhotoAsset::from_records(master, asset)
 }
 
+/// Reduce a page's records, leaving out any that are malformed. A skipped
+/// record is not a deletion: nothing it named is changed locally.
+fn observe_page(records: Vec<Record>) -> (Vec<Observation>, u64) {
+    let mut observations = Vec::with_capacity(records.len());
+    let mut skipped = 0;
+    for record in records {
+        // The type is not an identifier; the record name stays out of logs.
+        let record_type = record.record_type.clone();
+        match observe(record) {
+            Ok(Some(observation)) => observations.push(observation),
+            Ok(None) => {}
+            Err(error) => {
+                skipped += 1;
+                tracing::warn!(
+                    record_type = %record_type,
+                    error = %format!("{error:#}"),
+                    "Skipping a malformed iCloud record"
+                );
+            }
+        }
+    }
+    (observations, skipped)
+}
+
 fn observe(record: Record) -> anyhow::Result<Option<Observation>> {
     anyhow::ensure!(
         !record.record_name.trim().is_empty(),
@@ -379,8 +400,12 @@ fn observe(record: Record) -> anyhow::Result<Option<Observation>> {
             })
         }
         "CPLContainerRelation" => {
-            let album = string_value(&record.fields, "containerId");
-            let asset = string_value(&record.fields, "itemId");
+            // The record name also carries both ends as `<asset>-IN-<album>`.
+            let named = relation_parts(&record.record_name);
+            let album = string_value(&record.fields, "containerId")
+                .or_else(|| named.map(|(_, album)| album.to_owned()));
+            let asset = string_value(&record.fields, "itemId")
+                .or_else(|| named.map(|(asset, _)| asset.to_owned()));
             let (Some(album), Some(asset)) = (album, asset) else {
                 anyhow::bail!("iCloud returned an album membership without its album or photo");
             };
@@ -513,6 +538,33 @@ mod tests {
             ))
             .is_err()
         );
+        let named = observe(record(
+            json!({"recordName": "A2-IN-AL2", "recordType": "CPLContainerRelation", "fields": {}}),
+        ))
+        .unwrap();
+        assert_eq!(
+            named,
+            Some(Observation::Membership {
+                relation: "A2-IN-AL2".into(),
+                album: "AL2".into(),
+                asset: "A2".into(),
+                present: true
+            })
+        );
+    }
+
+    #[test]
+    fn a_malformed_record_is_skipped_and_the_rest_of_the_page_kept() {
+        let (observations, skipped) = observe_page(vec![
+            record(json!({"recordName": "R", "recordType": "CPLContainerRelation", "fields": {}})),
+            record(json!({"recordName": "", "recordType": "CPLMaster", "fields": {}})),
+            record(json!({"recordName": "M1", "recordType": "CPLMaster", "fields": {}})),
+        ]);
+        assert_eq!(skipped, 2);
+        assert!(matches!(
+            observations.as_slice(),
+            [Observation::Master { name, .. }] if name == "M1"
+        ));
     }
 
     #[test]

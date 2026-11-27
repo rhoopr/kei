@@ -446,12 +446,7 @@ impl PhotosService {
         .await
         .map_err(|error| {
             tracing::error!(zone = %zone_name, error = %error, "Failed to load library zone");
-            let message = format!("Could not load iCloud Photos library zone {zone_name}: {error}");
-            if matches!(error, ICloudError::IndexingUnavailable(_)) {
-                anyhow::Error::new(error).context(message)
-            } else {
-                anyhow::anyhow!(message)
-            }
+            anyhow::anyhow!("Could not load iCloud Photos library zone {zone_name}: {error}")
         })?;
         if library_type == "private" && zone_name == PRIMARY_ZONE_NAME {
             library.retain_provisional_readiness_from(&self.primary_library);
@@ -672,12 +667,14 @@ mod tests {
         }
     }
 
-    struct UnknownIndexSession {
+    /// Lists zones, but every zone fails to load: its readiness check
+    /// returns something that is not a CloudKit query response.
+    struct BrokenZoneSession {
         zone_response: Value,
     }
 
     #[async_trait::async_trait]
-    impl session::PhotosSession for UnknownIndexSession {
+    impl session::PhotosSession for BrokenZoneSession {
         async fn post(
             &self,
             _url: &str,
@@ -685,17 +682,13 @@ mod tests {
             _headers: &[(&str, &str)],
         ) -> anyhow::Result<Value> {
             if body.contains("CheckIndexingState") {
-                return Ok(json!({
-                    "records": [{
-                        "fields": {"state": {"value": "UNKNOWN"}}
-                    }]
-                }));
+                return Ok(json!({"records": "not a list"}));
             }
             Ok(self.zone_response.clone())
         }
 
         fn clone_box(&self) -> Box<dyn session::PhotosSession> {
-            Box::new(UnknownIndexSession {
+            Box::new(BrokenZoneSession {
                 zone_response: self.zone_response.clone(),
             })
         }
@@ -801,9 +794,9 @@ mod tests {
         assert_eq!(libs.len(), 2, "only photo libraries, got {names:?}");
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn test_fetch_libraries_fails_on_non_deleted_zone_initialization_failure() {
-        let session = UnknownIndexSession {
+        let session = BrokenZoneSession {
             zone_response: json!({
                 "zones": [
                     {"zoneID": {"zoneName": "PrimarySync"}, "syncToken": "tok"},
@@ -823,7 +816,7 @@ mod tests {
         let err = svc.fetch_private_libraries().await.unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("PrimarySync") && msg.contains("unknown photo library indexing state"),
+            msg.contains("Could not load iCloud Photos library zone PrimarySync"),
             "regular non-deleted zone failure must fail discovery: {msg}"
         );
         assert!(

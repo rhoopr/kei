@@ -160,6 +160,8 @@ impl PhotosSession for FakeICloud {
 struct Harness {
     world: FakeICloud,
     zones: Mutex<Vec<String>>,
+    /// What `CheckIndexingState` reports for every zone.
+    indexing_finished: Mutex<bool>,
     tweak: Mutex<Option<fn(&mut CoreConfig)>>,
     server: MockServer,
     root: tempfile::TempDir,
@@ -180,11 +182,16 @@ impl Harness {
         Self {
             world: FakeICloud(Arc::new(Mutex::new(world))),
             zones: Mutex::new(vec!["PrimarySync".to_owned()]),
+            indexing_finished: Mutex::new(true),
             tweak: Mutex::new(None),
             server,
             root: tempfile::tempdir().unwrap(),
             bytes: Arc::default(),
         }
+    }
+
+    fn pages_served(&self) -> usize {
+        self.world.0.lock().unwrap().pages_served
     }
 
     fn photos(&self) -> PathBuf {
@@ -196,7 +203,10 @@ impl Harness {
             .lock()
             .unwrap()
             .iter()
-            .map(|zone| PhotoLibrary::new_stub_with_zone(Box::new(self.world.clone()), zone))
+            .map(|zone| {
+                PhotoLibrary::new_stub_with_zone(Box::new(self.world.clone()), zone)
+                    .with_stub_indexing(*self.indexing_finished.lock().unwrap())
+            })
             .collect()
     }
 
@@ -453,6 +463,159 @@ async fn an_interrupted_listing_resumes_from_its_last_saved_page() {
     assert!(second.complete(), "{second:?}");
     assert_eq!(h.take_positions()[0].as_deref(), Some("p3"));
     assert_eq!(sorted_files(&h.photos()).len(), 2);
+}
+
+#[tokio::test]
+async fn listing_carries_on_while_icloud_indexes_then_repeats_once() {
+    let h = Harness::new().await;
+    library_with_album(&h).await;
+    *h.indexing_finished.lock().unwrap() = false;
+
+    let first = h.run().await;
+    assert!(first.zones[0].indexing);
+    assert!(first.zones[0].caught_up);
+    assert!(
+        !first.complete(),
+        "a listing during indexing is provisional"
+    );
+    assert_eq!(first.zones[0].drain.downloaded, 2);
+    assert_eq!(h.take_positions()[0], None);
+
+    // Still indexing: read changes as usual.
+    h.run().await;
+    assert_eq!(h.take_positions(), [Some("p6".to_owned())]);
+
+    // Indexing finished: list from the start once, interrupted part way.
+    *h.indexing_finished.lock().unwrap() = true;
+    let cancel = CancellationToken::new();
+    h.world.0.lock().unwrap().cancel_after_pages = Some((h.pages_served() + 1, cancel.clone()));
+    let interrupted = h.run_with(&cancel).await;
+    assert!(interrupted.zones[0].indexing);
+    assert_eq!(h.take_positions(), [None]);
+    h.world.0.lock().unwrap().cancel_after_pages = None;
+
+    // The restart continues that listing instead of starting it again.
+    let resumed = h.run().await;
+    assert!(resumed.complete(), "{resumed:?}");
+    assert!(!resumed.zones[0].indexing);
+    assert_eq!(resumed.zones[0].drain.downloaded, 0);
+    assert_eq!(h.take_positions(), [Some("p3".to_owned())]);
+
+    let quiet = h.run().await;
+    assert!(quiet.complete());
+    assert_eq!(h.take_positions(), [Some("p6".to_owned())]);
+    assert_eq!(
+        sorted_files(&h.photos()),
+        ["2023/IMG_0001.JPG", "Trip/IMG_0002.JPG"]
+    );
+}
+
+#[tokio::test]
+async fn queried_smart_folders_wait_for_indexing_before_new_photos_are_placed() {
+    let h = Harness::new().await;
+    *h.tweak.lock().unwrap() = Some(|config| {
+        config.smart_folders = crate::selection::SmartFolderSelector::Named {
+            included: ["Screenshots".to_owned()].into(),
+            excluded: Default::default(),
+        };
+    });
+    for (asset_name, master, file) in [("A1", "M1", "PLAIN.JPG"), ("A2", "M2", "SHOT.JPG")] {
+        let record = h.master(master, file, &jpeg(file)).await;
+        h.push(record);
+        h.push(asset(asset_name, master));
+    }
+    h.world
+        .0
+        .lock()
+        .unwrap()
+        .smart
+        .insert("SCREENSHOT".into(), vec!["A2".into()]);
+    *h.indexing_finished.lock().unwrap() = false;
+
+    let waiting = h.run().await;
+    assert!(waiting.zones[0].caught_up);
+    assert_eq!(h.world.0.lock().unwrap().smart_queries, 0);
+    assert!(
+        sorted_files(&h.photos()).is_empty(),
+        "a screenshot placed now would also be saved as unfiled"
+    );
+
+    *h.indexing_finished.lock().unwrap() = true;
+    let report = h.run().await;
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(
+        sorted_files(&h.photos()),
+        ["2023/PLAIN.JPG", "Screenshots/SHOT.JPG"]
+    );
+
+    // Indexing again later: the stored members are kept and used.
+    *h.indexing_finished.lock().unwrap() = false;
+    let m3 = h.master("M3", "NEW.JPG", &jpeg("NEW.JPG")).await;
+    h.push(m3);
+    h.push(asset("A3", "M3"));
+    let report = h.run().await;
+    assert_eq!(report.zones[0].drain.downloaded, 1);
+    assert_eq!(
+        sorted_files(&h.photos()),
+        ["2023/NEW.JPG", "2023/PLAIN.JPG", "Screenshots/SHOT.JPG"]
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_record_does_not_hold_up_the_library() {
+    let h = Harness::new().await;
+    library_with_album(&h).await;
+    h.push(json!({"recordName": "BROKEN", "recordType": "CPLContainerRelation", "fields": {}}));
+
+    let report = h.run().await;
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(report.zones[0].skipped_records, 1);
+    assert_eq!(
+        sorted_files(&h.photos()),
+        ["2023/IMG_0001.JPG", "Trip/IMG_0002.JPG"]
+    );
+    let quiet = h.run().await;
+    assert_eq!(quiet.zones[0].skipped_records, 0);
+}
+
+#[test]
+fn health_counts_new_failures_without_progress_not_repeated_ones() {
+    let zone = |error: Option<&str>, drain: drain::DrainStats| ZoneReport {
+        error: error.map(ToOwned::to_owned),
+        drain,
+        ..ZoneReport::default()
+    };
+    let report = |zones| CycleReport {
+        zones,
+        ..CycleReport::default()
+    };
+    let repeated = drain::DrainStats {
+        failed: 1,
+        ..Default::default()
+    };
+    assert_eq!(report(vec![zone(None, repeated)]).health_problem(), None);
+    let new_with_progress = drain::DrainStats {
+        failed: 2,
+        newly_failed: 2,
+        downloaded: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        report(vec![zone(None, new_with_progress)]).health_problem(),
+        None
+    );
+    let stuck = drain::DrainStats {
+        failed: 3,
+        newly_failed: 3,
+        ..Default::default()
+    };
+    assert!(report(vec![zone(None, stuck)]).health_problem().is_some());
+    assert_eq!(
+        report(vec![zone(Some("iCloud refused"), repeated)])
+            .health_problem()
+            .as_deref(),
+        Some("iCloud refused")
+    );
 }
 
 #[tokio::test]
@@ -1419,51 +1582,28 @@ async fn a_replacement_published_before_a_crash_is_not_downloaded_again() {
 }
 
 #[tokio::test]
+#[tracing_test::traced_test]
 async fn long_steps_report_progress_with_what_is_saved_and_what_remains() {
-    let (capture, _guard) = crate::test_helpers::TracingCapture::install();
     let h = Harness::new().await;
     library_with_album(&h).await;
     let report = h.run().await;
     assert!(report.complete(), "{report:?}");
-    let lines = capture.events();
-    let messages: Vec<&str> = lines.iter().filter_map(|e| e.message()).collect();
-    assert!(
-        messages
-            .iter()
-            .any(|m| m.starts_with("Listing the whole library")),
-        "{messages:?}"
-    );
-    let listing = lines
-        .iter()
-        .find(|e| e.message() == Some("Listing library: progress saved"))
-        .expect("a multi-page listing reports its saved pages");
-    assert_eq!(listing.field("pages"), Some("1"));
-    let owed = lines
-        .iter()
-        .find(|e| e.message() == Some("Saving owed copies"))
-        .expect("downloads report what is owed");
-    assert_eq!(owed.field("owed"), Some("2"));
-    let saved = lines
-        .iter()
-        .find(|e| e.message() == Some("Saved copies"))
-        .expect("downloads report what was saved");
-    assert_eq!(saved.field("downloaded"), Some("2"));
-    assert_eq!(saved.field("remaining"), Some("0"));
-
-    // A quiet cycle lists one page and owes nothing, so it stays quiet.
-    let (capture, _guard) = crate::test_helpers::TracingCapture::install();
+    // A quiet second cycle lists one page and owes nothing, so it adds none
+    // of these lines.
     h.run().await;
-    let quiet: Vec<String> = capture
-        .events()
-        .iter()
-        .filter_map(|e| e.message().map(ToOwned::to_owned))
-        .collect();
-    assert!(
-        !quiet
-            .iter()
-            .any(|m| m.starts_with("Listing the whole library")
-                || m == "Saving owed copies"
-                || m == "Saved copies"),
-        "{quiet:?}"
-    );
+    logs_assert(|lines: &[&str]| {
+        let once = |needle: &str, fields: &[&str]| {
+            let found: Vec<&&str> = lines.iter().filter(|line| line.contains(needle)).collect();
+            match found.as_slice() {
+                [line] if fields.iter().all(|field| line.contains(field)) => Ok(()),
+                _ => Err(format!(
+                    "expected one {needle:?} line with {fields:?}: {found:?}"
+                )),
+            }
+        };
+        once("Listing the whole library", &[])?;
+        once("Listing library: progress saved", &["pages=1"])?;
+        once("Saving owed copies", &["owed=2"])?;
+        once("Saved copies", &["downloaded=2", "remaining=0"])
+    });
 }

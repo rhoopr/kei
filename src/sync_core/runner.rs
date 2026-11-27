@@ -88,7 +88,7 @@ pub(crate) async fn run(run: Run<'_>) -> anyhow::Result<()> {
             && report
                 .zones
                 .iter()
-                .all(|zone| zone.caught_up && zone.error.is_none());
+                .all(|zone| zone.caught_up && zone.error.is_none() && !zone.indexing);
         if listed_everywhere && let Some(freed) = super::upgrade::finish(&state).await? {
             tracing::info!(
                 freed_bytes = freed,
@@ -182,10 +182,11 @@ async fn publish(
         },
         ..crate::sync_stats::SyncStats::default()
     };
-    if ok {
-        health.record_success();
-    } else {
-        health.record_failure(error.as_deref().unwrap_or("Some downloads failed"));
+    if !interrupted {
+        match report.health_problem() {
+            None => health.record_success(),
+            Some(problem) => health.record_failure(&problem),
+        }
     }
     health.write(&config.auth.cookie_directory);
     if let Some(metrics) = run.metrics {
@@ -396,6 +397,7 @@ fn log_report(report: &CycleReport) {
             pages = zone.pages,
             caught_up = zone.caught_up,
             listed_again = zone.position_reset,
+            indexing = zone.indexing,
             planned = zone.plan.planned,
             downloaded = zone.drain.downloaded,
             adopted = zone.drain.adopted,
@@ -403,6 +405,13 @@ fn log_report(report: &CycleReport) {
             locally_modified = zone.drain.modified,
             "Library synced"
         );
+        if zone.skipped_records > 0 {
+            tracing::warn!(
+                zone = %zone.zone,
+                records = zone.skipped_records,
+                "iCloud returned malformed records; they were skipped and the rest of the library synced"
+            );
+        }
         let m = zone.metadata;
         if m != super::metadata::MetadataStats::default() {
             tracing::info!(

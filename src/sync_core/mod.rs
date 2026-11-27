@@ -6,6 +6,7 @@
 
 pub(crate) mod access;
 pub(crate) mod drain;
+mod indexing;
 pub(crate) mod metadata;
 pub(crate) mod plan;
 mod progress;
@@ -106,6 +107,11 @@ pub(crate) struct ZoneReport {
     pub(crate) position_reset: bool,
     /// The zone had no saved position, so this cycle listed it from the start.
     pub(crate) full_listing: bool,
+    /// Malformed records left out of the catalog.
+    pub(crate) skipped_records: u64,
+    /// iCloud has not finished indexing the zone, or its listing taken while
+    /// it was has not been repeated yet. Queried smart folders wait.
+    pub(crate) indexing: bool,
     pub(crate) plan: plan::PlanStats,
     pub(crate) drain: drain::DrainStats,
     pub(crate) metadata: metadata::MetadataStats,
@@ -114,11 +120,31 @@ pub(crate) struct ZoneReport {
 }
 
 impl CycleReport {
+    /// Why this cycle counts against service health, if it does.
+    ///
+    /// Health tracks whether kei can still read iCloud and save photos. A
+    /// copy that keeps failing the same way is reported in the run report
+    /// and metrics, but does not count again every cycle. New failures with
+    /// nothing saved alongside them do, since nothing is getting through.
+    pub(crate) fn health_problem(&self) -> Option<String> {
+        if let Some(error) = self.zones.iter().find_map(|zone| zone.error.clone()) {
+            return Some(error);
+        }
+        let newly_failed: u64 = self.zones.iter().map(|zone| zone.drain.newly_failed).sum();
+        let saved: u64 = self
+            .zones
+            .iter()
+            .map(|zone| zone.drain.downloaded + zone.drain.adopted)
+            .sum();
+        (newly_failed > 0 && saved == 0)
+            .then(|| format!("{newly_failed} downloads failed and none succeeded"))
+    }
+
     /// Every zone caught up and no owed copy is left.
     pub(crate) fn complete(&self) -> bool {
         self.zones
             .iter()
-            .all(|zone| zone.caught_up && zone.error.is_none())
+            .all(|zone| zone.caught_up && zone.error.is_none() && !zone.indexing)
             && self.completeness.pending == 0
             && self.completeness.failed == 0
     }
@@ -151,17 +177,37 @@ pub(crate) async fn run_cycle(
             zone: zone.clone(),
             ..ZoneReport::default()
         };
+        let indexing = indexing::Indexing::check(library).await;
+        indexing::before_observe(state, &zone, indexing).await?;
         if let Err(error) = observe(state, library, cancel, &mut zone_report).await {
             report.session_expired |= crate::icloud::photos::session::is_session_error(&error);
             tracing::warn!(zone = %zone, error = %format!("{error:#}"), "Could not read iCloud changes; owed downloads continue");
             zone_report.error = Some(format!("{error:#}"));
         }
-        for folder in plan::queried_smart_folders(&config.smart_folders) {
+        indexing::after_observe(
+            state,
+            &zone,
+            indexing,
+            zone_report.caught_up && zone_report.error.is_none(),
+        )
+        .await?;
+        zone_report.indexing = indexing::relist_owed(state, &zone).await?;
+        // These folders come from iCloud's search index, which may be
+        // partial until indexing finishes. Their stored members stay.
+        let queried = if indexing == indexing::Indexing::Finished {
+            plan::queried_smart_folders(&config.smart_folders)
+        } else {
+            Vec::new()
+        };
+        for folder in queried {
             if cancel.is_cancelled() {
                 break;
             }
             match library.smart_folder_members(&folder).await {
-                Ok(members) => state.replace_smart_members(&zone, &folder, members).await?,
+                Ok(members) => {
+                    state.replace_smart_members(&zone, &folder, members).await?;
+                    state.set_kv(&smart_read_key(&zone, &folder), "1").await?;
+                }
                 Err(error) => {
                     report.session_expired |=
                         crate::icloud::photos::session::is_session_error(&error);
@@ -181,7 +227,17 @@ pub(crate) async fn run_cycle(
     }
     if all_listed && !cancel.is_cancelled() {
         for (library, zone_report) in libraries.iter().zip(report.zones.iter_mut()) {
-            zone_report.plan = plan::plan_zone(state, library.zone_name(), config).await?;
+            let zone = library.zone_name();
+            if !smart_folders_read(state, zone, config).await? {
+                // Placing a photo before its queried folder is known would
+                // file it as unfiled, and that copy would stay.
+                tracing::warn!(
+                    zone,
+                    "New photos wait until iCloud's smart folders such as Screenshots can be read"
+                );
+                continue;
+            }
+            zone_report.plan = plan::plan_zone(state, zone, config).await?;
         }
     }
 
@@ -260,6 +316,28 @@ pub(crate) async fn run_cycle(
     Ok(report)
 }
 
+fn smart_read_key(zone: &str, folder: &str) -> String {
+    format!("smart_read:{zone}:{folder}")
+}
+
+/// Every selected queried smart folder's members were read at least once.
+async fn smart_folders_read(
+    state: &State,
+    zone: &str,
+    config: &CoreConfig,
+) -> anyhow::Result<bool> {
+    for folder in plan::queried_smart_folders(&config.smart_folders) {
+        if state
+            .get_kv(&smart_read_key(zone, &folder))
+            .await?
+            .is_none()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Read the zone's feed to its current end, storing each page with its position.
 async fn observe(
     state: &State,
@@ -303,6 +381,7 @@ async fn observe(
         let caught_up = !page.more_coming;
         let next = page.sync_token.clone();
         records += page.observations.len();
+        report.skipped_records += page.skipped;
         state
             .commit_page(zone, page.observations, page.sync_token, caught_up)
             .await?;

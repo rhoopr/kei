@@ -8,8 +8,6 @@ use super::queries::encode_params;
 use super::session::PhotosSession;
 use crate::icloud::error::ICloudError;
 
-const INDEXING_RETRY_DELAYS_SECS: [u64; 2] = [5, 15];
-
 /// CloudKit zone name for the user's own (non-shared) library. Used as the
 /// fallback when a `zone_id` JSON object lacks `zoneName`, as the backfill
 /// value for the v8 schema migration, and as the default scope for
@@ -137,8 +135,20 @@ impl PhotoLibrary {
             library_type: Arc::from(library_type),
             retry_config,
         };
-        if !library.check_indexing().await? {
-            tracing::warn!("Photo library indexing is RUNNING; listings may be incomplete");
+        // Each sync cycle reads the state again and decides what waits for
+        // indexing, so only a failure to reach iCloud stops loading here.
+        match library.check_indexing_once().await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!("iCloud is still indexing this photo library");
+            }
+            Err(ICloudError::IndexingUnavailable(reason)) => {
+                tracing::warn!(
+                    reason,
+                    "Loading the photo library without its indexing state"
+                );
+            }
+            Err(error) => return Err(error),
         }
         Ok(library)
     }
@@ -163,24 +173,8 @@ impl PhotoLibrary {
         self.indexing_finished.store(false, Ordering::Relaxed);
     }
 
-    pub(crate) async fn check_indexing(&self) -> Result<bool, ICloudError> {
-        let mut delays = INDEXING_RETRY_DELAYS_SECS.into_iter();
-        loop {
-            match self.check_indexing_once().await {
-                Err(ICloudError::IndexingUnavailable(reason)) => {
-                    let Some(seconds) = delays.next() else {
-                        return Err(ICloudError::IndexingUnavailable(reason));
-                    };
-                    tracing::warn!(reason, seconds, "Retrying photo library readiness check");
-                    tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
-                }
-                result => return result,
-            }
-        }
-    }
-
-    /// Check readiness without indexing backoff. Closing checkpoint checks
-    /// cannot discard an unknown observation, and sparse lookups run per link.
+    /// Read iCloud's indexing state once. An unknown or missing state is
+    /// `IndexingUnavailable`; callers treat it as not finished.
     pub(crate) async fn check_indexing_once(&self) -> Result<bool, ICloudError> {
         #[cfg(test)]
         if let Some(finished) = self.stub_indexing_finished {
@@ -297,6 +291,13 @@ impl PhotoLibrary {
             library_type: Arc::from("private"),
             retry_config: RetryConfig::default(),
         }
+    }
+
+    /// Make the stub report this indexing state.
+    pub(crate) fn with_stub_indexing(mut self, finished: bool) -> Self {
+        self.stub_indexing_finished = Some(finished);
+        self.indexing_finished.store(finished, Ordering::Relaxed);
+        self
     }
 
     /// Test-only constructor that pins a custom zone name on the stub.
@@ -484,22 +485,22 @@ mod tests {
         .await
         .unwrap();
         assert!(!library.last_indexing_finished());
-        assert!(!library.check_indexing().await.unwrap());
+        assert!(!library.check_indexing_once().await.unwrap());
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn indexing_state_missing_fails_library_initialization() {
-        let start = tokio::time::Instant::now();
-        let err = new_library_with_indexing_response(json!({"records": []}))
-            .await
-            .unwrap_err();
-        assert_eq!(start.elapsed(), std::time::Duration::from_secs(20));
-
-        assert!(
-            err.to_string()
-                .contains("did not report whether the photo library is fully indexed"),
-            "missing indexing state must fail closed: {err}"
-        );
+    #[tokio::test]
+    async fn indexing_state_missing_or_unknown_still_loads_the_library() {
+        for response in [
+            json!({"records": []}),
+            json!({"records": [{"fields": {"state": {"value": "PAUSED"}}}]}),
+        ] {
+            let library = new_library_with_indexing_response(response).await.unwrap();
+            assert!(!library.last_indexing_finished());
+            assert!(matches!(
+                library.check_indexing_once().await,
+                Err(ICloudError::IndexingUnavailable(_))
+            ));
+        }
     }
 
     #[test]

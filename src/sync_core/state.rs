@@ -446,6 +446,17 @@ impl State {
         .await
     }
 
+    /// Forget a zone's position so it is listed again from the start. The
+    /// zone stays listed, so planning carries on with what is recorded.
+    pub(crate) async fn relist(&self, zone: &str) -> anyhow::Result<()> {
+        let zone = zone.to_owned();
+        self.with(move |conn| {
+            conn.execute("UPDATE zones SET position = NULL WHERE zone = ?1", [zone])?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Store one page's observations and the position after it, atomically.
     // CONTRACT: POSITION_COMMITS_WITH_OBSERVATIONS
     // The zone position moves only in the transaction that records the page
