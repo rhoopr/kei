@@ -1022,7 +1022,6 @@ fn tiny_jpeg(n: u16) -> Vec<u8> {
 }
 
 /// Every file under `root` with its bytes and modification time.
-#[cfg(feature = "xmp")]
 fn snapshot(root: &Path) -> std::collections::BTreeMap<String, (Vec<u8>, std::time::SystemTime)> {
     sorted_files(root)
         .into_iter()
