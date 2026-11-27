@@ -1,14 +1,17 @@
 //! Download owed copies from the work queue.
 //!
 //! Download URLs come from a record lookup made just before each batch, so
-//! nothing depends on URLs the catalog saw hours ago. A URL that still
+//! nothing depends on URLs the catalog saw hours ago. Downloads run in one
+//! queue with a fixed number of slots, and the next batch is looked up while
+//! earlier ones download, so no slot waits for a lookup or a slow file. A URL that still
 //! expires gets one fresh lookup in the same cycle. Every outcome is written
 //! back to the copy's row; nothing here touches a zone's position.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use reqwest::Client;
 use tokio_util::sync::CancellationToken;
 
@@ -47,45 +50,240 @@ pub(crate) async fn drain_zone(
 ) -> anyhow::Result<DrainStats> {
     let zone = library.zone_name().to_owned();
     let mut stats = Tally::start(&zone, state.owed(&zone).await?);
-    let mut after = 0;
+    let ctx = Ctx {
+        state,
+        library,
+        config,
+        client,
+        cancel,
+    };
+    let slots = config.concurrency.max(1);
+    let mut source = Source::default();
+    let mut retry = Vec::new();
+    let mut expired_once = HashSet::new();
+    // Downloads and adoptions ready to start, in work order.
+    let mut ready: VecDeque<Work> = VecDeque::new();
+    let mut running = FuturesUnordered::new();
+    let mut transfers = 0;
+    let mut preparing = false;
+    let mut failure: Option<anyhow::Error> = None;
     loop {
-        if cancel.is_cancelled() {
-            break;
+        if !cancel.is_cancelled() && failure.is_none() {
+            // Look up the next batch while earlier downloads run, so the
+            // slots never wait for a lookup or for a batch's slowest file.
+            // At most one batch waits ahead of the downloads, so its URLs
+            // stay fresh.
+            if !preparing && ready.len() < slots.max(ASSETS_PER_BATCH) {
+                match next_batch(
+                    state,
+                    &zone,
+                    config.transfer,
+                    &mut source,
+                    &mut retry,
+                    &mut ready,
+                )
+                .await
+                {
+                    Ok(Some(batch)) => {
+                        running.push(step(Work::Prepare(batch), &ctx));
+                        preparing = true;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        failure = Some(error);
+                    }
+                }
+            }
+            while transfers < slots
+                && failure.is_none()
+                && let Some(work) = ready.pop_front()
+            {
+                running.push(step(work, &ctx));
+                transfers += 1;
+            }
         }
-        let rows = state.work(&zone, after, ROWS_PER_QUERY).await?;
-        let Some(last) = rows.last() else {
+        // Nothing running means nothing is left to start, or work stopped.
+        let Some(done) = running.next().await else {
             break;
         };
-        after = last.id;
-        let mut downloads = Vec::new();
-        for row in rows {
-            if row.state == FileState::Adopt {
-                adopt(state, config, &row, &mut stats).await?;
-            } else if config.transfer == super::Transfer::All {
-                downloads.push(row);
+        match done {
+            Done::Prepared(result) => {
+                preparing = false;
+                match result {
+                    Ok(prepared) => {
+                        stats.waiting += prepared.waiting;
+                        stats.modified += prepared.modified;
+                        stats.downloaded += prepared.accepted;
+                        ready.extend(prepared.jobs.into_iter().map(Work::Download));
+                    }
+                    Err(error) => {
+                        failure.get_or_insert(error);
+                    }
+                }
             }
-        }
-        for batch in by_asset(downloads) {
-            if cancel.is_cancelled() {
-                break;
+            Done::Downloaded(row, result) => {
+                transfers -= 1;
+                match result {
+                    Ok(Ok(bytes)) => {
+                        stats.downloaded += 1;
+                        stats.bytes += bytes;
+                        stats.tick();
+                    }
+                    Ok(Err(FetchError::Expired)) => {
+                        if expired_once.insert(row.id) {
+                            retry.push(row);
+                        } else if let Err(error) = state
+                            .mark_failed(row.id, "iCloud refused the download URL twice")
+                            .await
+                        {
+                            failure.get_or_insert(error);
+                        } else {
+                            stats.fail(&row);
+                        }
+                    }
+                    Ok(Err(FetchError::Interrupted)) => {}
+                    Ok(Err(FetchError::Failed(_))) => {
+                        stats.fail(&row);
+                        stats.tick();
+                    }
+                    Err(error) => {
+                        failure.get_or_insert(error);
+                    }
+                }
             }
-            let expired =
-                download_batch(state, library, config, client, cancel, batch, &mut stats).await?;
-            if !expired.is_empty() && !cancel.is_cancelled() {
-                let still_expired =
-                    download_batch(state, library, config, client, cancel, expired, &mut stats)
-                        .await?;
-                for row in still_expired {
-                    state
-                        .mark_failed(row.id, "iCloud refused the download URL twice")
-                        .await?;
-                    stats.fail(&row);
+            Done::Adopted(row, result) => {
+                transfers -= 1;
+                match result {
+                    Ok(Adopted::Done) => {
+                        stats.adopted += 1;
+                        stats.tick();
+                    }
+                    Ok(Adopted::Failed) => stats.fail(&row),
+                    Ok(Adopted::Missing) => {}
+                    Err(error) => {
+                        failure.get_or_insert(error);
+                    }
                 }
             }
         }
     }
+    if let Some(error) = failure {
+        return Err(error);
+    }
     stats.finish();
     Ok(stats.stats)
+}
+
+/// What a drain step needs, shared by every step.
+struct Ctx<'a> {
+    state: &'a State,
+    library: &'a PhotoLibrary,
+    config: &'a CoreConfig,
+    client: &'a Client,
+    cancel: &'a CancellationToken,
+}
+
+enum Work {
+    /// Look up current records for a batch and turn its rows into downloads.
+    Prepare(Vec<FileRow>),
+    Download(Job),
+    Adopt(FileRow),
+}
+
+enum Done {
+    Prepared(anyhow::Result<Prepared>),
+    /// The outer error is a state write; the inner result is the transfer.
+    Downloaded(FileRow, anyhow::Result<Result<u64, FetchError>>),
+    Adopted(FileRow, anyhow::Result<Adopted>),
+}
+
+struct Job {
+    row: FileRow,
+    url: String,
+    replace: Option<Recorded>,
+    /// Modification time for the published file.
+    modified: i64,
+}
+
+#[derive(Default)]
+struct Prepared {
+    jobs: Vec<Job>,
+    waiting: u64,
+    modified: u64,
+    /// Replacements a crash interrupted after publishing; now recorded.
+    accepted: u64,
+}
+
+enum Adopted {
+    Done,
+    Failed,
+    /// The file went away; the copy is downloaded instead.
+    Missing,
+}
+
+/// Owed rows, read a page at a time and grouped into lookup batches.
+#[derive(Default)]
+struct Source {
+    after: i64,
+    done: bool,
+    batches: VecDeque<Vec<FileRow>>,
+}
+
+/// The next batch to look up. Adoptions found on the way go straight to
+/// `ready`. Returns `None` when there is no batch to look up right now.
+async fn next_batch(
+    state: &State,
+    zone: &str,
+    transfer: super::Transfer,
+    source: &mut Source,
+    retry: &mut Vec<FileRow>,
+    ready: &mut VecDeque<Work>,
+) -> anyhow::Result<Option<Vec<FileRow>>> {
+    // A URL that expired gets one more lookup in this cycle.
+    if !retry.is_empty() {
+        source.batches.extend(by_asset(std::mem::take(retry)));
+    }
+    loop {
+        if let Some(batch) = source.batches.pop_front() {
+            return Ok(Some(batch));
+        }
+        if source.done {
+            return Ok(None);
+        }
+        let rows = state.work(zone, source.after, ROWS_PER_QUERY).await?;
+        let Some(last) = rows.last() else {
+            source.done = true;
+            continue;
+        };
+        source.after = last.id;
+        let mut downloads = Vec::new();
+        for row in rows {
+            if row.state == FileState::Adopt {
+                ready.push_back(Work::Adopt(row));
+            } else if transfer == super::Transfer::All {
+                downloads.push(row);
+            }
+        }
+        source.batches.extend(by_asset(downloads));
+        if source.batches.is_empty() && !ready.is_empty() {
+            // Let the adoptions run before reading further.
+            return Ok(None);
+        }
+    }
+}
+
+async fn step(work: Work, ctx: &Ctx<'_>) -> Done {
+    match work {
+        Work::Prepare(rows) => Done::Prepared(prepare(ctx, rows).await),
+        Work::Download(job) => {
+            let row = job.row.clone();
+            Done::Downloaded(row, download(ctx, job).await)
+        }
+        Work::Adopt(row) => {
+            let result = adopt(ctx.state, ctx.config, &row).await;
+            Done::Adopted(row, result)
+        }
+    }
 }
 
 /// Drain counters plus periodic progress lines for one zone.
@@ -161,34 +359,30 @@ impl std::ops::DerefMut for Tally {
 }
 
 /// Hash a file already at a new copy's path and take ownership of it.
-async fn adopt(
-    state: &State,
-    config: &CoreConfig,
-    row: &FileRow,
-    stats: &mut Tally,
-) -> anyhow::Result<()> {
-    match core_io::hash_file(&config.directory.join(&row.path)).await {
-        Ok(Some((size, sha256))) if size == row.size => {
-            state.mark_done(row.id, &sha256).await?;
-            stats.adopted += 1;
-            stats.tick();
-        }
-        Ok(Some(_)) => {
-            state
-                .mark_failed(row.id, "A different file now occupies this path")
-                .await?;
-            stats.fail(row);
-        }
-        Ok(None) => {
-            // The file went away; download it instead.
-            state.mark_pending(row.id).await?;
-        }
-        Err(error) => {
-            state.mark_failed(row.id, &format!("{error:#}")).await?;
-            stats.fail(row);
-        }
-    }
-    Ok(())
+async fn adopt(state: &State, config: &CoreConfig, row: &FileRow) -> anyhow::Result<Adopted> {
+    Ok(
+        match core_io::hash_file(&config.directory.join(&row.path)).await {
+            Ok(Some((size, sha256))) if size == row.size => {
+                state.mark_done(row.id, &sha256).await?;
+                Adopted::Done
+            }
+            Ok(Some(_)) => {
+                state
+                    .mark_failed(row.id, "A different file now occupies this path")
+                    .await?;
+                Adopted::Failed
+            }
+            Ok(None) => {
+                // The file went away; download it instead.
+                state.mark_pending(row.id).await?;
+                Adopted::Missing
+            }
+            Err(error) => {
+                state.mark_failed(row.id, &format!("{error:#}")).await?;
+                Adopted::Failed
+            }
+        },
+    )
 }
 
 /// Group rows so each batch covers at most [`ASSETS_PER_BATCH`] assets.
@@ -212,18 +406,17 @@ fn by_asset(rows: Vec<FileRow>) -> Vec<Vec<FileRow>> {
     batches
 }
 
-/// Look up current records for a batch and download its copies. Returns the
-/// rows whose URL expired.
-async fn download_batch(
-    state: &State,
-    library: &PhotoLibrary,
-    config: &CoreConfig,
-    client: &Client,
-    cancel: &CancellationToken,
-    rows: Vec<FileRow>,
-    stats: &mut Tally,
-) -> anyhow::Result<Vec<FileRow>> {
+/// Look up current records for a batch and turn its rows into downloads.
+async fn prepare(ctx: &Ctx<'_>, rows: Vec<FileRow>) -> anyhow::Result<Prepared> {
+    let Ctx {
+        state,
+        library,
+        config,
+        ..
+    } = *ctx;
     let zone = library.zone_name();
+    let mut out = Prepared::default();
+    let mut pending = Vec::new();
     let mut assets: Vec<String> = rows.iter().map(|row| row.asset.clone()).collect();
     assets.dedup();
     let masters = state.masters_of(zone, assets.clone()).await?;
@@ -253,20 +446,19 @@ async fn download_batch(
         );
     }
 
-    let mut jobs = Vec::new();
     for row in rows {
         let Some(files) = current.get(&row.asset) else {
             state
                 .note_waiting(row.id, "iCloud did not return this photo")
                 .await?;
-            stats.waiting += 1;
+            out.waiting += 1;
             continue;
         };
         let Some(file) = files.iter().find(|file| file.rendition == row.rendition) else {
             state
                 .note_waiting(row.id, "iCloud no longer offers this version")
                 .await?;
-            stats.waiting += 1;
+            out.waiting += 1;
             continue;
         };
         let mut row = row;
@@ -290,17 +482,18 @@ async fn download_batch(
                 Untouched::AlreadyReplaced => {
                     // The replacement finished before kei last stopped.
                     state.accept_pending(row.id).await?;
-                    stats.downloaded += 1;
+                    out.accepted += 1;
                     continue;
                 }
                 Untouched::Changed => {
                     state.mark_modified(row.id).await?;
-                    stats.modified += 1;
+                    out.modified += 1;
                     continue;
                 }
             },
         };
-        jobs.push((row, file.url.clone(), replace));
+        let url = file.url.clone();
+        pending.push((row, url, replace));
     }
 
     let modified = |row: &FileRow, replacing: bool| -> i64 {
@@ -317,59 +510,73 @@ async fn download_batch(
         }
         fields.and_then(capture_seconds).unwrap_or(0)
     };
-    let jobs = jobs
+    out.jobs = pending
         .into_iter()
         .map(|(row, url, replace)| {
-            let seconds = modified(&row, replace.is_some());
-            async move {
-                let path = config.directory.join(&row.path);
-                if let Some(parent) = path.parent()
-                    && let Err(error) = tokio::fs::create_dir_all(parent).await
-                {
-                    return (row, Err(FetchError::Failed(error.into())));
-                }
-                let result = core_io::fetch(
-                    Fetch {
-                        client,
-                        url: &url,
-                        path: &path,
-                        checksum: &row.checksum,
-                        size: row.size,
-                        temp_suffix: &config.temp_suffix,
-                        retry: &config.retry,
-                        replace,
-                        modified: seconds,
-                        cancel,
-                        bandwidth: config.bandwidth.as_ref(),
-                    },
-                    async |sha256: &str| state.set_pending(row.id, sha256, None).await,
-                )
-                .await;
-                (row, result)
+            let modified = modified(&row, replace.is_some());
+            Job {
+                row,
+                url,
+                replace,
+                modified,
             }
         })
-        .collect::<Vec<_>>();
-    let mut results = futures_util::stream::iter(jobs).buffer_unordered(config.concurrency.max(1));
-    let mut expired = Vec::new();
-    while let Some((row, result)) = results.next().await {
-        match result {
-            Ok(fetched) => {
-                state.mark_done(row.id, &fetched.sha256).await?;
-                stats.downloaded += 1;
-                stats.bytes += fetched.bytes;
-                stats.tick();
-            }
-            Err(FetchError::Expired) => expired.push(row),
-            Err(FetchError::Interrupted) => {}
-            Err(FetchError::Failed(error)) => {
-                tracing::warn!(path = %row.path, error = %format!("{error:#}"), "Download failed; it will be retried");
-                state.mark_failed(row.id, &format!("{error:#}")).await?;
-                stats.fail(&row);
-                stats.tick();
-            }
+        .collect();
+    Ok(out)
+}
+
+/// Download one copy and record the outcome on its row.
+async fn download(ctx: &Ctx<'_>, job: Job) -> anyhow::Result<Result<u64, FetchError>> {
+    let Ctx {
+        state,
+        config,
+        client,
+        cancel,
+        ..
+    } = *ctx;
+    let Job {
+        row,
+        url,
+        replace,
+        modified,
+    } = job;
+    let path = config.directory.join(&row.path);
+    let result = match path.parent() {
+        Some(parent) if let Err(error) = tokio::fs::create_dir_all(parent).await => {
+            Err(FetchError::Failed(error.into()))
         }
-    }
-    Ok(expired)
+        _ => {
+            core_io::fetch(
+                Fetch {
+                    client,
+                    url: &url,
+                    path: &path,
+                    checksum: &row.checksum,
+                    size: row.size,
+                    temp_suffix: &config.temp_suffix,
+                    retry: &config.retry,
+                    replace,
+                    modified,
+                    cancel,
+                    bandwidth: config.bandwidth.as_ref(),
+                },
+                async |sha256: &str| state.set_pending(row.id, sha256, None).await,
+            )
+            .await
+        }
+    };
+    Ok(match result {
+        Ok(fetched) => {
+            state.mark_done(row.id, &fetched.sha256).await?;
+            Ok(fetched.bytes)
+        }
+        Err(FetchError::Failed(error)) => {
+            tracing::warn!(path = %row.path, error = %format!("{error:#}"), "Download failed; it will be retried");
+            state.mark_failed(row.id, &format!("{error:#}")).await?;
+            Err(FetchError::Failed(error))
+        }
+        Err(other) => Err(other),
+    })
 }
 
 enum Untouched {

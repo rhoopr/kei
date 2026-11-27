@@ -59,15 +59,18 @@ pub(crate) async fn plan_zone(
             break;
         };
         after.clone_from(&last.name);
+        // One transaction per batch. Paths chosen earlier in the batch are
+        // not in the state yet, so the batch tracks them itself.
+        let mut taken = HashSet::new();
+        let mut plans = Vec::with_capacity(batch.len());
         for asset in batch {
-            match plan_asset(state, zone, config, &albums, &smart, &asset).await? {
-                Some(wanted) => {
-                    state.apply_plan(zone, &asset.name, wanted).await?;
-                    stats.planned += 1;
-                }
+            match plan_asset(state, zone, config, &albums, &smart, &asset, &mut taken).await? {
+                Some(wanted) => plans.push((asset.name, wanted)),
                 None => stats.waiting += 1,
             }
         }
+        stats.planned += plans.len() as u64;
+        state.apply_plans(zone, plans).await?;
     }
     Ok(stats)
 }
@@ -88,6 +91,7 @@ async fn plan_asset(
     albums: &Albums,
     smart: &[(String, SmartRule)],
     asset: &DirtyAsset,
+    taken: &mut HashSet<String>,
 ) -> anyhow::Result<Option<Vec<WantedFile>>> {
     if asset.purged || asset.sparse {
         return Ok(Some(Vec::new()));
@@ -155,7 +159,6 @@ async fn plan_asset(
 
     let existing = state.files_for_asset(zone, &asset.name).await?;
     let mut claimed = HashSet::new();
-    let mut taken = HashSet::new();
     let mut wanted = Vec::new();
     for placement in placements {
         let files = expected_files(&photo, &placement.config);
@@ -181,7 +184,7 @@ async fn plan_asset(
                     photo.id(),
                     file.rendition,
                     &relative,
-                    &taken,
+                    taken,
                 )
                 .await?
                 {
@@ -198,7 +201,7 @@ async fn plan_asset(
                             asset_id: photo.id(),
                             size_suffix: size_suffix_first(config, file.rendition),
                         },
-                        &taken,
+                        taken,
                     )
                     .await?
                 };

@@ -28,6 +28,7 @@ trap 'rm -f "$log"' EXIT
 
 cargo test --locked --lib --all-features -- "${groups[@]}" --test-threads=2 \
     --skip sync_core::tests::copies_stress \
+    --skip sync_core::tests::bench_ \
     --format pretty --color never --show-output >"$log" 2>&1 || {
     tail -200 "$log" >&2
     exit 1

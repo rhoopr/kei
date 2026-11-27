@@ -36,6 +36,8 @@ struct World {
     pages_served: usize,
     requested_positions: Vec<Option<String>>,
     looked_up: Vec<String>,
+    /// Added to every record lookup, as network latency.
+    lookup_delay: std::time::Duration,
 }
 
 #[derive(Clone)]
@@ -50,6 +52,12 @@ impl PhotosSession for FakeICloud {
         _headers: &[(&str, &str)],
     ) -> anyhow::Result<Value> {
         let body: Value = serde_json::from_str(&body)?;
+        if url.contains("/records/lookup") {
+            let delay = self.0.lock().unwrap().lookup_delay;
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+        }
         let mut world = self.0.lock().unwrap();
         if url.contains("/changes/zone") {
             let zone = body["zones"][0]["zoneID"]["zoneName"]
@@ -292,13 +300,29 @@ impl Harness {
 
     /// Serve `bytes` for a master and return its record.
     async fn master(&self, name: &str, filename: &str, bytes: &[u8]) -> Value {
+        self.master_delayed(name, filename, bytes, std::time::Duration::ZERO)
+            .await
+    }
+
+    /// Like [`Self::master`], with each download taking at least `delay`.
+    async fn master_delayed(
+        &self,
+        name: &str,
+        filename: &str,
+        bytes: &[u8],
+        delay: std::time::Duration,
+    ) -> Value {
         let version = format!("{name}-{}", self.bytes.lock().unwrap().len());
         self.bytes
             .lock()
             .unwrap()
             .insert(version.clone(), bytes.to_vec());
         Mock::given(url_path(format!("/media/{version}")))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(bytes.to_vec())
+                    .set_delay(delay),
+            )
             .mount(&self.server)
             .await;
         let checksum = base64::engine::general_purpose::STANDARD.encode(version.as_bytes());
@@ -923,6 +947,92 @@ async fn copies_stress_one_photo_in_600_albums_finishes_then_reopens_quietly() {
         );
         assert_eq!(sorted_files(&h.photos()), files);
     }
+}
+
+/// Throughput under network latency. Prints the time to list and plan, and
+/// files per second for downloads: 400 photos, each download taking 20 ms
+/// and one in fifty taking 1.5 s like a large video, with 150 ms lookups.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "throughput benchmark; run with --ignored --nocapture"]
+async fn bench_throughput_under_latency() {
+    use std::time::{Duration, Instant};
+    const PHOTOS: usize = 400;
+    let h = Harness::new().await;
+    {
+        let mut world = h.world.0.lock().unwrap();
+        world.page_size = 500;
+        world.lookup_delay = Duration::from_millis(150);
+    }
+    for index in 0..PHOTOS {
+        let delay = if index % 50 == 7 {
+            Duration::from_millis(1500)
+        } else {
+            Duration::from_millis(20)
+        };
+        let master = format!("M{index:04}");
+        let record = h
+            .master_delayed(
+                &master,
+                &format!("IMG_{index:04}.JPG"),
+                &jpeg(&master),
+                delay,
+            )
+            .await;
+        h.push(record);
+        h.push(asset(&format!("A{index:04}"), &master));
+    }
+
+    *h.tweak.lock().unwrap() = Some(|config| {
+        config.concurrency = 10;
+        config.transfer = Transfer::None;
+    });
+    let start = Instant::now();
+    h.run().await;
+    let plan = start.elapsed();
+
+    *h.tweak.lock().unwrap() = Some(|config| config.concurrency = 10);
+    let start = Instant::now();
+    let report = h.run().await;
+    let drain = start.elapsed();
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(report.zones[0].drain.downloaded, PHOTOS as u64);
+    #[expect(clippy::cast_precision_loss, reason = "a small count")]
+    let rate = PHOTOS as f64 / drain.as_secs_f64();
+    eprintln!(
+        "BENCH list+plan={:.2}s downloads={:.2}s files_per_sec={rate:.1} files_per_hour={:.0}",
+        plan.as_secs_f64(),
+        drain.as_secs_f64(),
+        rate * 3600.0
+    );
+}
+
+#[tokio::test]
+async fn photos_with_one_name_planned_together_get_distinct_paths() {
+    let h = Harness::new().await;
+    // Three photos named alike on one day, planned in one batch; two have
+    // the same size, so the size suffix collides too.
+    for (asset_name, master, bytes) in [
+        ("A1", "M1", jpeg("one")),
+        ("A2", "M2", jpeg("two")),
+        ("A3", "M3", jpeg("three")),
+    ] {
+        let record = h.master(master, "IMG_0001.JPG", &bytes).await;
+        h.push(record);
+        h.push(asset(asset_name, master));
+    }
+    let report = h.run().await;
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(report.zones[0].drain.downloaded, 3);
+    let files = sorted_files(&h.photos());
+    assert_eq!(files.len(), 3, "{files:?}");
+    let mut contents: Vec<Vec<u8>> = files.iter().map(|f| h.file(f).unwrap()).collect();
+    contents.sort();
+    let mut expected = vec![jpeg("one"), jpeg("two"), jpeg("three")];
+    expected.sort();
+    assert_eq!(contents, expected);
+    let quiet = h.run().await;
+    assert_eq!(quiet.zones[0].drain, drain::DrainStats::default());
+    assert_eq!(sorted_files(&h.photos()), files);
 }
 
 #[tokio::test]

@@ -771,105 +771,32 @@ impl State {
     /// mark. Existing paths never change. A new version of a done copy
     /// becomes pending with its recorded hash, so it is replaced only if
     /// the local file is untouched. Copies no longer wanted stay on disk.
+    #[cfg(test)]
     pub(crate) async fn apply_plan(
         &self,
         zone: &str,
         asset: &str,
         wanted: Vec<WantedFile>,
     ) -> anyhow::Result<()> {
-        let (zone, asset) = (zone.to_owned(), asset.to_owned());
+        self.apply_plans(zone, vec![(asset.to_owned(), wanted)])
+            .await
+    }
+
+    /// [`Self::apply_plan`] for several assets in one transaction.
+    pub(crate) async fn apply_plans(
+        &self,
+        zone: &str,
+        plans: Vec<(String, Vec<WantedFile>)>,
+    ) -> anyhow::Result<()> {
+        if plans.is_empty() {
+            return Ok(());
+        }
+        let zone = zone.to_owned();
         self.with(move |conn| {
             let tx = conn.transaction()?;
-            // CONTRACT: SYNC_NEVER_DELETES
-            // A copy that is no longer planned only stops being wanted; its
-            // row and its file stay.
-            tx.execute(
-                "UPDATE files SET wanted = 0 WHERE zone = ?1 AND asset = ?2",
-                params![zone, asset],
-            )?;
-            for file in wanted {
-                let existing: Option<(i64, String, String, String)> = match file.row {
-                    Some(id) => Some(tx.query_row(
-                        "SELECT id, checksum, state, rendition FROM files
-                         WHERE id = ?1 AND zone = ?2 AND asset = ?3",
-                        params![id, zone, asset],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                    )?),
-                    None => None,
-                };
-                match existing {
-                    Some((id, checksum, state, rendition)) => {
-                        let state = FileState::parse(&state)?;
-                        // A new version, or another rendition taking over a
-                        // primary-naming slot, makes a saved or adoptable
-                        // copy owed again; a locally modified copy stays as
-                        // it is.
-                        let changed = checksum != file.checksum || rendition != file.rendition;
-                        let next = if !changed || state == FileState::Modified {
-                            state
-                        } else if matches!(state, FileState::Adopt | FileState::Done) {
-                            FileState::Pending
-                        } else {
-                            state
-                        };
-                        tx.execute(
-                            "UPDATE files SET wanted = 1, rendition = ?2, slot = ?3, size = ?4,
-                                 checksum = ?5, state = ?6, meta_dirty = 1,
-                                 attempts = CASE WHEN ?7 THEN 0 ELSE attempts END,
-                                 retry_at = CASE WHEN ?7 THEN NULL ELSE retry_at END
-                             WHERE id = ?1",
-                            params![
-                                id,
-                                file.rendition,
-                                file.slot,
-                                i64::try_from(file.size)?,
-                                file.checksum,
-                                next.as_str(),
-                                changed
-                            ],
-                        )?;
-                    }
-                    None => {
-                        // A carried-over copy keeps its recorded hash: it is
-                        // done if iCloud still serves the same version, and
-                        // replaced only while untouched if it does not.
-                        let (state, sha256) = match &file.imported {
-                            Some(copy) => {
-                                tx.execute("DELETE FROM imported WHERE path = ?1", [&copy.path])?;
-                                match &copy.sha256 {
-                                    None => (FileState::Adopt, None),
-                                    Some(_) if copy.checksum == file.checksum => {
-                                        (FileState::Done, copy.sha256.clone())
-                                    }
-                                    Some(_) => (FileState::Pending, copy.sha256.clone()),
-                                }
-                            }
-                            None if file.adopt => (FileState::Adopt, None),
-                            None => (FileState::Pending, None),
-                        };
-                        tx.execute(
-                            "INSERT INTO files (zone, asset, rendition, album, slot, path, size, checksum, state, sha256, source_sha)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
-                            params![
-                                zone,
-                                asset,
-                                file.rendition,
-                                file.album,
-                                file.slot,
-                                file.path,
-                                i64::try_from(file.size)?,
-                                file.checksum,
-                                state.as_str(),
-                                sha256
-                            ],
-                        )?;
-                    }
-                }
+            for (asset, wanted) in plans {
+                apply_one(&tx, &zone, &asset, wanted)?;
             }
-            tx.execute(
-                "UPDATE assets SET dirty = 0 WHERE zone = ?1 AND name = ?2",
-                params![zone, asset],
-            )?;
             tx.commit()?;
             Ok(())
         })
@@ -1590,6 +1517,106 @@ fn file_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<anyhow::Result<FileRow>
             slot: row.get(12)?,
         })
     })())
+}
+
+/// Apply one asset's wanted copies inside `tx`; see [`State::apply_plan`].
+fn apply_one(
+    tx: &rusqlite::Transaction<'_>,
+    zone: &str,
+    asset: &str,
+    wanted: Vec<WantedFile>,
+) -> anyhow::Result<()> {
+    // CONTRACT: SYNC_NEVER_DELETES
+    // A copy that is no longer planned only stops being wanted; its
+    // row and its file stay.
+    tx.execute(
+        "UPDATE files SET wanted = 0 WHERE zone = ?1 AND asset = ?2",
+        params![zone, asset],
+    )?;
+    for file in wanted {
+        let existing: Option<(i64, String, String, String)> = match file.row {
+            Some(id) => Some(tx.query_row(
+                "SELECT id, checksum, state, rendition FROM files
+                 WHERE id = ?1 AND zone = ?2 AND asset = ?3",
+                params![id, zone, asset],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?),
+            None => None,
+        };
+        match existing {
+            Some((id, checksum, state, rendition)) => {
+                let state = FileState::parse(&state)?;
+                // A new version, or another rendition taking over a
+                // primary-naming slot, makes a saved or adoptable
+                // copy owed again; a locally modified copy stays as
+                // it is.
+                let changed = checksum != file.checksum || rendition != file.rendition;
+                let next = if !changed || state == FileState::Modified {
+                    state
+                } else if matches!(state, FileState::Adopt | FileState::Done) {
+                    FileState::Pending
+                } else {
+                    state
+                };
+                tx.execute(
+                    "UPDATE files SET wanted = 1, rendition = ?2, slot = ?3, size = ?4,
+                         checksum = ?5, state = ?6, meta_dirty = 1,
+                         attempts = CASE WHEN ?7 THEN 0 ELSE attempts END,
+                         retry_at = CASE WHEN ?7 THEN NULL ELSE retry_at END
+                     WHERE id = ?1",
+                    params![
+                        id,
+                        file.rendition,
+                        file.slot,
+                        i64::try_from(file.size)?,
+                        file.checksum,
+                        next.as_str(),
+                        changed
+                    ],
+                )?;
+            }
+            None => {
+                // A carried-over copy keeps its recorded hash: it is
+                // done if iCloud still serves the same version, and
+                // replaced only while untouched if it does not.
+                let (state, sha256) = match &file.imported {
+                    Some(copy) => {
+                        tx.execute("DELETE FROM imported WHERE path = ?1", [&copy.path])?;
+                        match &copy.sha256 {
+                            None => (FileState::Adopt, None),
+                            Some(_) if copy.checksum == file.checksum => {
+                                (FileState::Done, copy.sha256.clone())
+                            }
+                            Some(_) => (FileState::Pending, copy.sha256.clone()),
+                        }
+                    }
+                    None if file.adopt => (FileState::Adopt, None),
+                    None => (FileState::Pending, None),
+                };
+                tx.execute(
+                    "INSERT INTO files (zone, asset, rendition, album, slot, path, size, checksum, state, sha256, source_sha)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+                    params![
+                        zone,
+                        asset,
+                        file.rendition,
+                        file.album,
+                        file.slot,
+                        file.path,
+                        i64::try_from(file.size)?,
+                        file.checksum,
+                        state.as_str(),
+                        sha256
+                    ],
+                )?;
+            }
+        }
+    }
+    tx.execute(
+        "UPDATE assets SET dirty = 0 WHERE zone = ?1 AND name = ?2",
+        params![zone, asset],
+    )?;
+    Ok(())
 }
 
 /// Seconds before a copy that has failed `attempts` times is tried again.

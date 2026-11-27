@@ -275,6 +275,7 @@ pub(crate) async fn run_cycle(
                 library.zone_name(),
                 &config.directory,
                 settings,
+                config.concurrency,
                 cancel,
             )
             .await

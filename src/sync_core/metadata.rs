@@ -7,6 +7,7 @@
 //! can tell kei's write from a local edit. Nothing here reads or moves a
 //! zone's sync position, and a failure leaves only that copy to retry.
 
+use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::download::core_io;
@@ -48,12 +49,14 @@ pub(crate) async fn prepare(
     Ok(())
 }
 
-/// Run the pass over one zone's copies.
+/// Run the pass over one zone's copies, up to `concurrency` at a time.
+/// Each copy's work touches only its own file and row.
 pub(crate) async fn run_zone(
     state: &State,
     zone: &str,
     directory: &std::path::Path,
     settings: &Settings,
+    concurrency: usize,
     cancel: &CancellationToken,
 ) -> anyhow::Result<MetadataStats> {
     let mut stats = MetadataStats::default();
@@ -68,11 +71,18 @@ pub(crate) async fn run_zone(
             break;
         };
         after = last.id;
-        for row in rows {
-            if cancel.is_cancelled() {
-                break;
+        let mut visits = futures_util::stream::iter(rows)
+            .take_while(|_| std::future::ready(!cancel.is_cancelled()))
+            .map(|row| visit(state, directory, settings, row))
+            .buffer_unordered(concurrency.max(1));
+        while let Some(outcome) = visits.next().await {
+            match outcome? {
+                Visit::Written => stats.written += 1,
+                Visit::Unchanged => stats.unchanged += 1,
+                Visit::Modified => stats.modified += 1,
+                Visit::Failed => stats.failed += 1,
+                Visit::Skipped => {}
             }
-            visit(state, directory, settings, row, &mut stats).await?;
             if progress.due() {
                 tracing::info!(
                     zone,
@@ -88,19 +98,29 @@ pub(crate) async fn run_zone(
     Ok(stats)
 }
 
+/// What visiting one copy did.
+enum Visit {
+    Written,
+    Unchanged,
+    /// Changed locally; left as it is.
+    Modified,
+    Failed,
+    /// Nothing to do yet, such as a missing file or master record.
+    Skipped,
+}
+
 async fn visit(
     state: &State,
     directory: &std::path::Path,
     settings: &Settings,
     mut row: MetadataRow,
-    stats: &mut MetadataStats,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Visit> {
     let path = directory.join(&row.path);
     // Settle an embedded rewrite a crash interrupted before reading bytes.
     core_io::recover_replacement(&path).await?;
     let Some((size, sha256)) = core_io::hash_file(&path).await? else {
         // A missing copy is for `kei reconcile`; check it again later.
-        return Ok(());
+        return Ok(Visit::Skipped);
     };
     if row.pending_sha.as_deref() == Some(sha256.as_str()) {
         // kei published these bytes and stopped before recording them.
@@ -110,18 +130,16 @@ async fn visit(
     }
     if row.sha256.as_deref() != Some(sha256.as_str()) {
         state.mark_modified(row.id).await?;
-        stats.modified += 1;
-        return Ok(());
+        return Ok(Visit::Modified);
     }
     let Some(master) = &row.master_body else {
-        return Ok(());
+        return Ok(Visit::Skipped);
     };
     let asset = match stored_asset(master, &row.asset_body) {
         Ok(asset) => asset,
         Err(error) => {
             tracing::warn!(error = %format!("{error:#}"), "Could not read a stored photo record");
-            stats.failed += 1;
-            return Ok(());
+            return Ok(Visit::Failed);
         }
     };
     let owned: EmbeddedMetadataFields = match row.meta_fields.as_deref() {
@@ -131,8 +149,7 @@ async fn visit(
     let payload = writers::payload(settings, &asset, &row.rendition, &row.albums, owned)?;
     if row.meta_hash.as_deref() == Some(payload.hash.as_str()) {
         state.metadata_written(row.id, &payload.hash, None).await?;
-        stats.unchanged += 1;
-        return Ok(());
+        return Ok(Visit::Unchanged);
     }
 
     let mut written = None;
@@ -161,24 +178,20 @@ async fn visit(
                     Outcome::Written(installed) => written = Some((installed, fields)),
                     Outcome::Changed => {
                         state.mark_modified(row.id).await?;
-                        stats.modified += 1;
-                        return Ok(());
+                        return Ok(Visit::Modified);
                     }
                     Outcome::Unchanged | Outcome::Failed => {
-                        stats.failed += 1;
-                        return Ok(());
+                        return Ok(Visit::Failed);
                     }
                 }
             }
             Outcome::Unchanged => {}
             Outcome::Changed => {
                 state.mark_modified(row.id).await?;
-                stats.modified += 1;
-                return Ok(());
+                return Ok(Visit::Modified);
             }
             Outcome::Failed => {
-                stats.failed += 1;
-                return Ok(());
+                return Ok(Visit::Failed);
             }
         }
     }
@@ -193,8 +206,7 @@ async fn visit(
                     state.set_pending(row.id, &installed, Some(fields)).await?;
                     state.accept_pending(row.id).await?;
                 }
-                stats.failed += 1;
-                return Ok(());
+                return Ok(Visit::Failed);
             }
         }
     }
@@ -202,12 +214,11 @@ async fn visit(
     state
         .metadata_written(row.id, &payload.hash, written)
         .await?;
-    if embedded || sidecar {
-        stats.written += 1;
+    Ok(if embedded || sidecar {
+        Visit::Written
     } else {
-        stats.unchanged += 1;
-    }
-    Ok(())
+        Visit::Unchanged
+    })
 }
 
 fn settings_writes_sidecar(settings: &Settings) -> bool {
