@@ -433,14 +433,15 @@ impl ConfinedPath {
         }
     }
 
-    #[cfg(unix)]
+    // Only Linux replacement recovery works relative to the parent directory.
+    #[cfg(target_os = "linux")]
     pub(crate) fn parent_fd(&self) -> std::os::fd::RawFd {
         use std::os::fd::AsRawFd;
 
         self.parent_dir.as_raw_fd()
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     pub(crate) fn name_cstr(&self) -> &std::ffi::CStr {
         &self.name
     }
