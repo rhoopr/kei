@@ -22,6 +22,7 @@ Read the [v0.30 upgrade checklist](docs/upgrade.md) before opening an existing b
 - A library that iCloud reports as still indexing is listed and downloaded anyway. Queried smart folders such as Screenshots wait, and the library is listed once more after indexing finishes. A library whose indexing state is reported as failed or missing syncs normally, with a warning.
 - Changing the download folder downloads again the copies missing from the new folder. Changing the folder layout or naming applies to new copies; existing copies keep their paths.
 - `kei manifest` now exports one row per local copy, with its album, status and whether it is still selected.
+- `verify` and `reconcile` work without a config file, using the download folder the last sync recorded.
 - `import-existing --dry-run` previews against a copy of the current state, as `sync --dry-run` does, so it reads only the changes since the last listing. It also reports how many copies are already recorded.
 - Rewrote the [upgrade checklist](docs/upgrade.md) and [backup maintenance](docs/backup-maintenance.md) guides for the new engine.
 
