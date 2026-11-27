@@ -46,8 +46,6 @@ mod xmp_fields;
 mod xmp_writer;
 
 #[cfg(test)]
-pub(crate) use embedded::apply_metadata;
-#[cfg(test)]
 #[allow(
     unused_imports,
     reason = "preserve the existing test helper path without the xmp feature"
@@ -65,14 +63,10 @@ pub(in crate::download) use probe::original_orientation_missing;
 pub(crate) use probe::{ExifProbe, probe_exif};
 #[cfg(feature = "xmp")]
 pub(crate) use sidecar::write_sidecar;
-#[cfg(feature = "xmp")]
-pub(super) use sidecar::{ReconciledSidecar, write_reconciled_sidecar};
 #[cfg(feature = "__fuzz_internals")]
 pub(crate) use source_gps::fuzz_tiff_source_gps;
 #[cfg(feature = "xmp")]
 pub(crate) use source_gps::read_source_gps;
-#[cfg(feature = "xmp")]
-pub(super) use source_gps::read_source_gps_from_file;
 #[cfg(feature = "xmp")]
 pub(crate) use values::SourceGpsMetadata;
 #[allow(

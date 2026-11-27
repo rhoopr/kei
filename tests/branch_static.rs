@@ -657,7 +657,6 @@ fn focused_scenario_catalog_lists_every_runner_slice() {
 fn config_reconciliation_scenario_pins_transition_seed_tests() {
     let scenario = repo_file("scripts/test-scenarios/config-reconciliation.sh");
     let required = [
-        "local_reconciliation_copy_preserves_source_and_refuses_conflict",
         "plans_keep_paths_and_replace_only_through_pending",
         "the_date_range_limits_which_photos_are_saved",
     ];

@@ -162,6 +162,15 @@ async fn publish(
         )
         .unwrap_or(usize::MAX),
         failed: usize::try_from(report.completeness.failed).unwrap_or(usize::MAX),
+        bytes_downloaded: report.zones.iter().map(|zone| zone.drain.bytes).sum(),
+        exif_failures: usize::try_from(
+            report
+                .zones
+                .iter()
+                .map(|zone| zone.metadata.failed)
+                .sum::<u64>(),
+        )
+        .unwrap_or(usize::MAX),
         elapsed_secs: elapsed.as_secs_f64(),
         interrupted,
         full_enumeration_reason: if report.zones.iter().any(|zone| zone.position_reset) {
@@ -367,6 +376,16 @@ fn core_config(config: &Config, retry: RetryConfig) -> CoreConfig {
             .download
             .bandwidth_limit
             .map(crate::download::BandwidthLimiter::new),
+        metadata: crate::download::metadata_pass::Settings::from_config(
+            &config.metadata,
+            if config.runtime.repair_capture_timestamps {
+                crate::download::CaptureTimestampRepair::ReplaceWithCaptureLocal
+            } else {
+                crate::download::CaptureTimestampRepair::Preserve
+            },
+            &config.download.temp_suffix,
+        ),
+        refresh_metadata: config.runtime.refresh_metadata,
     }
 }
 
@@ -384,6 +403,17 @@ fn log_report(report: &CycleReport) {
             locally_modified = zone.drain.modified,
             "Library synced"
         );
+        let m = zone.metadata;
+        if m != super::metadata::MetadataStats::default() {
+            tracing::info!(
+                zone = %zone.zone,
+                written = m.written,
+                unchanged = m.unchanged,
+                locally_modified = m.modified,
+                failed = m.failed,
+                "Metadata updated"
+            );
+        }
     }
     if report.unselected_shared > 0 {
         tracing::warn!(

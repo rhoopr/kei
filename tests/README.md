@@ -83,7 +83,7 @@ full set with `just test scenarios`.
 | `fulltest-harness` | Full-test phase reachability and rejection of stale or empty scenario filters | `just` dispatch, full-test orchestration, or scenario-runner helpers |
 | `identity-deltas` | Change-feed observations, masters, memberships, Shared Library stand-ins and smart folders | CloudKit change parsing, membership, or planning inputs |
 | `path-family` | Collision suffixes, icloudpd layouts and adoption of existing files | Path rendering, collision handling, import matching, or on-disk adoption |
-| `pending-recovery` | Interrupted listings, rejected positions, the position-with-records rule and confirmed damage | Sync positions, owed copies, or replacement |
+| `pending-recovery` | Interrupted listings, rejected positions, the position-with-records rule, confirmed damage and publication receipts | Sync positions, owed copies, or replacement |
 | `service-health` | Health and metrics facts exposed by unattended operation | Health checks, metrics, cycle reporting, or service monitoring |
 | `state-upgrade` | Upgrade from a previous release's state, ownership refusal and cleanup | The upgrade, account binding, or state access |
 | `url-refresh` | Fresh URLs from lookups and one refresh of an expired URL | Downloads, lookups, or URL freshness |
@@ -91,6 +91,8 @@ full set with `just test scenarios`.
 ## Sync core acceptance tests
 
 `cargo test --lib sync_core::` drives whole cycles of the sync engine. `src/sync_core/tests.rs` serves a fake zone change feed, record lookups and smart-folder queries through `PhotosSession`, and file bytes from a local HTTP server. Each run opens the real state file again, so restart behavior is part of every test. Tests check files on disk, state rows and quiet later cycles: a first full listing, a new photo that needs only its own work, resuming an interrupted listing, a rejected sync position, an expired URL, replacement only of untouched files, stable album paths, departed copies that stay, photos waiting for their master, adoption of existing files, Shared Library stand-ins, smart folders, date ranges, the upgrade from a previous release's state and confirmed damage.
+
+`metadata_pass` checks the opt-in metadata pass: embedded writes after download that later cycles leave alone until iCloud changes the photo, sidecars with album names, locally edited copies left untouched, and kei's own bytes recognised after a crash between publication and recording. `a_replacement_published_before_a_crash_is_not_downloaded_again` checks the same receipt for downloads.
 
 `icloudpd_layout` stages libraries with icloudpd's own fixture names and sizes and runs the adopt-only cycle `import-existing` uses. A divergence from icloudpd's layout leaves a copy owed. Collisions under the default policy get `<stem>-<size><ext>` first, as icloudpd and earlier kei did.
 

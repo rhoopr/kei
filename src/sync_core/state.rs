@@ -13,7 +13,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::icloud::photos::feed::Observation;
 
-pub(crate) const SCHEMA_VERSION: i64 = 1;
+pub(crate) const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS kv (
@@ -89,9 +89,17 @@ CREATE TABLE IF NOT EXISTS files (
     wanted INTEGER NOT NULL DEFAULT 1,
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
+    pending_sha TEXT,
+    pending_fields TEXT,
+    source_sha TEXT,
+    meta_dirty INTEGER NOT NULL DEFAULT 1,
+    meta_hash TEXT,
+    meta_fields TEXT,
     UNIQUE (zone, asset, rendition, album)
 ) STRICT;
 CREATE INDEX IF NOT EXISTS files_by_state ON files (state) WHERE wanted = 1;
+CREATE INDEX IF NOT EXISTS files_meta_dirty ON files (zone, id)
+    WHERE meta_dirty = 1 AND state = 'done' AND wanted = 1;
 CREATE TABLE IF NOT EXISTS imported (
     path TEXT PRIMARY KEY,
     zone TEXT NOT NULL,
@@ -167,6 +175,28 @@ pub(crate) struct FileRow {
     pub(crate) sha256: Option<String>,
     pub(crate) state: FileState,
     pub(crate) attempts: i64,
+    /// Bytes kei was about to publish at this path when it last stopped.
+    pub(crate) pending_sha: Option<String>,
+}
+
+/// A saved copy whose metadata the metadata pass checks.
+#[derive(Debug, Clone)]
+pub(crate) struct MetadataRow {
+    pub(crate) id: i64,
+    pub(crate) asset: String,
+    pub(crate) rendition: String,
+    pub(crate) path: String,
+    pub(crate) sha256: Option<String>,
+    pub(crate) pending_sha: Option<String>,
+    /// The bytes kei downloaded, before any metadata write.
+    pub(crate) source_sha: Option<String>,
+    pub(crate) meta_hash: Option<String>,
+    /// JSON of the embedded fields kei owns in this file.
+    pub(crate) meta_fields: Option<String>,
+    pub(crate) asset_body: String,
+    pub(crate) master_body: Option<String>,
+    /// Titles of the albums the photo is in.
+    pub(crate) albums: Vec<String>,
 }
 
 /// A copy the planner wants for one asset.
@@ -277,6 +307,22 @@ impl State {
             version <= SCHEMA_VERSION,
             "Sync state was written by a newer kei (schema {version})"
         );
+        if version == 1 {
+            // Schema 2 adds publication receipts and metadata bookkeeping.
+            let tx = conn.unchecked_transaction()?;
+            for column in [
+                "pending_sha TEXT",
+                "pending_fields TEXT",
+                "source_sha TEXT",
+                "meta_dirty INTEGER NOT NULL DEFAULT 1",
+                "meta_hash TEXT",
+                "meta_fields TEXT",
+            ] {
+                tx.execute_batch(&format!("ALTER TABLE files ADD COLUMN {column}"))?;
+            }
+            tx.execute("UPDATE files SET source_sha = sha256", [])?;
+            tx.commit()?;
+        }
         conn.execute_batch(SCHEMA)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Self {
@@ -704,7 +750,8 @@ impl State {
                             state
                         };
                         tx.execute(
-                            "UPDATE files SET wanted = 1, size = ?2, checksum = ?3, state = ?4
+                            "UPDATE files SET wanted = 1, size = ?2, checksum = ?3, state = ?4,
+                                 meta_dirty = 1
                              WHERE id = ?1",
                             params![id, i64::try_from(file.size)?, file.checksum, next.as_str()],
                         )?;
@@ -728,8 +775,8 @@ impl State {
                             None => (FileState::Pending, None),
                         };
                         tx.execute(
-                            "INSERT INTO files (zone, asset, rendition, album, path, size, checksum, state, sha256)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                            "INSERT INTO files (zone, asset, rendition, album, path, size, checksum, state, sha256, source_sha)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
                             params![
                                 zone,
                                 asset,
@@ -798,7 +845,10 @@ impl State {
         let sha256 = sha256.to_owned();
         self.with(move |conn| {
             conn.execute(
-                "UPDATE files SET state = 'done', sha256 = ?2, last_error = NULL WHERE id = ?1",
+                "UPDATE files SET state = 'done', sha256 = ?2, source_sha = ?2, last_error = NULL,
+                     pending_sha = NULL, pending_fields = NULL,
+                     meta_dirty = 1, meta_hash = NULL, meta_fields = NULL
+                 WHERE id = ?1",
                 params![id, sha256],
             )?;
             Ok(())
@@ -1254,6 +1304,149 @@ impl State {
         .await
     }
 
+    /// Record the bytes kei is about to publish over this copy, and the
+    /// embedded fields they carry, so a restart can tell kei's own write
+    /// from a local edit.
+    pub(crate) async fn set_pending(
+        &self,
+        id: i64,
+        sha256: &str,
+        fields: Option<String>,
+    ) -> anyhow::Result<()> {
+        let sha256 = sha256.to_owned();
+        self.with(move |conn| {
+            conn.execute(
+                "UPDATE files SET pending_sha = ?2, pending_fields = ?3 WHERE id = ?1",
+                params![id, sha256, fields],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// The file holds the bytes kei was publishing when it stopped: take
+    /// them as the copy's recorded bytes.
+    pub(crate) async fn accept_pending(&self, id: i64) -> anyhow::Result<()> {
+        self.with(move |conn| {
+            conn.execute(
+                "UPDATE files SET sha256 = pending_sha,
+                     source_sha = CASE WHEN pending_fields IS NULL THEN pending_sha ELSE source_sha END,
+                     meta_fields = pending_fields, meta_hash = NULL, meta_dirty = 1,
+                     state = 'done', last_error = NULL, pending_sha = NULL, pending_fields = NULL
+                 WHERE id = ?1 AND pending_sha IS NOT NULL",
+                [id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Saved copies whose metadata may be stale, in id order after `after`.
+    pub(crate) async fn metadata_work(
+        &self,
+        zone: &str,
+        after: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MetadataRow>> {
+        let zone = zone.to_owned();
+        self.with(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT f.id, f.asset, f.rendition, f.path, f.sha256, f.pending_sha, f.source_sha,
+                        f.meta_hash, f.meta_fields, a.body, m.body
+                 FROM files f
+                 JOIN assets a ON a.zone = f.zone AND a.name = f.asset
+                 LEFT JOIN masters m ON m.zone = a.zone AND m.name = a.master
+                 WHERE f.zone = ?1 AND f.id > ?2 AND f.meta_dirty = 1
+                   AND f.state = 'done' AND f.wanted = 1
+                 ORDER BY f.id LIMIT ?3",
+            )?;
+            let mut rows = stmt
+                .query_map(params![zone, after, i64::try_from(limit)?], |row| {
+                    Ok(MetadataRow {
+                        id: row.get(0)?,
+                        asset: row.get(1)?,
+                        rendition: row.get(2)?,
+                        path: row.get(3)?,
+                        sha256: row.get(4)?,
+                        pending_sha: row.get(5)?,
+                        source_sha: row.get(6)?,
+                        meta_hash: row.get(7)?,
+                        meta_fields: row.get(8)?,
+                        asset_body: row.get(9)?,
+                        master_body: row.get(10)?,
+                        albums: Vec::new(),
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut albums = conn.prepare(
+                "SELECT DISTINCT al.title FROM memberships ms
+                 JOIN albums al ON al.zone = ms.zone AND al.name = ms.album
+                 WHERE ms.zone = ?1 AND ms.asset = ?2 AND ms.present = 1
+                   AND al.deleted = 0 AND al.title IS NOT NULL
+                 ORDER BY al.title",
+            )?;
+            for row in &mut rows {
+                row.albums = albums
+                    .query_map(params![zone, row.asset], |r| r.get(0))?
+                    .collect::<Result<Vec<String>, _>>()?;
+            }
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Metadata for this copy now matches `hash`; record what kei wrote.
+    pub(crate) async fn metadata_written(
+        &self,
+        id: i64,
+        hash: &str,
+        written: Option<(String, String)>,
+    ) -> anyhow::Result<()> {
+        let hash = hash.to_owned();
+        self.with(move |conn| {
+            match written {
+                Some((sha256, fields)) => conn.execute(
+                    "UPDATE files SET meta_dirty = 0, meta_hash = ?2, sha256 = ?3, meta_fields = ?4,
+                         pending_sha = NULL, pending_fields = NULL
+                     WHERE id = ?1",
+                    params![id, hash, sha256, fields],
+                )?,
+                None => conn.execute(
+                    "UPDATE files SET meta_dirty = 0, meta_hash = ?2 WHERE id = ?1",
+                    params![id, hash],
+                )?,
+            };
+            Ok(())
+        })
+        .await
+    }
+
+    /// JSON of the embedded fields kei owns in this copy.
+    pub(crate) async fn meta_fields(&self, id: i64) -> anyhow::Result<Option<String>> {
+        self.with(move |conn| {
+            Ok(conn
+                .query_row("SELECT meta_fields FROM files WHERE id = ?1", [id], |row| {
+                    row.get(0)
+                })
+                .optional()?
+                .flatten())
+        })
+        .await
+    }
+
+    /// Check every saved copy's metadata again on the next pass.
+    pub(crate) async fn mark_all_metadata_dirty(&self, forget_written: bool) -> anyhow::Result<()> {
+        self.with(move |conn| {
+            if forget_written {
+                conn.execute("UPDATE files SET meta_dirty = 1, meta_hash = NULL", [])?;
+            } else {
+                conn.execute("UPDATE files SET meta_dirty = 1", [])?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
     /// Owe a done copy again, replacing it only while it still has `sha256`.
     pub(crate) async fn owe_again(&self, id: i64, sha256: Option<&str>) -> anyhow::Result<()> {
         let sha256 = sha256.map(ToOwned::to_owned);
@@ -1268,7 +1461,7 @@ impl State {
     }
 }
 
-const FILE_COLUMNS: &str = "SELECT id, zone, asset, rendition, album, path, size, checksum, sha256, state, attempts FROM files";
+const FILE_COLUMNS: &str = "SELECT id, zone, asset, rendition, album, path, size, checksum, sha256, state, attempts, pending_sha FROM files";
 
 fn file_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<anyhow::Result<FileRow>> {
     let state: String = row.get(9)?;
@@ -1286,6 +1479,7 @@ fn file_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<anyhow::Result<FileRow>
             sha256: row.get(8)?,
             state: FileState::parse(&state)?,
             attempts: row.get(10)?,
+            pending_sha: row.get(11)?,
         })
     })())
 }
@@ -1430,6 +1624,43 @@ mod tests {
             hidden: false,
             sparse: None,
         }
+    }
+
+    #[tokio::test]
+    async fn schema_one_gains_receipt_and_metadata_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.sync.db");
+        let conn = Connection::open(&path).unwrap();
+        // The files table as schema 1 created it.
+        conn.execute_batch(
+            "CREATE TABLE files (
+                id INTEGER PRIMARY KEY, zone TEXT NOT NULL, asset TEXT NOT NULL,
+                rendition TEXT NOT NULL, album TEXT NOT NULL, path TEXT NOT NULL UNIQUE,
+                size INTEGER NOT NULL, checksum TEXT NOT NULL, sha256 TEXT,
+                state TEXT NOT NULL, wanted INTEGER NOT NULL DEFAULT 1,
+                attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT,
+                UNIQUE (zone, asset, rendition, album)) STRICT;
+             INSERT INTO files (zone, asset, rendition, album, path, size, checksum, sha256, state)
+             VALUES ('Z', 'A', 'original', '', 'a.jpg', 1, 'c', 'abc', 'done');
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        drop(conn);
+        let state = State::open(&path).await.unwrap();
+        let row = state.file_at("a.jpg").await.unwrap().unwrap();
+        assert_eq!(row.sha256.as_deref(), Some("abc"));
+        assert_eq!(row.pending_sha, None);
+        assert_eq!(
+            state
+                .with(|conn| Ok(conn.query_row(
+                    "SELECT source_sha, meta_dirty FROM files",
+                    [],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                )?))
+                .await
+                .unwrap(),
+            ("abc".to_owned(), 1)
+        );
     }
 
     #[tokio::test]

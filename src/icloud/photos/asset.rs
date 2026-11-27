@@ -134,10 +134,6 @@ impl SparseShareEvidence {
 /// `DownloadTask`, deferred state writes) can share the same allocation via
 /// refcount bumps instead of re-cloning IDs at every stage boundary.
 #[derive(Debug, Clone)]
-#[allow(
-    dead_code,
-    reason = "metadata writers wait for the opt-in metadata pass; it removes this allow"
-)]
 pub struct PhotoAsset {
     // Heap types first
     record_name: Arc<str>,
@@ -151,11 +147,8 @@ pub struct PhotoAsset {
     asset_metadata: Arc<AssetMetadata>,
     rendition_facts: Arc<[(VersionSizeKey, RenditionMetadata)]>,
     versions: VersionsMap,
-    malformed_resources: Arc<[MalformedResource]>,
     // f64 primitives
     asset_date_ms: Option<f64>,
-    added_date_ms: Option<f64>,
-    adjusted_still_modified: Option<DateTime<Utc>>,
     // Small enum (1 byte)
     item_type_val: Option<AssetItemType>,
 }
@@ -431,23 +424,7 @@ fn is_test_loopback_host(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "::1" | "[::1]" | "localhost")
 }
 
-#[allow(
-    dead_code,
-    reason = "metadata writers wait for the opt-in metadata pass; it removes this allow"
-)]
 impl PhotoAsset {
-    /// Only a current adjusted still sourced from CPLAsset has proven edit time.
-    /// Original, alternative and video resource clocks remain unknown.
-    pub(crate) fn media_modified_at(&self, version: VersionSizeKey) -> Option<DateTime<Utc>> {
-        (version == VersionSizeKey::Adjusted
-            && self.versions.iter().any(|(key, resource)| {
-                *key == AssetVersionSize::Adjusted
-                    && item_type_from_str(&resource.asset_type) == Some(AssetItemType::Image)
-            }))
-        .then_some(self.adjusted_still_modified)
-        .flatten()
-    }
-
     /// Project the selected provider rendition. Unsupported keys retain
     /// shared fields but have no known dimensions or duration.
     #[must_use]
@@ -465,34 +442,6 @@ impl PhotoAsset {
         Arc::new(metadata)
     }
 
-    /// All supported resource facts, independent of downloadable URLs.
-    pub fn rendition_facts(&self) -> &[(VersionSizeKey, RenditionMetadata)] {
-        &self.rendition_facts
-    }
-
-    /// Shared asset fields; rendition projections replace all measurements.
-    #[must_use]
-    pub fn shared_metadata_arc(&self) -> Arc<AssetMetadata> {
-        Arc::clone(&self.asset_metadata)
-    }
-
-    /// Provider date evidence without the display/path fallback to the epoch.
-    pub(crate) fn added_date_evidence(&self) -> Option<DateTime<Utc>> {
-        self.added_date_ms.and_then(f64_to_millis_datetime)
-    }
-
-    pub fn added_date(&self) -> DateTime<Utc> {
-        self.added_date_evidence()
-            .unwrap_or_else(|| {
-                tracing::warn!(asset_id = %self.record_name, "Missing or invalid addedDate, falling back to epoch");
-                DateTime::UNIX_EPOCH
-            })
-    }
-
-    pub(crate) fn malformed_resources(&self) -> &[MalformedResource] {
-        &self.malformed_resources
-    }
-
     /// Construct from raw JSON values (used by tests).
     #[cfg(test)]
     pub fn new(master_record: Value, asset_record: Value) -> Self {
@@ -502,12 +451,7 @@ impl PhotoAsset {
         let filename = decode_filename(&master_fields).map(String::into_boxed_str);
         let item_type_val = Some(resolve_item_type(&master_fields, filename.as_deref()));
         let asset_date_ms = asset_fields["assetDate"]["value"].as_f64();
-        let added_date_ms = asset_fields["addedDate"]["value"].as_f64();
-        let adjusted_still_modified = (item_type_val != Some(AssetItemType::Movie)
-            && asset_fields.get("resJPEGFullRes").is_some())
-        .then(|| enc::decode_adjustment_timestamp(&asset_fields))
-        .flatten();
-        let (versions, malformed_resources) = extract_versions_with(
+        let (versions, _malformed) = extract_versions_with(
             item_type_val,
             &master_fields,
             &asset_fields,
@@ -531,10 +475,7 @@ impl PhotoAsset {
             rendition_facts,
             item_type_val,
             asset_date_ms,
-            added_date_ms,
-            adjusted_still_modified,
             versions,
-            malformed_resources: Arc::from(malformed_resources.into_boxed_slice()),
         }
     }
 
@@ -574,12 +515,7 @@ impl PhotoAsset {
             .get("assetDate")
             .and_then(|f| f.get("value"))
             .and_then(Value::as_f64);
-        let added_date_ms = asset
-            .fields
-            .get("addedDate")
-            .and_then(|f| f.get("value"))
-            .and_then(Value::as_f64);
-        let (versions, malformed_resources) = extract_versions_with(
+        let (versions, _malformed) = extract_versions_with(
             item_type_val,
             &master.fields,
             &asset.fields,
@@ -589,24 +525,17 @@ impl PhotoAsset {
         let asset_metadata = Arc::new(metadata::extract(&master.fields, &asset.fields));
         let rendition_facts =
             metadata::extract_renditions(item_type_val, &master.fields, &asset.fields);
-        let adjusted_still_modified = (item_type_val != Some(AssetItemType::Movie)
-            && asset.fields.get("resJPEGFullRes").is_some())
-        .then(|| enc::decode_adjustment_timestamp(&asset.fields))
-        .flatten();
         Self {
             record_name: Arc::from(master.record_name),
             asset_record_name: Arc::from(asset.record_name.as_str()),
             state_record_name: None,
             source_zone,
             filename,
-            adjusted_still_modified,
             asset_metadata,
             rendition_facts,
             item_type_val,
             asset_date_ms,
-            added_date_ms,
             versions,
-            malformed_resources: Arc::from(malformed_resources.into_boxed_slice()),
         }
     }
 
@@ -791,327 +720,6 @@ mod tests {
         PhotoAsset::new(master, asset)
     }
 
-    fn rendition_assets(master_fields: Value, asset_fields: Value) -> [PhotoAsset; 2] {
-        let master = json!({
-            "recordName": "master", "recordType": "CPLMaster", "fields": master_fields,
-        });
-        let asset = json!({
-            "recordName": "asset", "recordType": "CPLAsset", "fields": asset_fields,
-        });
-        [
-            PhotoAsset::new(master.clone(), asset.clone()),
-            PhotoAsset::from_records(
-                serde_json::from_value(master).unwrap(),
-                &serde_json::from_value(asset).unwrap(),
-            ),
-        ]
-    }
-
-    #[test]
-    fn media_edit_time_is_only_asset_owned_adjusted_still() {
-        use base64::Engine as _;
-        let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        let mut bytes = Vec::new();
-        plist::Value::Date(time.into())
-            .to_writer_binary(&mut bytes)
-            .unwrap();
-        let resource = json!({"value":{"size":10,"downloadURL":"https://p01.icloud-content.com/edit.jpg","fileChecksum":"edited"}});
-        let fields = json!({
-            "resJPEGFullRes":resource,
-            "resJPEGFullFileType":{"value":"public.jpeg"},
-            "adjustmentTimestampEnc":{"type":"ENCRYPTED_BYTES","value":base64::engine::general_purpose::STANDARD.encode(bytes)}
-        });
-        for asset in rendition_assets(json!({"itemType":{"value":"public.jpeg"}}), fields.clone()) {
-            assert_eq!(
-                asset.media_modified_at(VersionSizeKey::Adjusted),
-                Some(time.into())
-            );
-            for key in [
-                VersionSizeKey::Original,
-                VersionSizeKey::Alternative,
-                VersionSizeKey::LiveAdjusted,
-                VersionSizeKey::LiveOriginal,
-            ] {
-                assert_eq!(asset.media_modified_at(key), None);
-            }
-        }
-        for asset in rendition_assets(fields.clone(), json!({})) {
-            assert_eq!(asset.media_modified_at(VersionSizeKey::Adjusted), None);
-        }
-        for asset in rendition_assets(json!({"itemType":{"value":"public.mpeg-4"}}), fields) {
-            assert_eq!(asset.media_modified_at(VersionSizeKey::Adjusted), None);
-        }
-    }
-
-    #[test]
-    fn rendition_metadata_live_photo_dimensions_and_duration_without_urls() {
-        for asset in rendition_assets(
-            json!({
-                "itemType": {"value": "public.heic"},
-                "resOriginalWidth": {"value": 5712},
-                "resOriginalHeight": {"value": 4284},
-                "resOriginalVidComplWidth": {"value": 1744},
-                "resOriginalVidComplHeight": {"value": 1308},
-            }),
-            json!({
-                "duration": {"value": 0},
-                "vidComplDurValue": {"type": "INT64", "value": 2300000000_u64},
-                "vidComplDurScale": {"type": "INT64", "value": 1000000000},
-                "isFavorite": {"value": 1},
-                "captionEnc": {"type": "STRING", "value": "Live Photo"},
-            }),
-        ) {
-            assert!(asset.versions().is_empty());
-            assert_eq!(asset.rendition_facts().len(), PHOTO_VERSION_LOOKUP.len());
-            let cloned = asset.clone();
-            assert!(Arc::ptr_eq(&asset.rendition_facts, &cloned.rendition_facts));
-            assert!(Arc::ptr_eq(
-                &asset.shared_metadata_arc(),
-                &cloned.shared_metadata_arc()
-            ));
-            let original = asset.metadata_arc(VersionSizeKey::Original);
-            assert_eq!((original.width, original.height), (Some(5712), Some(4284)));
-            assert_eq!(original.duration_secs, Some(0.0));
-            assert_eq!(original.metadata_hash, asset.metadata().metadata_hash);
-            let live = asset.metadata_arc(VersionSizeKey::LiveOriginal);
-            assert_eq!((live.width, live.height), (Some(1744), Some(1308)));
-            assert_eq!(live.duration_secs, Some(2.3));
-            assert_ne!(original.metadata_hash, live.metadata_hash);
-            let raw: Value = serde_json::from_str(live.provider_data.as_ref().unwrap()).unwrap();
-            assert_eq!(raw["vidComplDurValue"]["value"], 2300000000_u64);
-            assert_eq!(raw["vidComplDurScale"]["value"], 1000000000);
-            for (key, _) in asset.rendition_facts() {
-                let metadata = asset.metadata_arc(*key);
-                assert!(metadata.is_favorite);
-                assert_eq!(metadata.title.as_deref(), Some("Live Photo"));
-                assert_eq!(metadata.provider_data, original.provider_data);
-                assert_eq!(metadata.metadata_hash, Some(metadata.compute_hash()));
-                assert!(!Arc::ptr_eq(&metadata, &asset.metadata_arc(*key)));
-            }
-            for key in [
-                VersionSizeKey::LiveMedium,
-                VersionSizeKey::LiveThumb,
-                VersionSizeKey::LiveAdjusted,
-            ] {
-                let metadata = asset.metadata_arc(key);
-                assert_eq!((metadata.width, metadata.height), (None, None));
-                assert_eq!(metadata.duration_secs, Some(2.3));
-            }
-        }
-    }
-
-    #[test]
-    fn rendition_metadata_uses_exact_photo_and_video_prefixes_and_resource_provenance() {
-        let photo = [
-            (VersionSizeKey::Original, "resOriginal"),
-            (VersionSizeKey::Alternative, "resOriginalAlt"),
-            (VersionSizeKey::Adjusted, "resJPEGFull"),
-            (VersionSizeKey::Medium, "resJPEGMed"),
-            (VersionSizeKey::Thumb, "resJPEGThumb"),
-            (VersionSizeKey::LiveOriginal, "resOriginalVidCompl"),
-            (VersionSizeKey::LiveAdjusted, "resVidCompl"),
-            (VersionSizeKey::LiveMedium, "resVidMed"),
-            (VersionSizeKey::LiveThumb, "resVidSmall"),
-        ];
-        let video = [
-            (VersionSizeKey::Original, "resOriginal"),
-            (VersionSizeKey::Adjusted, "resVidFull"),
-            (VersionSizeKey::Medium, "resVidMed"),
-            (VersionSizeKey::Thumb, "resVidSmall"),
-        ];
-        for (item_type, mappings) in [
-            ("public.heic", photo.as_slice()),
-            ("com.apple.quicktime-movie", video.as_slice()),
-        ] {
-            for (index, (key, prefix)) in mappings.iter().enumerate() {
-                let width = u32::try_from(index).unwrap() + 100;
-                let height = width + 10;
-                let resource = json!({"value": {
-                    "size": 1000, "fileChecksum": "checksum",
-                    "downloadURL": "https://p01.icloud-content.com/rendition",
-                }});
-                for source in [
-                    "absent",
-                    "historical",
-                    "master",
-                    "asset",
-                    "no_url",
-                    "malformed",
-                    "blank_checksum",
-                ] {
-                    let mut master = json!({"itemType": {"value": item_type}});
-                    let mut asset_fields = json!({"duration": {"value": 12.5}});
-                    master[format!("{prefix}Width")] = json!({"value": width});
-                    master[format!("{prefix}Height")] = json!({"value": height});
-                    if source != "historical" {
-                        asset_fields[format!("{prefix}Width")] = json!({"value": width + 1000});
-                        asset_fields[format!("{prefix}Height")] = json!({"value": height + 1000});
-                    }
-                    if !matches!(source, "absent" | "historical") {
-                        master[format!("{prefix}Res")] = resource.clone();
-                        master[format!("{prefix}FileType")] = json!({"value": item_type});
-                    }
-                    if matches!(source, "asset" | "no_url" | "malformed" | "blank_checksum") {
-                        asset_fields[format!("{prefix}Res")] = match source {
-                            "asset" => {
-                                let mut selected = resource.clone();
-                                selected["value"]["fileChecksum"] = json!("asset-checksum");
-                                selected
-                            }
-                            "no_url" => {
-                                json!({"value": {"size": 1000, "fileChecksum": "asset-checksum"}})
-                            }
-                            "blank_checksum" => json!({"value": {"fileChecksum": " \t"}}),
-                            _ => json!({"value": null}),
-                        };
-                        asset_fields[format!("{prefix}FileType")] = json!({"value": item_type});
-                    }
-                    for asset in rendition_assets(master, asset_fields) {
-                        assert_eq!(asset.rendition_facts().len(), mappings.len());
-                        let cloned = asset.clone();
-                        assert!(Arc::ptr_eq(&asset.rendition_facts, &cloned.rendition_facts));
-                        let facts = &asset
-                            .rendition_facts()
-                            .iter()
-                            .find(|(k, _)| k == key)
-                            .unwrap()
-                            .1;
-                        let cloned_facts = facts.clone();
-                        assert_eq!(&cloned_facts, facts);
-                        if let Some(checksum) = &facts.checksum {
-                            assert!(Arc::ptr_eq(
-                                checksum,
-                                cloned_facts.checksum.as_ref().unwrap()
-                            ));
-                        }
-                        assert_eq!(
-                            facts.checksum.as_deref(),
-                            match source {
-                                "master" => Some("checksum"),
-                                "asset" | "no_url" => Some("asset-checksum"),
-                                _ => None,
-                            }
-                        );
-                        let metadata = asset.metadata_arc(*key);
-                        let offset = if matches!(source, "master" | "historical") {
-                            0
-                        } else {
-                            1000
-                        };
-                        assert_eq!(metadata.width, Some(width + offset), "{prefix}: {source}");
-                        assert_eq!(metadata.height, Some(height + offset), "{prefix}: {source}");
-                        assert_eq!(
-                            asset.versions().len(),
-                            usize::from(matches!(source, "master" | "asset"))
-                        );
-                        if item_type == "com.apple.quicktime-movie" {
-                            assert_eq!(metadata.duration_secs, Some(12.5));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn rendition_metadata_rejects_missing_and_invalid_dimensions_without_cross_record_fallback() {
-        for value in [
-            json!(null),
-            json!(0),
-            json!(-1),
-            json!(1.5),
-            json!("1744"),
-            json!(4294967296_u64),
-        ] {
-            for asset in rendition_assets(
-                json!({
-                    "itemType": {"value": "public.heic"},
-                    "resOriginalWidth": {"value": 5712},
-                    "resOriginalHeight": {"value": 4284},
-                    "resOriginalVidComplWidth": {"value": 1744},
-                    "resOriginalVidComplHeight": {"value": 1308},
-                }),
-                json!({
-                    "resOriginalVidComplRes": {"value": {}},
-                    "resOriginalVidComplWidth": {"value": value},
-                }),
-            ) {
-                let live = asset.metadata_arc(VersionSizeKey::LiveOriginal);
-                assert_eq!((live.width, live.height), (None, None));
-                assert_eq!(live.duration_secs, None);
-            }
-        }
-    }
-
-    #[test]
-    fn rendition_metadata_validates_companion_duration_without_asset_or_master_fallback() {
-        for (value, scale, expected) in [
-            (json!(null), json!(1000), None),
-            (json!(2300), json!(null), None),
-            (json!(2300), json!(0), None),
-            (json!(2300), json!(-1000), None),
-            (json!(-2300), json!(1000), None),
-            (json!("2300"), json!(1000), None),
-            (json!(2300), json!("1000"), None),
-            (json!(true), json!(1000), None),
-            (json!(2300), json!({}), None),
-            (json!(1e308), json!(1e-308), None),
-            (json!(0), json!(1000), Some(0.0)),
-            (json!(2300), json!(1000), Some(2.3)),
-        ] {
-            let mut fields = json!({"duration": {"value": 99}});
-            if !value.is_null() {
-                fields["vidComplDurValue"] = json!({"value": value});
-            }
-            if !scale.is_null() {
-                fields["vidComplDurScale"] = json!({"value": scale});
-            }
-            for asset in rendition_assets(
-                json!({
-                    "itemType": {"value": "public.heic"},
-                    "vidComplDurValue": {"value": 2300},
-                    "vidComplDurScale": {"value": 1000},
-                }),
-                fields,
-            ) {
-                for key in [
-                    VersionSizeKey::LiveOriginal,
-                    VersionSizeKey::LiveMedium,
-                    VersionSizeKey::LiveThumb,
-                    VersionSizeKey::LiveAdjusted,
-                ] {
-                    assert_eq!(asset.metadata_arc(key).duration_secs, expected);
-                }
-                assert_eq!(asset.metadata().duration_secs, Some(99.0));
-                assert_eq!(
-                    asset.metadata_arc(VersionSizeKey::Original).duration_secs,
-                    Some(99.0)
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn rendition_metadata_unsupported_key_does_not_inherit_original_measurements() {
-        for asset in rendition_assets(
-            json!({
-                "itemType": {"value": "com.apple.quicktime-movie"},
-                "resOriginalWidth": {"value": 1920},
-                "resOriginalHeight": {"value": 1080},
-            }),
-            json!({"duration": {"value": 12.5}, "isFavorite": {"value": 1}}),
-        ) {
-            let metadata = asset.metadata_arc(VersionSizeKey::LiveOriginal);
-            assert_eq!(
-                (metadata.width, metadata.height, metadata.duration_secs),
-                (None, None, None)
-            );
-            assert!(metadata.is_favorite);
-            assert_eq!(metadata.metadata_hash, Some(metadata.compute_hash()));
-            assert_eq!(asset.rendition_facts().len(), VIDEO_VERSION_LOOKUP.len());
-        }
-    }
-
     #[test]
     fn test_id_present() {
         let asset = make_asset(json!({"recordName": "ABC123"}), json!({}));
@@ -1122,69 +730,6 @@ mod tests {
     fn test_id_missing() {
         let asset = make_asset(json!({}), json!({}));
         assert_eq!(asset.id(), "");
-    }
-
-    #[test]
-    fn test_filename_string_type() {
-        let asset = make_asset(
-            json!({"fields": {"filenameEnc": {"value": "photo.jpg", "type": "STRING"}}}),
-            json!({}),
-        );
-        assert_eq!(asset.filename(), Some("photo.jpg"));
-    }
-
-    #[test]
-    fn test_filename_encrypted_bytes() {
-        use base64::Engine;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(b"test.png");
-        let asset = make_asset(
-            json!({"fields": {"filenameEnc": {"value": encoded, "type": "ENCRYPTED_BYTES"}}}),
-            json!({}),
-        );
-        assert_eq!(asset.filename(), Some("test.png"));
-    }
-
-    #[test]
-    fn test_filename_missing() {
-        let asset = make_asset(json!({"fields": {}}), json!({}));
-        assert_eq!(asset.filename(), None);
-    }
-
-    /// A `filenameEnc` value that decodes to the empty string must
-    /// yield `None`, not `Some("")`. Production routes filename-less assets
-    /// through the fingerprint fallback; an empty string would slip past
-    /// the `is_some()` check downstream and produce paths like
-    /// `2026-04-19/` (a directory) or `.JPG` (a hidden file). Pin both
-    /// the STRING and ENCRYPTED_BYTES variants — they hit the same
-    /// post-decode early-return.
-    #[test]
-    fn empty_filename_string_rejected_at_deser() {
-        let asset = make_asset(
-            json!({"fields": {"filenameEnc": {"value": "", "type": "STRING"}}}),
-            json!({}),
-        );
-        assert_eq!(
-            asset.filename(),
-            None,
-            "empty STRING filename must be treated as missing"
-        );
-    }
-
-    #[test]
-    fn empty_filename_encrypted_bytes_rejected_at_deser() {
-        use base64::Engine;
-        // Base64 of the empty string is the empty string.
-        let encoded = base64::engine::general_purpose::STANDARD.encode(b"");
-        assert_eq!(encoded, "");
-        let asset = make_asset(
-            json!({"fields": {"filenameEnc": {"value": encoded, "type": "ENCRYPTED_BYTES"}}}),
-            json!({}),
-        );
-        assert_eq!(
-            asset.filename(),
-            None,
-            "empty ENCRYPTED_BYTES filename must be treated as missing"
-        );
     }
 
     #[test]
@@ -1673,41 +1218,6 @@ mod tests {
     }
 
     #[test]
-    fn from_records_null_master_fields_partial_data() {
-        use super::super::cloudkit::Record;
-
-        // Master record where fields has null values for everything except recordName
-        let master = Record {
-            record_name: "M_PARTIAL".to_string(),
-            record_type: "CPLMaster".to_string(),
-            fields: json!({
-                "filenameEnc": null,
-                "itemType": null,
-                "resOriginalRes": null
-            }),
-            deleted: None,
-        };
-        let asset_rec = Record {
-            record_name: "A_PARTIAL".to_string(),
-            record_type: "CPLAsset".to_string(),
-            fields: json!({
-                "assetDate": null,
-                "addedDate": null
-            }),
-            deleted: None,
-        };
-
-        let asset = PhotoAsset::from_records(master, &asset_rec);
-        assert_eq!(asset.id(), "M_PARTIAL");
-        assert_eq!(asset.filename(), None);
-        assert!(asset.versions().is_empty());
-        // Missing assetDate falls back to epoch
-        assert_eq!(asset.asset_date(), DateTime::UNIX_EPOCH);
-        assert_eq!(asset.added_date(), DateTime::UNIX_EPOCH);
-        assert_eq!(asset.added_date_evidence(), None);
-    }
-
-    #[test]
     fn test_is_live_photo_true() {
         let asset = make_asset(
             json!({
@@ -1730,24 +1240,6 @@ mod tests {
             json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
         );
         assert!(asset.is_live_photo());
-    }
-
-    #[test]
-    fn test_is_live_photo_false_no_companion() {
-        let asset = make_asset(
-            json!({
-                "recordName": "PHOTO_1",
-                "fields": {
-                    "itemType": {"value": "public.jpeg"},
-                    "resOriginalRes": {"value": {
-                        "size": 1000, "downloadURL": "https://p01.icloud-content.com/jpg",
-                        "fileChecksum": "jpg_ck"
-                    }}
-                }
-            }),
-            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
-        );
-        assert!(!asset.is_live_photo());
     }
 
     #[test]
@@ -1832,77 +1324,9 @@ mod tests {
 
     // ── Gap: asset with null resOriginalRes value ────────────────────
 
-    #[test]
-    fn extract_versions_null_res_value_produces_empty_map() {
-        let asset = make_asset(
-            json!({"fields": {
-                "itemType": {"value": "public.jpeg"},
-                "resOriginalRes": {"value": null},
-                "resOriginalFileType": {"value": "public.jpeg"}
-            }}),
-            json!({"fields": {}}),
-        );
-        assert!(
-            asset.versions().is_empty(),
-            "null resOriginalRes value should produce empty versions"
-        );
-        assert_eq!(asset.malformed_resources().len(), 1);
-        assert_eq!(
-            asset.malformed_resources()[0].field.as_ref(),
-            "resOriginalRes"
-        );
-    }
-
     // ── Gap: asset with missing size skips the version ───────────────
 
-    #[test]
-    fn extract_versions_missing_size_skips_version() {
-        let asset = make_asset(
-            json!({"fields": {
-                "itemType": {"value": "public.jpeg"},
-                "resOriginalRes": {"value": {
-                    "downloadURL": "https://p01.icloud-content.com/orig",
-                    "fileChecksum": "abc123"
-                }},
-                "resOriginalFileType": {"value": "public.jpeg"}
-            }}),
-            json!({"fields": {}}),
-        );
-        // A size-less version cannot be reliably downloaded or verified.
-        // Skip it so a 0-byte placeholder doesn't poison downstream decisions.
-        assert!(
-            asset.versions().is_empty(),
-            "version with missing size should be skipped"
-        );
-        assert_eq!(
-            asset.malformed_resources()[0].field.as_ref(),
-            "resOriginalRes.size"
-        );
-    }
-
     // ── Gap: asset with empty string downloadURL ─────────────────────
-
-    #[test]
-    fn extract_versions_empty_download_url_is_rejected() {
-        // An empty-but-present URL is a CloudKit shape we cannot safely
-        // download from; the version is skipped.
-        let asset = make_asset(
-            json!({"fields": {
-                "itemType": {"value": "public.jpeg"},
-                "resOriginalRes": {"value": {
-                    "size": 100,
-                    "downloadURL": "",
-                    "fileChecksum": "ck_empty_url"
-                }},
-                "resOriginalFileType": {"value": "public.jpeg"}
-            }}),
-            json!({"fields": {}}),
-        );
-        assert!(
-            asset.versions().is_empty(),
-            "empty URL should cause the version to be skipped"
-        );
-    }
 
     #[test]
     fn extract_versions_non_https_url_is_rejected() {

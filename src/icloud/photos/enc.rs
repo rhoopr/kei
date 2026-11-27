@@ -15,24 +15,6 @@ use base64::Engine;
 use plist::Value as PlistValue;
 use serde_json::Value;
 
-/// Photos adjustment time is a plist Date, not CloudKit record modification time.
-/// Unknown encodings and dates outside the observed historical range stay unknown.
-pub(super) fn decode_adjustment_timestamp(fields: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
-    let entry = fields.get("adjustmentTimestampEnc")?;
-    if entry.get("value")?.as_str()?.len() > 1024 {
-        return None;
-    }
-    let bytes = decoded_bytes(entry)?;
-    let value = PlistValue::from_reader(Cursor::new(&bytes)).ok()?;
-    let date = value.as_date()?;
-    let time = std::time::SystemTime::from(date);
-    if time < std::time::UNIX_EPOCH || time > std::time::SystemTime::now() {
-        return None;
-    }
-    let date = chrono::DateTime::<chrono::Utc>::from(time);
-    (date >= chrono::DateTime::UNIX_EPOCH && date <= chrono::Utc::now()).then_some(date)
-}
-
 /// Read the `value` string from a `fieldEnc` JSON entry.
 ///
 /// Accepts both Apple variants: `type: "STRING"` (plain UTF-8 text in
@@ -207,52 +189,6 @@ mod tests {
         let mut out = Vec::new();
         plist::to_writer_binary(&mut out, &value).unwrap();
         out
-    }
-
-    #[test]
-    fn adjustment_time_accepts_only_bounded_plist_dates() {
-        let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        let field = |value| json!({"adjustmentTimestampEnc":{"type":"ENCRYPTED_BYTES","value":b64(&bplist_from(value))}});
-        assert_eq!(
-            decode_adjustment_timestamp(&field(PlistValue::Date(time.into()))),
-            Some(time.into())
-        );
-        for value in [
-            PlistValue::String("1700000000".into()),
-            PlistValue::Integer(1_700_000_000_i64.into()),
-            PlistValue::Date((std::time::UNIX_EPOCH - std::time::Duration::from_secs(1)).into()),
-            PlistValue::Date(
-                (std::time::SystemTime::now() + std::time::Duration::from_secs(86400)).into(),
-            ),
-        ] {
-            assert_eq!(decode_adjustment_timestamp(&field(value)), None);
-        }
-        for fields in [
-            json!({}),
-            json!({"adjustmentTimestampEnc":{"value":"not-base64"}}),
-            json!({"adjustmentTimestampEnc":{"type":"ENCRYPTED_BYTES","value":b64(b"opaque")}}),
-        ] {
-            assert_eq!(decode_adjustment_timestamp(&fields), None);
-        }
-    }
-
-    #[test]
-    fn decode_string_string_type() {
-        let fields = json!({
-            "captionEnc": {"value": "hello", "type": "STRING"}
-        });
-        assert_eq!(decode_string(&fields, "captionEnc"), Some("hello".into()));
-    }
-
-    #[test]
-    fn decode_string_encrypted_bytes() {
-        let fields = json!({
-            "captionEnc": {"value": b64(b"a caption"), "type": "ENCRYPTED_BYTES"}
-        });
-        assert_eq!(
-            decode_string(&fields, "captionEnc"),
-            Some("a caption".into())
-        );
     }
 
     #[test]

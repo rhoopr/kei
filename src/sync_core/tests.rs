@@ -225,6 +225,8 @@ impl Harness {
             },
             transfer: Transfer::All,
             bandwidth: None,
+            metadata: None,
+            refresh_metadata: false,
         };
         if let Some(tweak) = *self.tweak.lock().unwrap() {
             tweak(&mut config);
@@ -1236,4 +1238,182 @@ mod icloudpd_layout {
         stage(&h, "2018/IMG_Y2.JPG", 200_000);
         adopts_all(&h, yearly, 2).await;
     }
+}
+
+/// The opt-in metadata pass runs after downloads and only on copies that
+/// still hold the bytes kei recorded.
+#[cfg(feature = "xmp")]
+mod metadata_pass {
+    use super::*;
+    use crate::download::metadata_pass::{CaptureTimestampRepair, MetadataFlags, Settings};
+    use crate::sync_core::state::FileState;
+
+    /// SOI + APP0 JFIF + EOI: a JPEG the XMP toolkit can write into.
+    fn small_jpeg() -> Vec<u8> {
+        vec![
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00,
+            0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
+        ]
+    }
+
+    fn rating(config: &mut CoreConfig) {
+        config.metadata = Some(Settings {
+            flags: MetadataFlags::RATING | MetadataFlags::DATETIME,
+            repair: CaptureTimestampRepair::Preserve,
+            temp_suffix: ".kei-part".into(),
+        });
+    }
+
+    fn favorite(name: &str, master: &str, on: bool) -> Value {
+        let mut record = asset(name, master);
+        record["fields"]["isFavorite"] = json!({"value": i64::from(on)});
+        record
+    }
+
+    async fn recorded(h: &Harness, path: &str) -> (Option<String>, FileState) {
+        let row = h.state().await.file_at(path).await.unwrap().unwrap();
+        (row.sha256, row.state)
+    }
+
+    #[tokio::test]
+    async fn metadata_is_written_after_download_then_stays_quiet_until_icloud_changes() {
+        let h = Harness::new().await;
+        *h.tweak.lock().unwrap() = Some(rating);
+        let m1 = h.master("M1", "IMG_0001.JPG", &small_jpeg()).await;
+        h.push(m1);
+        h.push(favorite("A1", "M1", true));
+
+        let first = h.run().await;
+        assert!(first.complete(), "{first:?}");
+        assert_eq!(first.zones[0].drain.downloaded, 1);
+        assert_eq!(first.zones[0].metadata.written, 1, "{first:?}");
+        let bytes = h.file("2023/IMG_0001.JPG").unwrap();
+        assert_ne!(bytes, small_jpeg(), "the rating was embedded");
+        // kei's own rewrite is the recorded copy, not a local edit.
+        assert_eq!(
+            recorded(&h, "2023/IMG_0001.JPG").await,
+            (Some(sha256_hex(&bytes)), FileState::Done)
+        );
+
+        let quiet = h.run().await;
+        assert_eq!(quiet.zones[0].metadata, Default::default());
+        assert_eq!(quiet.zones[0].drain.downloaded, 0);
+        assert_eq!(h.file("2023/IMG_0001.JPG").unwrap(), bytes);
+
+        // A change in iCloud reaches the file without a download.
+        h.push(favorite("A1", "M1", false));
+        let changed = h.run().await;
+        assert!(changed.complete(), "{changed:?}");
+        assert_eq!(changed.zones[0].drain.downloaded, 0);
+        assert_eq!(changed.zones[0].metadata.written, 1, "{changed:?}");
+        let rewritten = h.file("2023/IMG_0001.JPG").unwrap();
+        assert_ne!(rewritten, bytes);
+        assert_eq!(
+            recorded(&h, "2023/IMG_0001.JPG").await,
+            (Some(sha256_hex(&rewritten)), FileState::Done)
+        );
+    }
+
+    fn sidecar(config: &mut CoreConfig) {
+        config.metadata = Some(Settings {
+            flags: MetadataFlags::XMP_SIDECAR | MetadataFlags::INCLUDE_ALBUMS,
+            repair: CaptureTimestampRepair::Preserve,
+            temp_suffix: ".kei-part".into(),
+        });
+    }
+
+    #[tokio::test]
+    async fn a_sidecar_carries_album_names_and_the_media_is_untouched() {
+        let h = Harness::new().await;
+        *h.tweak.lock().unwrap() = Some(sidecar);
+        h.push(album("AL", "Trip"));
+        let m1 = h.master("M1", "IMG_0001.JPG", &small_jpeg()).await;
+        h.push(m1);
+        h.push(favorite("A1", "M1", true));
+        h.push(member("A1", "AL"));
+
+        let report = h.run().await;
+        assert!(report.complete(), "{report:?}");
+        assert_eq!(report.zones[0].metadata.written, 1, "{report:?}");
+        assert_eq!(h.file("Trip/IMG_0001.JPG").unwrap(), small_jpeg());
+        let xmp = String::from_utf8(h.file("Trip/IMG_0001.JPG.xmp").unwrap()).unwrap();
+        assert!(xmp.contains("Trip"), "{xmp}");
+        let quiet = h.run().await;
+        assert_eq!(quiet.zones[0].metadata, Default::default());
+    }
+
+    #[tokio::test]
+    async fn a_locally_edited_copy_gets_no_metadata() {
+        let h = Harness::new().await;
+        let m1 = h.master("M1", "IMG_0001.JPG", &small_jpeg()).await;
+        h.push(m1);
+        h.push(favorite("A1", "M1", true));
+        h.run().await;
+        let edited = [small_jpeg(), b"edited".to_vec()].concat();
+        std::fs::write(h.photos().join("2023/IMG_0001.JPG"), &edited).unwrap();
+
+        *h.tweak.lock().unwrap() = Some(rating);
+        let report = h.run().await;
+        assert_eq!(report.zones[0].metadata.modified, 1, "{report:?}");
+        assert_eq!(report.completeness.modified, 1);
+        assert_eq!(h.file("2023/IMG_0001.JPG").unwrap(), edited);
+    }
+
+    #[tokio::test]
+    async fn kei_bytes_published_before_a_crash_are_not_taken_for_an_edit() {
+        let h = Harness::new().await;
+        let m1 = h.master("M1", "IMG_0001.JPG", &small_jpeg()).await;
+        h.push(m1);
+        h.push(favorite("A1", "M1", true));
+        h.run().await;
+        // A metadata rewrite was published, then kei stopped before recording it.
+        let published = [small_jpeg(), b"kei-written".to_vec()].concat();
+        let state = h.state().await;
+        let row = state.file_at("2023/IMG_0001.JPG").await.unwrap().unwrap();
+        state
+            .set_pending(row.id, &sha256_hex(&published), Some("{}".into()))
+            .await
+            .unwrap();
+        drop(state);
+        std::fs::write(h.photos().join("2023/IMG_0001.JPG"), &published).unwrap();
+
+        *h.tweak.lock().unwrap() = Some(rating);
+        let report = h.run().await;
+        assert_eq!(report.zones[0].metadata.modified, 0, "{report:?}");
+        assert_eq!(report.completeness.modified, 0);
+        let (sha, state) = recorded(&h, "2023/IMG_0001.JPG").await;
+        assert_eq!(state, FileState::Done);
+        assert_eq!(sha, Some(sha256_hex(&h.file("2023/IMG_0001.JPG").unwrap())));
+    }
+}
+
+#[tokio::test]
+async fn a_replacement_published_before_a_crash_is_not_downloaded_again() {
+    let h = Harness::new().await;
+    library_with_album(&h).await;
+    h.run().await;
+    let m1 = h.master("M1", "IMG_0001.JPG", &jpeg("one v2")).await;
+    h.push(m1);
+    // The new version landed, then kei stopped before recording it.
+    let state = h.state().await;
+    let row = state.file_at("2023/IMG_0001.JPG").await.unwrap().unwrap();
+    state
+        .set_pending(row.id, &sha256_hex(&jpeg("one v2")), None)
+        .await
+        .unwrap();
+    drop(state);
+    std::fs::write(h.photos().join("2023/IMG_0001.JPG"), jpeg("one v2")).unwrap();
+
+    let report = h.run().await;
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(report.completeness.modified, 0);
+    assert_eq!(h.file("2023/IMG_0001.JPG").unwrap(), jpeg("one v2"));
+    let row = h
+        .state()
+        .await
+        .file_at("2023/IMG_0001.JPG")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.sha256, Some(sha256_hex(&jpeg("one v2"))));
 }

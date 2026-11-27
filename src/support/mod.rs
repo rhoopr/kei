@@ -328,18 +328,10 @@ pub(crate) fn download_error_fields(
 }
 
 /// Record a metadata-writing event. Paths stay out of support history.
-#[allow(
-    dead_code,
-    reason = "metadata writers wait for the opt-in metadata pass; it removes this allow"
-)]
 pub(crate) fn observe_metadata(_path: &Path, kind: &'static str, fields: Value) {
     observe(kind, fields);
 }
 
-#[allow(
-    dead_code,
-    reason = "metadata writers wait for the opt-in metadata pass; it removes this allow"
-)]
 pub(crate) fn metadata_error(
     path: &Path,
     stage: &'static str,

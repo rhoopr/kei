@@ -6,6 +6,7 @@
 
 pub(crate) mod access;
 pub(crate) mod drain;
+pub(crate) mod metadata;
 pub(crate) mod plan;
 pub(crate) mod runner;
 pub(crate) mod state;
@@ -47,6 +48,10 @@ pub(crate) struct CoreConfig {
     pub(crate) transfer: Transfer,
     /// One shared byte budget for every download, when a limit is set.
     pub(crate) bandwidth: Option<crate::download::BandwidthLimiter>,
+    /// Metadata to write after downloads; `None` when none is enabled.
+    pub(crate) metadata: Option<crate::download::metadata_pass::Settings>,
+    /// Plan every saved copy's metadata again this cycle.
+    pub(crate) refresh_metadata: bool,
 }
 
 /// Which owed copies a cycle works on.
@@ -102,6 +107,7 @@ pub(crate) struct ZoneReport {
     pub(crate) full_listing: bool,
     pub(crate) plan: plan::PlanStats,
     pub(crate) drain: drain::DrainStats,
+    pub(crate) metadata: metadata::MetadataStats,
     /// Why observation stopped early, if it did.
     pub(crate) error: Option<String>,
 }
@@ -190,6 +196,34 @@ pub(crate) async fn run_cycle(
                 zone_report
                     .error
                     .get_or_insert_with(|| format!("{error:#}"));
+            }
+        }
+    }
+
+    // Metadata comes after every download and never touches a position.
+    if let Some(settings) = &config.metadata
+        && config.transfer == Transfer::All
+        && !cancel.is_cancelled()
+    {
+        metadata::prepare(state, settings, config.refresh_metadata).await?;
+        for (library, zone_report) in libraries.iter().zip(report.zones.iter_mut()) {
+            if cancel.is_cancelled() {
+                break;
+            }
+            match metadata::run_zone(
+                state,
+                library.zone_name(),
+                &config.directory,
+                settings,
+                cancel,
+            )
+            .await
+            {
+                Ok(stats) => zone_report.metadata = stats,
+                Err(error) => {
+                    tracing::warn!(zone = %zone_report.zone, error = %format!("{error:#}"), "Metadata writes stopped early; they are retried next cycle");
+                    zone_report.metadata.failed += 1;
+                }
             }
         }
     }

@@ -84,8 +84,13 @@ pub(crate) struct Fetch<'a> {
 }
 
 /// Download one copy, verify it, publish it and sync its parent directory.
-/// Returns the published bytes' SHA-256 as lowercase hex.
-pub(crate) async fn fetch(request: Fetch<'_>) -> Result<String, FetchError> {
+/// Returns the published bytes' SHA-256 and the bytes transferred. Before replacing
+/// an existing copy, `before_replace` receives the verified bytes' SHA-256
+/// so the caller can record them first.
+pub(crate) async fn fetch(
+    request: Fetch<'_>,
+    before_replace: impl AsyncFnOnce(&str) -> anyhow::Result<()>,
+) -> Result<Fetched, FetchError> {
     let publication = match request.replace {
         Some(recorded) => FinalPublication::ReplaceLocal {
             fingerprint: ExistingFileFingerprint {
@@ -127,6 +132,10 @@ pub(crate) async fn fetch(request: Fetch<'_>) -> Result<String, FetchError> {
         .set_times(file_times(request.modified))
         .await
         .map_err(FetchError::Failed)?;
+    let sha256 = hex(&fingerprint.sha256);
+    if request.replace.is_some() {
+        before_replace(&sha256).await.map_err(FetchError::Failed)?;
+    }
     // Installed and identical-existing bytes both leave exactly the verified
     // content at the path; the recorded hash is the same either way.
     let _installed_or_identical = downloaded
@@ -136,7 +145,19 @@ pub(crate) async fn fetch(request: Fetch<'_>) -> Result<String, FetchError> {
     crate::fs_util::fsync_parent_dir_async(request.path)
         .await
         .map_err(|error| FetchError::Failed(error.into()))?;
-    Ok(hex(&fingerprint.sha256))
+    Ok(Fetched {
+        sha256,
+        bytes: downloaded.bytes_written,
+    })
+}
+
+/// A copy `fetch` saved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Fetched {
+    /// The saved bytes' SHA-256, lowercase hex.
+    pub(crate) sha256: String,
+    /// Bytes this attempt transferred; a resumed download counts only the rest.
+    pub(crate) bytes: u64,
 }
 
 /// Finish or undo a replacement at `path` that a crash interrupted, so its
@@ -175,7 +196,7 @@ pub(crate) fn parse_sha256(value: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-fn hex(bytes: &[u8; 32]) -> String {
+pub(crate) fn hex(bytes: &[u8; 32]) -> String {
     use std::fmt::Write;
     bytes
         .iter()

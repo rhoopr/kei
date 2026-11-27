@@ -27,7 +27,7 @@ The state lives in `<account>.sync.db` next to the account's old state file.
 | `albums` | Album ID, current name, parent, whether it is a folder, deleted, and the folder fixed at first use. |
 | `memberships` | One row per album relation: album, asset, present or departed. |
 | `smart_members` | Members of the queried smart folders, replaced each cycle. |
-| `files` | One row per local copy: asset, rendition, album or unfiled, relative path, iCloud checksum and size, recorded SHA-256, state (pending, adopt, done, failed, modified), whether it is still wanted, attempts and last error. |
+| `files` | One row per local copy: asset, rendition, album or unfiled, relative path, iCloud checksum and size, recorded SHA-256, state (pending, adopt, done, failed, modified), whether it is still wanted, attempts and last error. A receipt holds the bytes kei is about to publish over the copy, so a restart can tell kei's own replacement or metadata write from a local edit. Metadata bookkeeping: the downloaded bytes' SHA-256, whether metadata needs a check, the last payload hash, and the embedded fields kei owns. |
 | `runs` | One row per cycle for status and reports. |
 | `kv` | Small settings: the bound account and the planning config fingerprint. |
 
@@ -40,7 +40,7 @@ Existing account-owner, temp-file ownership and migration-backup behavior is kep
 1. **Observe.** Read `changes/zone` pages from the saved position. Without one, `changes/zone` enumerates the whole zone, so a full listing uses the same path. When iCloud rejects the saved position, the zone forgets it and lists again in the same cycle. Each page is parsed in `src/icloud/photos/feed.rs`, then its records and the position after it are committed together. A page that fails validation stops that zone's observation and leaves the old position; owed downloads still run.
 2. **Plan.** Once a zone has finished a full listing, compute the wanted copies of each marked asset from `assets`, `memberships`, the selection and the date range, and upsert `files`. A path is chosen once and stored. On a collision, the default file-match policy tries `<stem>-<size><ext>` first, as icloudpd and earlier kei did, then the asset ID, then numbered asset-ID suffixes; Live Photo videos and `name-id7` start at the asset ID. A file already at a new copy's path with the expected size is adopted after hashing; anything else there is left alone. An asset whose master or album is not known yet stays marked. A config change marks every asset; it never forgets the sync position.
 3. **Download.** Drain owed `files` in batches. Each batch looks up its current records for download URLs, then downloads with bounded concurrency through the existing publication path: `.part`, size and content checks, no-overwrite publish, parent-directory fsync, then the SHA-256 is recorded. A URL iCloud refuses gets one fresh lookup in the same cycle. Failures stay owed. Replacing a copy first settles any replacement a crash interrupted at that path. The configured bandwidth limit is one budget shared by every download.
-4. **Metadata.** If enabled, write metadata for done files whose metadata marker is stale.
+4. **Metadata.** If a writer is enabled, update saved copies whose metadata may be stale; see [metadata write boundaries](architecture/metadata.md).
 5. **Report.** Record the run, completeness and failures, and update the health file, metrics, notifications, the JSON report and support history.
 
 When iCloud refuses the session, the runner signs in again, with the existing attempt limit and the 2FA wait in watch mode, and repeats the cycle from the saved positions. Between watch cycles it releases the session lock and checks the session again on waking.
@@ -109,14 +109,14 @@ The sync core (state, cycle, plan, download driver) stays under 15,000 lines inc
 3. Shared libraries, smart folders, date range.
 4. Upgrade from schema 49: build, validate, switch, first cycle and history cleanup, plus adoption of existing files.
 5. Metadata pass.
-6. Delete the old engine and its tests, and update `docs/architecture.md`. Done; the metadata pass follows.
+6. Delete the old engine and its tests, and update `docs/architecture.md`.
 
 Acceptance tests in `src/sync_core/tests.rs` drive whole cycles against a fake zone feed and a local HTTP server, reopen the state file between runs, and check files on disk, catalog rows and quiet later cycles.
 
 ## Open items
 
-- **Metadata pass.** The writers in `src/download/metadata/` are not wired to the core yet. Until the pass lands, metadata settings are accepted and nothing is written; `--refresh-metadata` runs an ordinary cycle.
 - **Live verification.** A run against a real library needs the owner's machine and credentials.
+- **Previous field ownership.** Copies carried over from a previous release start with no owned embedded fields, so kei does not clear values the old engine wrote.
 - **Missing files.** Normal sync does not re-check that saved copies still exist; `kei reconcile` owes missing ones again.
 - **Sibling naming.** Earlier releases named extra assets of one master with the asset's ID under `name-id7`; the core names them by the master and resolves the collision with a suffix.
 - **Progress display.** The friendly progress bars and album dividers went with the old engine; the core logs a per-library summary.

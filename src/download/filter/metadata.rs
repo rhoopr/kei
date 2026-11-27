@@ -1,7 +1,5 @@
 //! Metadata payloads and preloaded album/people enrichment.
 
-use rustc_hash::FxHashMap;
-
 /// Metadata values surfaced on a `DownloadTask` for write-out to embedded XMP
 /// / native EXIF / XMP sidecars.
 ///
@@ -111,33 +109,4 @@ impl MetadataPayload {
 
 fn is_zero(value: &u8) -> bool {
     *value == 0
-}
-
-/// Index of per-asset album memberships and face-tag names, preloaded from
-/// the state DB at sync start so `filter_asset_to_tasks` can enrich each
-/// task's [`MetadataPayload`] without per-asset DB hits.
-#[derive(Debug, Default)]
-pub(crate) struct AssetGroupings {
-    pub(crate) albums: FxHashMap<String, Vec<String>>,
-    pub(crate) people: FxHashMap<String, Vec<String>>,
-}
-
-impl AssetGroupings {
-    pub(in crate::download) fn metadata_payload(
-        &self,
-        asset_id: &str,
-        metadata: &crate::state::AssetMetadata,
-        flags: (bool, bool),
-    ) -> MetadataPayload {
-        let albums = self.albums.get(asset_id).map(Vec::as_slice).unwrap_or(&[]);
-        let people = self.people.get(asset_id).map(Vec::as_slice).unwrap_or(&[]);
-        let mut payload =
-            MetadataPayload::from_metadata(metadata).with_asset_groupings(albums, people, flags);
-        // An explicit empty snapshot is observed absence. A missing entry is
-        // not evidence that the provider removed previously written people.
-        if self.people.get(asset_id).is_some_and(Vec::is_empty) {
-            payload.observed_absent |= crate::state::types::embedded_absence::PEOPLE;
-        }
-        payload
-    }
 }

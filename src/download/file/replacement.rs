@@ -74,8 +74,6 @@ pub(in crate::download) enum FinalPublication {
     /// Preserve the global no-overwrite contract.
     #[default]
     NoReplace,
-    /// Replace only the exact truncated bytes authorized by retry planning.
-    ReplaceTruncated(ExistingFileFingerprint),
     /// Replace one selected local copy after its byte and time policy was checked.
     ReplaceLocal {
         fingerprint: ExistingFileFingerprint,
@@ -115,6 +113,7 @@ pub(in crate::download) async fn publish_file_if_unchanged(
     }
 }
 
+#[cfg(feature = "xmp")]
 pub(super) async fn replace_file_if_unchanged(
     part_path: &Path,
     final_path: &Path,

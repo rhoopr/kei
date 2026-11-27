@@ -7,11 +7,6 @@ pub(crate) mod enc;
 pub(crate) mod feed;
 mod hydration_progress;
 mod library;
-#[allow(
-    dead_code,
-    unused_imports,
-    reason = "metadata writers wait for the opt-in metadata pass; it removes this allow"
-)]
 pub(crate) mod metadata;
 pub mod queries;
 pub mod session;

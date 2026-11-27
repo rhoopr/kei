@@ -13,14 +13,10 @@
 mod config;
 mod eligibility;
 mod expected_paths;
-#[allow(
-    dead_code,
-    unused_imports,
-    reason = "metadata writers wait for the opt-in metadata pass; it removes this allow"
-)]
 mod metadata;
 mod versions;
 
 pub(crate) use config::PathDerivationConfig;
 pub(crate) use eligibility::is_asset_filtered;
 pub(super) use expected_paths::derive_expected_paths;
+pub(super) use metadata::MetadataPayload;

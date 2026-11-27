@@ -33,11 +33,6 @@ mod commands;
 mod config;
 mod credential;
 mod download;
-#[allow(
-    dead_code,
-    unused_imports,
-    reason = "metadata writers wait for the opt-in metadata pass; it removes this allow"
-)]
 mod fs_util;
 mod health;
 mod icloud;

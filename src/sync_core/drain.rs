@@ -26,6 +26,8 @@ const ROWS_PER_QUERY: usize = 200;
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DrainStats {
     pub(crate) downloaded: u64,
+    /// Bytes transferred by this cycle's downloads.
+    pub(crate) bytes: u64,
     pub(crate) adopted: u64,
     pub(crate) failed: u64,
     pub(crate) modified: u64,
@@ -205,9 +207,15 @@ async fn download_batch(
         }
         let replace = match &row.sha256 {
             None => None,
-            Some(recorded) => match untouched(&path, recorded).await? {
+            Some(recorded) => match untouched(&path, recorded, row.pending_sha.as_deref()).await? {
                 Untouched::Missing => None,
                 Untouched::Same(recorded) => Some(recorded),
+                Untouched::AlreadyReplaced => {
+                    // The replacement finished before kei last stopped.
+                    state.accept_pending(row.id).await?;
+                    stats.downloaded += 1;
+                    continue;
+                }
                 Untouched::Changed => {
                     state.mark_modified(row.id).await?;
                     stats.modified += 1;
@@ -235,19 +243,22 @@ async fn download_batch(
                 {
                     return (row, Err(FetchError::Failed(error.into())));
                 }
-                let result = core_io::fetch(Fetch {
-                    client,
-                    url: &url,
-                    path: &path,
-                    checksum: &row.checksum,
-                    size: row.size,
-                    temp_suffix: &config.temp_suffix,
-                    retry: &config.retry,
-                    replace,
-                    modified: seconds,
-                    cancel,
-                    bandwidth: config.bandwidth.as_ref(),
-                })
+                let result = core_io::fetch(
+                    Fetch {
+                        client,
+                        url: &url,
+                        path: &path,
+                        checksum: &row.checksum,
+                        size: row.size,
+                        temp_suffix: &config.temp_suffix,
+                        retry: &config.retry,
+                        replace,
+                        modified: seconds,
+                        cancel,
+                        bandwidth: config.bandwidth.as_ref(),
+                    },
+                    async |sha256: &str| state.set_pending(row.id, sha256, None).await,
+                )
                 .await;
                 (row, result)
             }
@@ -257,9 +268,10 @@ async fn download_batch(
     let mut expired = Vec::new();
     while let Some((row, result)) = results.next().await {
         match result {
-            Ok(sha256) => {
-                state.mark_done(row.id, &sha256).await?;
+            Ok(fetched) => {
+                state.mark_done(row.id, &fetched.sha256).await?;
                 stats.downloaded += 1;
+                stats.bytes += fetched.bytes;
             }
             Err(FetchError::Expired) => expired.push(row),
             Err(FetchError::Interrupted) => {}
@@ -276,6 +288,8 @@ async fn download_batch(
 enum Untouched {
     Missing,
     Same(Recorded),
+    /// The file holds the bytes kei recorded just before replacing it.
+    AlreadyReplaced,
     Changed,
 }
 
@@ -283,7 +297,11 @@ enum Untouched {
 // CONTRACT: REPLACE_REQUIRES_RECORDED_BYTES
 // A copy is replaced only while its bytes still hash to what kei recorded;
 // anything else is kept and reported as locally modified.
-async fn untouched(path: &Path, recorded: &str) -> anyhow::Result<Untouched> {
+async fn untouched(
+    path: &Path,
+    recorded: &str,
+    pending: Option<&str>,
+) -> anyhow::Result<Untouched> {
     let Some(expected) = core_io::parse_sha256(recorded) else {
         return Ok(Untouched::Changed);
     };
@@ -293,6 +311,7 @@ async fn untouched(path: &Path, recorded: &str) -> anyhow::Result<Untouched> {
             size,
             sha256: expected,
         }),
+        Some((_, sha256)) if pending == Some(sha256.as_str()) => Untouched::AlreadyReplaced,
         Some(_) => Untouched::Changed,
     })
 }
@@ -324,6 +343,7 @@ mod tests {
             sha256: None,
             state: FileState::Pending,
             attempts: 0,
+            pending_sha: None,
         }
     }
 

@@ -121,6 +121,8 @@ pub(crate) async fn run_import_existing(
             crate::sync_core::Transfer::AdoptOnly
         },
         bandwidth: None,
+        metadata: None,
+        refresh_metadata: false,
     };
     let client = shared_session.read().await.download_client().clone();
     let report =

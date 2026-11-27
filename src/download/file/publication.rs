@@ -7,7 +7,7 @@ use tokio::fs;
 
 use super::fingerprint::fingerprint_regular_file;
 use super::platform::{PublishResult, publish_part_no_replace};
-use super::replacement::{FinalPublication, replace_file_if_unchanged};
+use super::replacement::FinalPublication;
 
 #[derive(Debug, thiserror::Error)]
 #[error(
@@ -43,11 +43,6 @@ pub(in crate::download) async fn publish_part_to_final(
     final_path: &Path,
     publication: FinalPublication,
 ) -> anyhow::Result<PublicationOutcome> {
-    if let FinalPublication::ReplaceTruncated(expected) = publication {
-        return replace_file_if_unchanged(part_path, final_path, expected)
-            .await
-            .map(|()| PublicationOutcome::Installed);
-    }
     if let FinalPublication::ReplaceLocal {
         fingerprint,
         modified,

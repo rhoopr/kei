@@ -14,7 +14,7 @@ kei syncs iCloud Photos media and metadata to local storage. Use this map to fin
 | Which local copies should exist, and where? | `src/sync_core/plan.rs`, `src/download/filter/` | Planning derives paths with the shared path rules. Chosen paths are stable and never move. |
 | Can this file be published, adopted or replaced? | `src/sync_core/drain.rs`, `src/download/core_io.rs`, `src/download/file/` | Downloads are verified before publication. Replacement needs the bytes kei recorded. Import adopts only verified matches. |
 | How does a previous release's state become this one? | `src/sync_core/upgrade.rs`, `src/sync_core/access.rs`, `src/state/db/account.rs` | The old file is read without changes, verified copies are carried over, and the old file is removed only after a complete cycle. |
-| Can metadata change? | `src/download/metadata/` | Writers run only when enabled and must preserve concurrent edits. |
+| Can metadata change? | `src/sync_core/metadata.rs`, `src/download/metadata_pass/`, `src/download/metadata/` | The pass runs only when a writer is enabled, on copies that still hold kei's recorded bytes. Writers preserve concurrent edits. |
 | What can an operator observe? | `src/commands/status.rs`, `src/report.rs`, `src/metrics.rs`, `src/support/` | Reports project recorded state. Counters and diagnostic labels cannot grant publication authority. |
 
 ## Main flows
@@ -29,7 +29,7 @@ kei syncs iCloud Photos media and metadata to local storage. Use this map to fin
 
 **Upgrade.** A previous release's state file is opened read-only and its ownership checked. Verified copies inside the download directory are imported into a scratch file, which is integrity-checked and renamed into place. Planning takes over a carried-over copy at the same path or in the same folder when its size matches. After the first cycle in which every zone listed to the end without error, the old file, its SQLite companions and its schema backups are removed.
 
-**Metadata.** Metadata writing is opt-in and runs separately from downloads. It never affects a sync position or download completion. See [metadata write boundaries](architecture/metadata.md).
+**Metadata.** Metadata writing is opt-in. After downloads, the pass updates saved copies whose metadata may be stale, but only while they still hold the bytes kei recorded. An embedded write records its output as kei's bytes, with a receipt written first so a restart can tell it from a local edit. It never affects a sync position or download completion. See [metadata write boundaries](architecture/metadata.md).
 
 ## Data-safety invariants
 
@@ -58,9 +58,11 @@ Stable IDs connect safety rules to production owners and focused tests.
 | `SYNC_NEVER_DELETES` | `src/sync_core/state.rs` | Replanning marks departed copies as no longer wanted; it never removes their rows or files. |
 | `UNKNOWN_PROVIDER_IDENTITY_REMAINS_PENDING` | `src/sync_core/plan.rs` | A photo whose master record is unknown stays pending and is planned once the master arrives. |
 | `UPGRADE_CLEANUP_REQUIRES_VALIDATED_STATE` | `src/sync_core/upgrade.rs` | The previous state file and its backups are removed only after the new state was integrity-checked and a cycle listed every zone without error. |
-| `TEMP_FILE_DELETE_REQUIRES_DURABLE_OWNERSHIP` | `src/download/file/replacement_recovery.rs` | Recovery removes a prepared file only when it is the exact owned inode with the expected bytes, and syncs both parents afterwards. |
+| `TEMP_FILE_DELETE_REQUIRES_DURABLE_OWNERSHIP` | `src/download/file/replacement_recovery.rs` | A prepared file is removed only while it is the exact inode kei created and still holds the bytes kei wrote; its folder is synced afterwards. |
+| `METADATA_WRITES_REQUIRE_OPT_IN` | `src/download/metadata_pass/mod.rs` | The metadata pass runs only when a writer is enabled. Enrichment choices such as album names do not enable one. |
 | `METADATA_EMBED_REWRITE_REQUIRES_STABLE_INPUT` | `src/download/metadata/prepared.rs` | Every embedded metadata rewrite prepares a uniquely owned sibling and replaces the media only while both the destination and prepared bytes match their approved fingerprints. |
 | `HEIF_EMBED_REWRITE_REQUIRES_STABLE_INPUT` | `src/download/metadata/heif_writer.rs` | A HEIF-family embedded rewrite accepts tone-map insertion only when `dimg` and primary Exif `cdsc` relationships prove the exact target and no existing XMP owns that tone map, and replaces the media only while both files match their approved fingerprints. |
+| `XMP_GPS_ACCURACY_REQUIRES_MATCHING_LOCATION` | `src/download/metadata_pass/mod.rs` | A sidecar carries native horizontal accuracy only when the file's coordinates equal iCloud's and the file still holds the bytes kei downloaded. |
 | `XMP_SIDECAR_REWRITE_REQUIRES_STABLE_INPUT` | `src/download/metadata/sidecar.rs` | An existing XMP sidecar is replaced only when it parses and its bytes still match the writer's initial read. |
 
 ## Maintaining this guide

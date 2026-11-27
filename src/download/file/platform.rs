@@ -5,6 +5,7 @@ use std::path::Path;
 #[cfg(unix)]
 use tokio::fs;
 
+#[cfg(all(unix, not(target_os = "macos")))]
 use crate::fs_util::ConfinedPath;
 
 #[cfg(all(test, feature = "xmp", target_os = "linux"))]
@@ -29,86 +30,6 @@ pub(in crate::download) enum PublishResult {
     DestinationExists,
 }
 
-/// A retirement move must consume the source atomically. Link publication is
-/// deliberately unavailable because later unlink would race a foreign writer.
-pub(in crate::download) fn move_layout_confined(
-    source: &ConfinedPath,
-    destination: &ConfinedPath,
-) -> std::io::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        renameat2_confined_blocking(source, destination, libc::RENAME_NOREPLACE)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        rename_confined_macos(source, destination, libc::RENAME_EXCL)
-    }
-    #[cfg(windows)]
-    {
-        move_file_no_replace_blocking(source.path(), destination.path())
-    }
-    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-    {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "Conditional alias retirement is unsupported on this platform",
-        ))
-    }
-}
-
-/// Exchange only entries in the retained, no-follow parent capabilities.
-/// Linux unsupported exchange is reported to the conditional replacement
-/// owner, which retains these capabilities through its journal fallback.
-#[cfg(unix)]
-pub(in crate::download) fn exchange_layout_confined(
-    source: &ConfinedPath,
-    destination: &ConfinedPath,
-) -> std::io::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        renameat2_confined_blocking(source, destination, libc::RENAME_EXCHANGE)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        rename_confined_macos(source, destination, libc::RENAME_SWAP)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "Confined primary layout exchange is unsupported on this platform",
-        ))
-    }
-}
-
-pub(in crate::download) fn publish_reconciliation_part_blocking(
-    part: &ConfinedPath,
-    destination: &ConfinedPath,
-) -> std::io::Result<PublishResult> {
-    #[cfg(target_os = "linux")]
-    let result =
-        renameat2_confined_blocking(part, destination, libc::RENAME_NOREPLACE).or_else(|error| {
-            if is_renameat2_unsupported(&error) {
-                hard_link_confined(part, destination)
-            } else {
-                Err(error)
-            }
-        });
-    #[cfg(target_os = "macos")]
-    let result = rename_confined_macos(part, destination, libc::RENAME_EXCL);
-    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-    let result = hard_link_confined(part, destination);
-    #[cfg(windows)]
-    let result = move_file_no_replace_blocking(part.path(), destination.path());
-    match result {
-        Ok(()) => Ok(PublishResult::Published),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            Ok(PublishResult::DestinationExists)
-        }
-        Err(error) => Err(error),
-    }
-}
-
 #[cfg(all(unix, not(target_os = "macos")))]
 pub(super) fn hard_link_confined(
     part: &ConfinedPath,
@@ -123,62 +44,6 @@ pub(super) fn hard_link_confined(
             destination.parent_fd(),
             destination.name_cstr().as_ptr(),
             0,
-        )
-    } == 0
-    {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn renameat2_confined_blocking(
-    part_path: &ConfinedPath,
-    final_path: &ConfinedPath,
-    flags: libc::c_uint,
-) -> std::io::Result<()> {
-    #[cfg(all(test, feature = "xmp"))]
-    if flags == libc::RENAME_NOREPLACE
-        && let Some(hook) = RECONCILIATION_RENAME_FAULT.take()
-    {
-        hook(final_path.path());
-        return Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP));
-    }
-    // SAFETY: both directory descriptors and NUL-terminated names remain live,
-    // and callers pass one documented renameat2 flag.
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            part_path.parent_fd(),
-            part_path.name_cstr().as_ptr(),
-            final_path.parent_fd(),
-            final_path.name_cstr().as_ptr(),
-            flags,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn rename_confined_macos(
-    source: &ConfinedPath,
-    destination: &ConfinedPath,
-    flags: libc::c_uint,
-) -> std::io::Result<()> {
-    // SAFETY: both retained directory descriptors and NUL-terminated names
-    // remain live and callers pass a documented renameatx_np flag.
-    if unsafe {
-        libc::renameatx_np(
-            source.parent_fd(),
-            source.name_cstr().as_ptr(),
-            destination.parent_fd(),
-            destination.name_cstr().as_ptr(),
-            flags,
         )
     } == 0
     {
@@ -387,13 +252,9 @@ fn destination_exists_or(err: std::io::Error, final_path: &Path) -> std::io::Res
 
 #[cfg(all(test, windows))]
 mod tests {
-    use super::{
-        PublishResult, move_layout_confined, publish_part_no_replace,
-        publish_reconciliation_part_blocking, windows_api_path,
-    };
-    use crate::fs_util::{ConfinedParents, ConfinedPath};
+    use crate::fs_util::windows_api_path;
     use std::ffi::OsString;
-    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::os::windows::ffi::OsStringExt;
     use std::path::Path;
 
     #[test]
@@ -444,61 +305,5 @@ mod tests {
                 .kind(),
             std::io::ErrorKind::InvalidInput
         );
-    }
-
-    #[tokio::test]
-    async fn windows_long_paths_publish_without_overwrite_and_retire_confined_aliases() {
-        let root = tempfile::tempdir().unwrap();
-        let parent = root
-            .path()
-            .join("nested".repeat(20))
-            .join("nested".repeat(20));
-        tokio::fs::create_dir_all(&parent).await.unwrap();
-        let stage = parent.join("source.part");
-        let target = parent.join("primary.jpg");
-        let retired = parent.join("retired.jpg");
-        assert!(stage.as_os_str().encode_wide().count() > 260);
-        assert!(target.as_os_str().encode_wide().count() > 260);
-        tokio::fs::write(&stage, b"verified source").await.unwrap();
-        assert_eq!(
-            publish_part_no_replace(&stage, &target).await.unwrap(),
-            PublishResult::Published
-        );
-        assert!(!stage.exists());
-        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"verified source");
-        tokio::fs::write(&stage, b"second source").await.unwrap();
-        assert_eq!(
-            publish_part_no_replace(&stage, &target).await.unwrap(),
-            PublishResult::DestinationExists
-        );
-        assert_eq!(tokio::fs::read(&stage).await.unwrap(), b"second source");
-        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"verified source");
-        let root = root.path().to_owned();
-        tokio::task::spawn_blocking(move || {
-            let source = ConfinedPath::open(&root, &stage, ConfinedParents::Existing).unwrap();
-            let destination =
-                ConfinedPath::open(&root, &target, ConfinedParents::Existing).unwrap();
-            let retired = ConfinedPath::open(&root, &retired, ConfinedParents::Existing).unwrap();
-            assert_eq!(
-                publish_reconciliation_part_blocking(&source, &destination).unwrap(),
-                PublishResult::DestinationExists
-            );
-            assert_eq!(std::fs::read(source.path()).unwrap(), b"second source");
-            assert_eq!(
-                std::fs::read(destination.path()).unwrap(),
-                b"verified source"
-            );
-            move_layout_confined(&destination, &retired).unwrap();
-            assert_eq!(std::fs::read(retired.path()).unwrap(), b"verified source");
-            assert!(!destination.path().exists());
-            assert_eq!(
-                publish_reconciliation_part_blocking(&source, &destination).unwrap(),
-                PublishResult::Published
-            );
-            assert_eq!(std::fs::read(destination.path()).unwrap(), b"second source");
-            assert!(!source.path().exists());
-        })
-        .await
-        .unwrap();
     }
 }
