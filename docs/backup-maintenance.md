@@ -1,28 +1,26 @@
 # Backup maintenance
 
-Keep an independent backup before local repairs. Do not delete conflicting
-files, temporary siblings, or the state database to make a warning disappear.
+Keep an independent backup before local repairs. Do not delete conflicting files, temporary siblings or the state database to make a warning go away. Sync never deletes files, and it replaces a file only while the file still holds the bytes kei recorded for it.
 
 ## Choose the operation
 
 | Need | Operation | What can change |
 | --- | --- | --- |
-| Inspect recorded progress | `kei status` | No repair |
-| Check recorded bytes | `kei verify --checksums` | Integrity diagnostics, not restoration |
-| Preview missing/truncated state | `kei reconcile --dry-run` | No repair-row changes; owned-state opening can still migrate the database |
-| Queue missing files | `kei reconcile` | SQLite state, not media; shorter files are reported |
-| Inspect one changed copy | `kei reconcile --inspect-path /absolute/path` | Prints a fingerprint; no repair authorization |
-| Confirm damage to that copy | Repeat inspection with `--confirm-damage SHA256:SIZE` | Queues conditional replacement for the next selected sync |
-| Refresh provider metadata | `kei sync --refresh-metadata` | Catalogue plus configured local outputs |
-| Replace capture timestamps | `kei sync --refresh-metadata --repair-capture-timestamps` | Supported embedded timestamps, including camera values |
-| Change folder layout | Edit path configuration, then `kei sync` | Verified local copies; old copies remain |
+| See saved, owed, failed and locally modified copies | `kei status` | Nothing |
+| Check every copy's bytes against its recorded SHA-256 | `kei verify --checksums` | Nothing; differences are reported, not repaired |
+| List saved copies whose file is missing | `kei reconcile --dry-run` | Nothing |
+| Download missing copies again | `kei reconcile`, then `kei sync` | State only; the next sync downloads them |
+| Inspect one changed copy | `kei reconcile --inspect-path /absolute/path` | Nothing; prints its fingerprint |
+| Replace that copy | Repeat inspection with `--confirm-damage SHA256:SIZE`, then `kei sync` | That one file, if it still has the inspected bytes |
+| Rewrite metadata for every saved copy | `kei sync --refresh-metadata` | Configured metadata outputs |
+| Replace embedded capture timestamps | `kei sync --refresh-metadata --repair-capture-timestamps` | Embedded timestamps, including camera values |
+| Move the backup | Change `[download].directory`, then `kei sync` | Missing copies are downloaded into the new folder |
 
-Automatic path reconciliation after configuration changes is separate from the
-`reconcile` integrity command. Neither is a general container-corruption repair.
+Opening state with a newer binary can upgrade it, even for `kei status`. Follow the [upgrade checklist](upgrade.md) first.
 
 ## Refresh catalogue and configured outputs
 
-Use a separate repair configuration that preserves your existing `data_dir`, credentials, and download directory. Remove the `albums` and `smart_folders` keys entirely, even when they contain `all` or `none`: explicit selectors reject this repair. Also remove date bounds. Retired `recent` / `recent_scope` keys must be removed from any config before it can load. This selection covers all visible libraries and enables the unfiled pass:
+Use a separate repair configuration that keeps your existing `data_dir`, credentials and download directory. Remove the `albums` and `smart_folders` keys entirely, even when they contain `all` or `none`, and remove date bounds: the refresh requires a complete sweep of the selected libraries. This selection covers all visible libraries and enables the unfiled pass:
 
 ```toml
 [filters]
@@ -31,36 +29,25 @@ unfiled = true
 exclude = []
 ```
 
-Choose the libraries you intend to repair. Do not add one-run date filters. Then run:
+Then run:
 
 ```sh
 kei sync --config /path/to/repair.toml --refresh-metadata
 ```
 
-The command refreshes every downloaded version encountered in those libraries
-before current resolution, filename, or Live Photo download policy is applied.
-It does not download media again. Embedded and sidecar changes follow the
-configured metadata writers. Disable embedded outputs if media bytes must stay
-unchanged; disable sidecar output too if no local metadata should change.
+The refresh forgets what the metadata pass last wrote, so every saved copy is checked against the catalog and rewritten where its configured outputs differ. It does not download media again. Only copies that still hold the bytes kei recorded are written; locally modified copies are left alone and counted. Embedded writes change media bytes and record the new checksum; disable embedded outputs if media bytes must stay unchanged. See [Metadata output](metadata.md).
 
-This is one-shot even when the TOML file sets a watch interval. It rejects `--dry-run`, `--only-print-filenames`, narrowing selection, and `service run`. The retired `--retry-failed` flag is rejected by all sync invocations; ordinary sync retries unfinished work automatically. See [Metadata output](metadata.md) for automatic bounded capture repair, which is different from this explicit full sweep.
+The refresh runs once even when the configuration sets a watch interval. It rejects `--dry-run`, `--only-print-filenames`, a narrowed selection and `service run`.
 
 ### Replace capture timestamps
 
-First enable `metadata.set_exif_datetime = true` in the repair configuration.
-Then explicitly authorize replacement:
+Enable `metadata.set_exif_datetime = true` in the repair configuration, then authorize replacement explicitly:
 
 ```sh
 kei sync --config /path/to/repair.toml --refresh-metadata --repair-capture-timestamps
 ```
 
-This can overwrite camera-supplied timestamps. It writes a supported
-capture-local timestamp with its matching Apple offset. It requires usable
-offset evidence and recorded file/checksum evidence. Unknown provenance,
-changed bytes, or unsupported layouts can leave durable repair work pending.
-Prepared-output receipts allow a later explicit repair to finish interrupted
-state finalization without trusting unrelated bytes. Do not promise that every
-historical file can be repaired. Ordinary writes preserve native timestamps.
+This can overwrite camera-supplied timestamps with Apple's capture-local time and its offset. Ordinary metadata writes keep existing timestamps.
 
 ## Repair a confirmed damaged copy
 
@@ -72,163 +59,36 @@ kei reconcile --inspect-path /photos/Album/photo.jpg --confirm-damage SHA256:SIZ
 kei sync
 ```
 
-Replace `SHA256:SIZE` with the fingerprint printed by the first command. Confirm only after establishing that this copy is damaged. A changed checksum or shorter file may be an intentional edit. Confirmation applies to that exact managed destination and those inspected bytes. It does not authorize replacement of other album copies.
+Replace `SHA256:SIZE` with the fingerprint the first command printed. Confirm only after establishing that this copy is damaged: a changed checksum or a shorter file may be an intentional edit. Confirmation covers that one copy and those bytes. If the file changes again before the next sync, the replacement is refused; inspect it again and confirm the new fingerprint. A copy reported as locally modified can be handed back to kei the same way.
 
-If the file changes again before repair, inspect it again. The command shows the pending fingerprint. To replace the newly inspected bytes, confirm their new fingerprint. A locally preserved copy can also be explicitly confirmed this way.
+The next sync downloads the current version from iCloud and publishes it over the confirmed bytes. If the download fails, the damaged file stays and the copy stays owed.
 
-The next sync uses the current selected provider resource and existing conditional publication. A changed target refuses replacement. An unavailable source leaves the damaged bytes and retry intent in place. Excluding the destination from selection does not complete its repair. Linux filesystems that reject atomic exchange use the existing journaled fallback described in [Guarded publication](metadata.md#guarded-publication).
+`kei verify --checksums` hashes every copy and reports differences without treating them as damage. Ordinary sync hashes a copy only when it needs the copy's bytes, for a new version or a metadata write; a copy that changed is then kept and reported as locally modified. `--repair-truncated` is retired because file size cannot tell damage from a local edit.
 
-Ordinary sync and periodic presence diagnostics do not hash files for integrity checks. `kei verify --checksums` reports differences without treating them as proven corruption. Plain `kei reconcile` marks missing files for retry and reports shorter files without authorizing replacement. `--repair-truncated` is retired because its size-based marker cannot distinguish damage from local edits. State opening can still migrate the database during inspection.
+## Missing files
 
-## Change the backup layout
+`kei reconcile` lists saved, selected copies whose file is missing and owes them again; the next sync downloads them to the same paths. `--dry-run` only lists them. Copies carried over from an earlier release that nothing has taken over yet are listed too; the next sync downloads those as new copies.
 
-Path-setting changes reconcile recorded media through verified local copying.
-Old sources remain. Ordinary copies receive capture mtime; a safe same-path
-change between equivalent relative and absolute root spellings only changes
-catalogue spelling, preserving mtime and existing or absent sidecars.
+## Move the backup or change its layout
 
-Eligibility changes, such as date bounds, do not by themselves relocate every
-file. Active provider checkpoints remain while replacement inventory proof is
-built. Path reconciliation also preserves checkpoints rather than clearing them.
+When `[download].directory` changes, the next sync looks for each saved copy in the new folder and downloads again the ones it cannot find. Move the files first if you want to keep them; kei does not move or delete anything in the old folder.
 
-Reconciliation uses retained directory handles, no-follow traversal, checked
-file identity, exclusively created temporary files, and no-overwrite publication.
-It rejects symlinks, non-regular leaves, unsafe/replaced parents, `..` components,
-and a distinct destination hard-linked to its source. Ordinary relative roots
-remain supported. These restrictions describe reconciliation, not every command.
-On Unix, temporary copies start owner-only; completed copies receive source
-permissions. Ambiguous temporary entries remain for inspection.
+Changing `folder_structure`, naming or `edited_as_primary` does not rename existing files. A copy keeps the path it was given, and new copies use the new settings. Copies that stop being selected keep their files.
 
-With sidecars enabled, a valid source packet is copied byte-for-byte, including
-custom fields and ownership markers. A missing packet is generated by the normal
-metadata planner. Source-read failure stops before an incomplete packet lands.
-Migration does not upgrade an existing packet or create original GPS provenance.
+## Unfinished work and health
 
-Reservations distinguish library, asset, rendition, and provider content.
-Equivalent path spellings share ownership. Another owner's reservation can
-select a stable identity-suffixed destination. Changed provider content can
-receive a new reservation while old and unselected renditions remain protected.
-Conflicting bytes never authorize overwrite or a fresh filename on every retry.
-Ordinary download collision naming remains unchanged.
+A failed download stays owed. It is retried on each of the next three cycles, then after an hour, doubling to at most once a day; a new version from iCloud resets the wait. `kei status --failed` lists them with their last error. Failed downloads make `/healthz` report a problem only when a cycle saved nothing else.
 
-Catalogue finalization follows capture mtime, required sidecar work, and final
-input validation. A metadata or state-write failure keeps pending work and its
-selected destination. A safe retry can finish without copying media again.
+While iCloud reports that a library is still indexing, it is listed and downloaded anyway, but queried smart folders such as Screenshots wait and the library is listed once more from the start after indexing stops. Until that listing finishes, the cycle is reported incomplete. A library whose indexing state iCloud reports as failed or missing is logged with a warning and otherwise synced normally.
 
-### Recover from a blocked move
+When reporting a problem, include `kei --version`, the Docker image ID if you use one, `kei status`, health output and the warnings from one cycle. Redact account details and local paths. Do not upload the state database, session files or raw provider responses.
 
-1. Stop the affected worker and preserve its state and reported conflicting
-   paths. Inspect identities and bytes without modifying the originals.
-2. Check configured roots, permissions, parent directories, and the reported
-   media or sidecar conflict. Remove `..` from reconciliation roots.
-3. If a conflicting entry must be moved, first back it up and choose an explicit
-   destination outside the planned path. Do not apply blanket deletion commands.
-4. Retry the same configuration and inspect the result. The old catalogue path
-   remains until all required finalization succeeds.
+## Retired maintenance
 
-Blocking failure skips that library's normal source/download/adoption pass and
-withholds its checkpoint and the aggregate database precheck token. Selected
-smart-folder reconciliation still has the limitation in #770.
+The v0.30 sync engine does not keep the earlier engine's provider inbox, checkpoints, selection generations, legacy coverage certificates or preservation evidence. These no longer apply:
 
-## Interpret recovery evidence
-
-A policy-excluded row is not provider-deleted. Pending retries use targeted
-provider revalidation and durable identity evidence, with full-enumeration
-fallback where needed. Unknown or transient responses retain retry evidence.
-
-Complete enumeration proof plus durable exact retry work can permit zone-token
-progress after a transfer failure. Identity, grouping, or state failures without
-recovery proof cannot. Aggregate database prechecks have stricter clean-cycle
-gates. Zero failed downloads does not establish successful metadata, state,
-enumeration, or checkpoint work.
-
-Provider MMCS identity, original-download SHA-256, post-metadata local SHA-256,
-and verified `source_checksum` provenance serve different purposes. Historical
-download hashes are not proof of unmodified source bytes. Adoption/import have
-evidence limits; integrity commands cannot prove completeness against iCloud or
-restore damaged media. Never remove temporary files by suffix and age alone:
-cleanup requires durable ownership evidence.
-
-### Upgrade retired sync selection
-
-Sync and service mode reject `--recent` and `--recent-scope`. Remove those flags and `[filters].recent` / `recent_scope` before starting. If you still want a limited backup, choose fixed capture-date bounds, such as `skip_created_before = "2025-01-01"` and `skip_created_after = "2025-01-07"`; replace both dates with your own range. Relative `Nd` values are unsupported too. Startup errors give removal and replacement guidance without changing configuration, state or media. Import-only `import-existing --recent N` still accepts a positive sample count and does not apply sync date filters.
-
-Schema 37 preserves old recent-selection receipts and records a one-time inventory request for each zone with an old receipt key, regardless of its payload. A selected zone can therefore need a current inventory even when iCloud reports no changes. Each attempt replays the retained cursor, inventories the current selection, then requires a raw-empty terminal replay before retiring the request. A busy interval, interruption, failed write or incomplete current work keeps it pending for a later cycle; no same-cycle catch-up loop is added. Healthy media can still complete while other work remains held.
-
-This proves current selected coverage, not an atomic provider snapshot, complete historical deletions or permission to delete local files. Completing it can retire the inventory request while a separate sparse-identity, expired-cursor or retained provider-work hold remains. Historical legacy certification is no longer a checkpoint requirement. Preserve the state and investigate any remaining hold rather than resetting it.
-
-After upgrading, let normal sync or watch continue to check previously downloaded records. Each successful or quiet cycle can check up to 32 historical identities after current work finishes. A record missing from a folder or lookup stays live unless iCloud explicitly confirms deletion. `kei manifest` reports `is_deleted` and `deleted_at` in JSON and CSV; a row can be both `downloaded` locally and deleted upstream. A null or empty deletion time means the provider supplied no known time. Local copies are kept.
-
-### Historical legacy evidence
-
-Run normal `kei sync`; there is no certificate repair step. Preserved legacy records and old coverage certificates remain in the database, but sync no longer revalidates or writes those certificates. For already prepared records, a missing certificate or changed historical file alone does not force another inventory, fail the current cycle or make the process unhealthy. This retirement adds no schema migration and rewrites no files.
-
-Status, sync reports and health JSON retain their existing field names:
-
-- `unattributed_legacy_assets` counts preserved legacy records with unknown attribution, not paths or renditions.
-- `unattributed_legacy_pending` counts those records without a stored coverage certificate at their recorded generation. The historical name is retained for compatibility; this is not pending sync work. The count does not revalidate configuration, file contents or certificate dependencies.
-
-`kei status` reports unresolved historical attribution. That means historical completeness is unproven; it does not by itself fail a current sync, increment health failures or prevent a successful health update. Current transfer, metadata, identity, enumeration and state-write failures keep their existing retry and checkpoint effects. A healthy process is not proof of a complete backup.
-
-The old [`reconcile trust-legacy-files plan/apply` commands](trusted-legacy-files.md) now refuse early and direct you to `kei sync`. They create no plan or trust declaration. Existing declarations remain stored history, not provider verification or new ownership permission.
-
-Original-file protection remains in force before and after preservation preparation. The separate preparation scan, unresolved source identity, raw-inbox capacity, unfinished provider-selection work across generations and expired-cursor recovery retain their existing limits. Certification retirement does not resolve every historical-state or Shared Library problem reported in [#1044](https://github.com/rhoopr/kei/issues/1044), and it never permits deletion or overwrite of uncertain files.
-
-## Unresolved provider identities
-
-If logs show `asset_delta_hydration_incomplete`, keep the state database and
-media. Kei retains the provider checkpoint so a later cycle can retry the
-unresolved records. Other valid assets can still download. Do not reset state
-or use a metadata refresh to bypass this guard.
-
-For valid sparse-share records, kei retains per-source retry evidence across
-restarts. An unchanged unresolved lookup retries after one hour, then doubles
-the delay up to 24 hours. Each library execution selects up to 100 due sparse
-source lookups. Exact saved source/master mappings can recover immediately;
-malformed or changed evidence does not reuse the negative result. `kei status`
-shows how many retained sparse records are unresolved and deferred. A deferred
-lookup does not mean that the record was skipped safely or deleted. These
-limits reduce repeated lookups; they do not repair a missing provider identity.
-
-Ambiguous metadata-capture identities also retain a retry schedule. Unchanged
-ambiguity retries after one hour, doubling up to 24 hours. Changed saved identity
-or rendition evidence becomes eligible immediately. Status reports unresolved
-identities and deferred retries separately from failed repair attempts.
-Deferral keeps the capture revision and checkpoint pending; it is not recovery.
-
-Before running even `kei status` with a newer binary, follow the [upgrade checklist](upgrade.md). Opening an owned database can migrate it.
-
-Kei marks unresolved asset identity cycles incomplete. Status
-remains unsafe across restarts and successful syncs in other libraries until
-the affected checkpoint can advance safely. Health does not update
-`last_success_at` for incomplete cycles. A deployment that previously looked
-healthy can therefore start reporting unhealthy without a new transfer error.
-
-For a diagnostic retest, disable automatic restarts driven by `/healthz`.
-Keep health monitoring enabled. Do not use this sync-health endpoint as a
-Kubernetes liveness probe during the retest. Repeated provider failures can
-produce HTTP 503 while the process is still running and able to retry.
-
-Record `kei --version`, the Docker image ID when applicable, `kei status`,
-health output, and the aggregate `Asset identity lookup` log lines from one
-cycle. Include whether the accounts use a Shared Photo
-Library. Redact account details and local paths from other logs. Do not upload
-the state database, session files, or raw provider responses.
-
-The diagnostics do not establish why Apple omitted an identity. Ambiguous
-metadata-capture matches are a separate condition and remain pending.
-
-## Legacy preservation and hardlinks
-
-Legacy preservation normally refuses files with multiple hard links. The TOML-only
-`[download].legacy_preservation_allow_hardlinks = true` setting waives that
-link-count check for legacy originals and qualifying current outputs, including
-sidecars. When used, it emits one warning per library cycle with the number of
-distinct evidence paths whose shared-link check was waived. It assumes you coordinate external tools so they do not change linked
-contents, metadata, or kei-managed names during the operation.
-
-This setting does not make kei read-only: distinct original and current paths
-can share an inode, and existing identical-file reuse can set timestamps through
-aliases even when metadata output is disabled. Repair and recovery behavior is
-unchanged. Other preservation checks still apply. Broader hardlink support remains
-open in [#884](https://github.com/rhoopr/kei/issues/884).
+- `kei reconcile trust-legacy-files plan` and `apply` refuse and point to `kei sync`. Existing trust records were not carried over; see [trusted legacy files](trusted-legacy-files.md) for the earlier behaviour.
+- `kei doctor --missing-reference-inventory` refuses.
+- `[download].legacy_preservation_allow_hardlinks` is still accepted and has no effect.
+- The `unattributed_legacy_assets` and `unattributed_legacy_pending` fields stay in health and report output for compatibility and are always zero. `asset_delta_hydration_incomplete` holds and sparse-identity retry schedules no longer exist; a photo whose details iCloud has not sent yet stays owed until it does.
+- `--retry-failed` is rejected; ordinary sync retries unfinished work.

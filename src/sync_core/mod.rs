@@ -197,8 +197,11 @@ pub(crate) async fn run_cycle(
         .await?;
         zone_report.indexing = indexing::relist_owed(state, &zone).await?;
         // These folders come from iCloud's search index, which may be
-        // partial until indexing finishes. Their stored members stay.
-        let queried = if indexing == indexing::Indexing::Finished {
+        // partial while indexing runs. Their stored members stay.
+        let queried = if matches!(
+            indexing,
+            indexing::Indexing::Finished | indexing::Indexing::Unavailable(_)
+        ) {
             plan::queried_smart_folders(&config.smart_folders)
         } else {
             Vec::new()

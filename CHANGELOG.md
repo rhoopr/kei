@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+Read the [v0.30 upgrade checklist](docs/upgrade.md) before opening an existing backup with this build. It replaces the sync engine and moves state to a new file.
+
+### Changed
+
+- Replaced the sync engine. State now lives in `<account>.sync.db`. A library's sync position is saved with each page of changes it covers, and owed downloads are kept as rows that every cycle retries. The first sync builds the new file from the previous one, carries over the copies it recorded, and lists every library from the start without downloading those copies again. After a cycle in which every library finished its listing, the old state file and its schema backups are removed.
+- Sync never deletes files. It replaces a file, for a new version or a metadata write, only while the file still holds the bytes kei recorded. A file changed locally is kept and reported as locally modified.
+- Downloads keep every slot busy: each batch of photos looks up its download URLs while the previous batch downloads. Planning writes are batched. In local benchmarks this was about 4 times faster than the previous engine.
+- Metadata writing is a separate pass after downloads. It is off unless a writer is enabled, and it never holds back the sync position.
+- Failed downloads are retried on each of the next three cycles, then after an hour, doubling to at most once a day. Failed downloads alone no longer make `/healthz` unhealthy while other downloads succeed.
+- With `edited_as_primary = true`, the plain filename follows the current rendition: an edit replaces it and the original is saved with `_original`, and a revert puts the original back. `.kei-history` is no longer written.
+- A library that iCloud reports as still indexing is listed and downloaded anyway. Queried smart folders such as Screenshots wait, and the library is listed once more after indexing finishes. A library whose indexing state is reported as failed or missing syncs normally, with a warning.
+- Changing the download folder downloads again the copies missing from the new folder. Changing the folder layout or naming applies to new copies; existing copies keep their paths.
+- `kei manifest` now exports one row per local copy, with its album, status and whether it is still selected.
+- Rewrote the [upgrade checklist](docs/upgrade.md) and [backup maintenance](docs/backup-maintenance.md) guides for the new engine.
+
+### Removed
+
+- The previous engine's provider inbox, checkpoints, selection generations, legacy coverage certificates, preservation evidence and layout journals. `reconcile trust-legacy-files` and `doctor --missing-reference-inventory` refuse. `[download].legacy_preservation_allow_hardlinks` is accepted and has no effect.
+- `import-existing --strict` and `import-existing --recent` are refused. `[filters].filename_exclude` is rejected.
+
+### Fixed
+
+- Album names were missing when the change feed did not return album fields. kei now asks for them, and a library whose catalog holds albums without names is listed once more to fetch them.
+- A file the previous release saved under a shorter name in the same folder ([#1119](https://github.com/rhoopr/kei/issues/1119)) is taken over under that name instead of being downloaded again under the current name.
+- After an upgrade, only copies whose downloaded bytes the previous state proved count as original for orientation filling and sidecar GPS accuracy. This update upgraded the new state database to schema 4.
+- A library whose index iCloud reports as `FAILED` no longer stays incomplete or skips its queried smart folders ([#1126](https://github.com/rhoopr/kei/issues/1126)).
+- A malformed record from iCloud is skipped and counted instead of stopping the library's sync.
+
 ## [0.30.0-beta.3] - 2026-11-23
 
 See the [v0.30 upgrade checklist](docs/upgrade.md) before opening an existing backup with this beta.

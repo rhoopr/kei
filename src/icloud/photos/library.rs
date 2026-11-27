@@ -80,7 +80,8 @@ fn log_cloudkit_auth_hint(http_err: &crate::icloud::photos::session::HttpStatusE
 pub struct PhotoLibrary {
     indexing_finished: Arc<AtomicBool>,
     #[cfg(test)]
-    stub_indexing_finished: Option<bool>,
+    /// `Some(None)`: the stub reports a state kei does not recognize.
+    stub_indexing_finished: Option<Option<bool>>,
     service_endpoint: Arc<str>,
     params: Arc<HashMap<String, Value>>,
     session: Box<dyn PhotosSession>,
@@ -178,7 +179,9 @@ impl PhotoLibrary {
     pub(crate) async fn check_indexing_once(&self) -> Result<bool, ICloudError> {
         #[cfg(test)]
         if let Some(finished) = self.stub_indexing_finished {
-            return Ok(finished);
+            return finished.ok_or(ICloudError::IndexingUnavailable(
+                "Apple reported an unknown photo library indexing state; results may be incomplete",
+            ));
         }
         self.retain_provisional_readiness();
         let url = format!(
@@ -283,7 +286,7 @@ impl PhotoLibrary {
     pub(crate) fn new_stub(session: Box<dyn PhotosSession>) -> Self {
         Self {
             indexing_finished: Arc::new(AtomicBool::new(true)),
-            stub_indexing_finished: Some(true),
+            stub_indexing_finished: Some(Some(true)),
             service_endpoint: Arc::from("https://stub.example.com"),
             params: Arc::new(HashMap::new()),
             session,
@@ -293,9 +296,17 @@ impl PhotoLibrary {
         }
     }
 
+    /// Make the stub report an indexing state kei does not recognize, as
+    /// when iCloud says `FAILED`.
+    pub(crate) fn with_stub_indexing_unavailable(mut self) -> Self {
+        self.stub_indexing_finished = Some(None);
+        self.indexing_finished.store(false, Ordering::Relaxed);
+        self
+    }
+
     /// Make the stub report this indexing state.
     pub(crate) fn with_stub_indexing(mut self, finished: bool) -> Self {
-        self.stub_indexing_finished = Some(finished);
+        self.stub_indexing_finished = Some(Some(finished));
         self.indexing_finished.store(finished, Ordering::Relaxed);
         self
     }
@@ -306,7 +317,7 @@ impl PhotoLibrary {
     pub(crate) fn new_stub_with_zone(session: Box<dyn PhotosSession>, zone_name: &str) -> Self {
         Self {
             indexing_finished: Arc::new(AtomicBool::new(true)),
-            stub_indexing_finished: Some(true),
+            stub_indexing_finished: Some(Some(true)),
             service_endpoint: Arc::from("https://stub.example.com"),
             params: Arc::new(HashMap::new()),
             session,
@@ -439,7 +450,7 @@ mod tests {
     fn make_library(zone_id: Value) -> PhotoLibrary {
         PhotoLibrary {
             indexing_finished: Arc::new(AtomicBool::new(true)),
-            stub_indexing_finished: Some(true),
+            stub_indexing_finished: Some(Some(true)),
             service_endpoint: Arc::from("https://example.com"),
             params: Arc::new(HashMap::new()),
             session: Box::new(StubSession),

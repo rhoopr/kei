@@ -20,22 +20,23 @@ record their resulting checksums. Back up originals before enabling them.
 
 ## Capture, output, and repair
 
-Automatic capture repair processes at most 500 stale assets per selected library
-per cycle. One-shot sync handles one bounded batch. Watch/service schedules a
-follow-up after at most 60 seconds only when clean progress leaves work remaining;
-failed or stalled batches use normal cadence. A cycle can have local work even
-when Apple reports no provider changes.
+kei stores each photo's provider record in its catalog as it lists the library.
+When a metadata writer is enabled, a separate pass after downloads updates every
+saved copy whose catalog record or metadata settings changed since kei last wrote
+it, up to `[download] threads` copies at a time. A changed setting makes every
+saved copy due once. The pass never holds back the sync position or download
+completion, and a failed write leaves only that copy to retry next cycle.
 
-Status separates stale catalogue capture from pending configured-output rewrites.
-The report uses an optional integer `metadata_capture_revision`, omitted when
-unavailable, and integer `metadata_capture_refreshed`, `metadata_capture_failures`,
-and `metadata_capture_remaining` counts. A metadata writer must be enabled before
-its output retry can run. Captured data alone does not authorize local writes.
+Only copies that still hold the bytes kei recorded are written. A copy that
+changed locally is left alone and counted as locally modified. Each cycle logs
+how many copies were written, already up to date, locally modified or failed.
+The report's `metadata_capture_*` fields are kept for compatibility and stay
+zero; captured data alone does not authorize local writes.
 
 An explicit [metadata refresh](backup-maintenance.md#refresh-catalogue-and-configured-outputs)
-revisits the selected libraries without downloading media again. Explicit
-capture-timestamp replacement, truncated-media replacement, and path
-reconciliation each have separate consent and safety rules.
+makes every saved copy in the selected libraries due without downloading media
+again. Capture-timestamp replacement and damaged-copy replacement each need
+separate consent.
 
 ## Dates and format support
 
@@ -94,8 +95,7 @@ Embedded clearing requires an enabled field option, explicit current source abse
 Prepared rewrite evidence survives interrupted publication and state finalization in the existing receipts. Initial downloads commit measured field ownership with downloaded state after installing the output. An identical existing file gains no ownership from a discarded temporary download. Historical receipts without field-write evidence grant no clearing authority. Rewrites preserve the local modification time. Sidecar ownership and clearing retain their existing rules. Disabling an output does not schedule cleanup.
 
 Untouched stale sidecars have no automatic output-revision sweep; that remains
-[#799](https://github.com/rhoopr/kei/issues/799). Path reconciliation copies an
-existing valid packet rather than regenerating it.
+[#799](https://github.com/rhoopr/kei/issues/799).
 
 ### GPS coordinates
 

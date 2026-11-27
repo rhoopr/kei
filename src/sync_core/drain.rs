@@ -363,7 +363,7 @@ async fn adopt(state: &State, config: &CoreConfig, row: &FileRow) -> anyhow::Res
     Ok(
         match core_io::hash_file(&config.directory.join(&row.path)).await {
             Ok(Some((size, sha256))) if size == row.size => {
-                state.mark_done(row.id, &sha256).await?;
+                state.mark_adopted(row.id, &sha256).await?;
                 Adopted::Done
             }
             Ok(Some(_)) => {

@@ -226,7 +226,7 @@ fn read_copies(
             "NULL"
         };
         let sql = format!(
-            "SELECT {library}, id, version_size, local_path, size_bytes, {local}, checksum FROM assets
+            "SELECT {library}, id, version_size, local_path, size_bytes, {local}, checksum, NULL FROM assets
              WHERE status = 'downloaded' AND local_path IS NOT NULL"
         );
         collect(conn, &sql, &mut rows, &mut unreadable)?;
@@ -247,10 +247,17 @@ fn read_copies(
                 "provider_checksum",
             ],
         )? {
+            // Only `source_checksum` proves the bytes kei downloaded; older
+            // `download_checksum` values may come from rewritten bytes.
+            let source = if has_columns(conn, "asset_metadata_paths", &["source_checksum"])? {
+                "p.source_checksum"
+            } else {
+                "NULL"
+            };
             collect(
                 conn,
                 &format!(
-                    "SELECT p.library, p.id, p.version_size, p.local_path, a.size_bytes, p.local_checksum, p.provider_checksum
+                    "SELECT p.library, p.id, p.version_size, p.local_path, a.size_bytes, p.local_checksum, p.provider_checksum, {source}
                      FROM asset_metadata_paths p JOIN assets a
                        ON a.id = p.id AND a.version_size = p.version_size AND {joined} = p.library
                      WHERE a.status = 'downloaded'"
@@ -274,10 +281,17 @@ fn read_copies(
             "verified_media",
         ],
     )? {
+        let source = if has_columns(conn, "provider_active_destinations", &["source_checksum"])? {
+            "source_checksum"
+        } else {
+            "NULL"
+        };
         collect(
             conn,
-            "SELECT library, master, version_size, path, size_bytes, local_checksum, checksum
-             FROM provider_active_destinations WHERE verified_media = 1",
+            &format!(
+                "SELECT library, master, version_size, path, size_bytes, local_checksum, checksum, {source}
+                 FROM provider_active_destinations WHERE verified_media = 1"
+            ),
             &mut rows,
             &mut unreadable,
         )?;
@@ -292,7 +306,7 @@ fn read_copies(
     let mut order = Vec::new();
     let mut by_path: std::collections::HashMap<String, Vec<ImportedCopy>> =
         std::collections::HashMap::new();
-    for (zone, master, rendition, path, size, sha256, checksum) in rows {
+    for (zone, master, rendition, path, size, sha256, checksum, source) in rows {
         let absolute = if Path::new(&path).is_absolute() {
             PathBuf::from(&path)
         } else {
@@ -314,6 +328,8 @@ fn read_copies(
             size,
             sha256: sha256.filter(|hash| crate::download::core_io::parse_sha256(hash).is_some()),
             checksum,
+            source_sha: source
+                .filter(|hash| crate::download::core_io::parse_sha256(hash).is_some()),
         };
         by_path
             .entry(relative.clone())
@@ -365,7 +381,19 @@ fn owner_of(
     let first = identity(claims.first()?);
     if claims.iter().all(|copy| identity(copy) == first) {
         report.duplicates += u64::try_from(claims.len() - 1).unwrap_or(u64::MAX);
-        return claims.into_iter().next();
+        // Another record of the same copy may prove what the first does not.
+        let proof = claims
+            .iter()
+            .find(|copy| copy.source_sha.is_some() && copy.source_sha == copy.sha256)
+            .map(|copy| (copy.sha256.clone(), copy.source_sha.clone()));
+        let mut kept = claims.into_iter().next()?;
+        if let Some((sha256, source)) = proof
+            && (kept.sha256.is_none() || kept.sha256 == sha256)
+        {
+            kept.sha256 = sha256;
+            kept.source_sha = source;
+        }
+        return Some(kept);
     }
     let actual = hash_file(absolute);
     let mut owner = None;
@@ -397,7 +425,16 @@ fn hash_file(path: &Path) -> Option<String> {
     Some(format!("{:x}", hasher.finalize()))
 }
 
-type Row = (String, String, String, String, i64, Option<String>, String);
+type Row = (
+    String,
+    String,
+    String,
+    String,
+    i64,
+    Option<String>,
+    String,
+    Option<String>,
+);
 
 /// Append the rows `sql` returns. A row whose values do not decode is
 /// counted in `unreadable` and skipped.
@@ -417,6 +454,7 @@ fn collect(
             row.get(4)?,
             row.get(5)?,
             row.get(6)?,
+            row.get(7)?,
         ))
     })?;
     for row in found {

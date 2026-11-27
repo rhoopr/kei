@@ -1,8 +1,8 @@
 # Manifest export
 
 `kei manifest` exports the local state catalog. It reads the state database
-only. It doesn't contact iCloud, download files, rewrite files, or advance sync
-tokens.
+only. It doesn't contact iCloud, download files, rewrite files, or change the
+sync position.
 
 Use it when you want a local inventory for backup checks, support, or external
 scripts:
@@ -16,12 +16,13 @@ The command still needs to know which account's state DB to read. Set
 `ICLOUD_USERNAME` or `[auth].username` in your config. It doesn't need a
 password or a valid iCloud session. The database must have a matching account
 owner; [legacy state needs explicit adoption](account-state-migration.md). Configure
-the same realm used when binding the database.
+the same realm used when binding the database. Opening state written by an
+earlier release upgrades it first; see the [upgrade checklist](upgrade.md).
 
 ## JSON
 
-JSON output is a pretty-printed array. Each item is one asset version known to
-the local state DB:
+JSON output is a pretty-printed array. Each item is one local copy: one
+rendition of one photo in one album folder, or its unfiled copy.
 
 ```json
 [
@@ -29,46 +30,43 @@ the local state DB:
     "library": "PrimarySync",
     "asset_id": "ASSET_RECORD_NAME",
     "version": "original",
-    "filename": "IMG_0001.JPG",
-    "local_path": "/photos/2024/01/IMG_0001.JPG",
-    "checksum": "icloud-checksum",
-    "local_checksum": "local-file-sha256",
-    "download_checksum": "downloaded-bytes-sha256",
+    "local_path": "2024/01/02/IMG_0001.JPG",
+    "album": "",
     "size_bytes": 123456,
-    "created_at": "2024-01-02T03:04:05Z",
-    "added_at": "2024-01-02T03:05:00Z",
-    "downloaded_at": "2024-01-02T03:06:00Z",
-    "last_seen_at": "2024-01-02T03:06:30Z",
-    "media_type": "photo",
-    "status": "downloaded",
-    "albums": ["Favorites"],
-    "is_deleted": false,
-    "deleted_at": null
+    "local_checksum": "local-file-sha256",
+    "status": "done",
+    "selected": true
   }
 ]
 ```
 
-This is an illustrative inventory, not a sync-report sample. Capture/addition
-dates can include milliseconds. `checksum` is provider MMCS identity, not a
-local content hash. `local_checksum` describes local bytes; historical
-`download_checksum` is not verified original-source provenance. Manifest output
-is not proof of backup completeness. See [maintenance](backup-maintenance.md).
+- `local_path` is relative to the download directory.
+- `album` is the album's record name, `smart:<name>` for a smart folder, or
+  empty for the unfiled copy.
+- `local_checksum` is the SHA-256 kei recorded for the file's bytes, or `null`
+  before the copy is saved.
+- `status` is `pending` (owed), `adopt` (a file at the path waits to be
+  checked), `done`, `failed` (retried later), `modified` (changed locally and
+  left alone) or `carried_over` (recorded by the previous release and not yet
+  taken over by a sync). A carried-over row's `asset_id` is the photo's master
+  record name.
+- `selected` is false for a copy the current selection no longer wants. Its
+  file is kept.
+
+Manifest output describes what kei recorded. It is not proof of backup
+completeness; run `kei verify --checksums` to check the files. See
+[maintenance](backup-maintenance.md).
 
 Fields may be `null` when kei doesn't have that value. The schema may grow in
 later releases, so consumers should ignore fields they don't recognize.
 
-A rendition can have `status: "downloaded"` and `is_deleted: true`: kei kept the local copy and recorded its deletion upstream. `deleted_at` is the provider timestamp when known. To list only catalog entries without a recorded deletion, run `kei manifest | jq '.[] | select(.is_deleted == false)'`.
-
 ## CSV
 
-CSV output has the same information with one row per asset version. The
-`albums` cell is a JSON array string so album names with commas stay
-unambiguous.
+CSV output has the same information with one row per copy. A `null` checksum
+is an empty cell.
 
 Columns:
 
 ```text
-library,asset_id,version,filename,local_path,checksum,local_checksum,download_checksum,size_bytes,created_at,added_at,downloaded_at,last_seen_at,media_type,status,albums,is_deleted,deleted_at
+library,asset_id,version,local_path,album,size_bytes,local_checksum,status,selected
 ```
-
-An unknown `deleted_at` is an empty CSV cell. Managed edited-primary archives add an optional `preserved_files` array to each rendition's JSON row. It identifies independently preserved earlier provider checksums and exact local media/sidecar hashes using lossless native path encoding, family and operation identifiers, previous generation and journal phase. An old adjusted row whose primary path was handed over has a null `local_path`; its retained bytes are addressed by these receipts. CSV includes a JSON-valued `preserved_files` column only when at least one row has preserved receipts.

@@ -13,7 +13,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::icloud::photos::feed::Observation;
 
-pub(crate) const SCHEMA_VERSION: i64 = 3;
+pub(crate) const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS kv (
@@ -117,7 +117,8 @@ CREATE TABLE IF NOT EXISTS imported (
     rendition TEXT NOT NULL,
     size INTEGER NOT NULL,
     sha256 TEXT,
-    checksum TEXT NOT NULL
+    checksum TEXT NOT NULL,
+    source_sha TEXT
 ) STRICT;
 CREATE INDEX IF NOT EXISTS imported_by_asset ON imported (zone, master, rendition);
 CREATE TABLE IF NOT EXISTS runs (
@@ -239,6 +240,9 @@ pub(crate) struct ImportedCopy {
     pub(crate) size: u64,
     pub(crate) sha256: Option<String>,
     pub(crate) checksum: String,
+    /// The previous state proved these are the bytes it downloaded, as
+    /// opposed to bytes a metadata write may have changed since.
+    pub(crate) source_sha: Option<String>,
 }
 
 /// An asset whose wanted copies must be recomputed.
@@ -356,6 +360,14 @@ impl State {
                  DROP TABLE files_v2;",
             )?;
             tx.commit()?;
+        }
+        if (1..=3).contains(&version)
+            && table_exists(&conn, "imported")?
+            && !has_column(&conn, "imported", "source_sha")?
+        {
+            // Schema 4 keeps whether the previous state proved a carried-over
+            // copy holds the bytes it downloaded.
+            conn.execute_batch("ALTER TABLE imported ADD COLUMN source_sha TEXT")?;
         }
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(FILES_TABLE)?;
@@ -890,6 +902,24 @@ impl State {
         .await
     }
 
+    /// Take ownership of a file kei found already in place. Its bytes are
+    /// recorded, but not as bytes kei downloaded: kei cannot tell where
+    /// they came from.
+    pub(crate) async fn mark_adopted(&self, id: i64, sha256: &str) -> anyhow::Result<()> {
+        let sha256 = sha256.to_owned();
+        self.with(move |conn| {
+            conn.execute(
+                "UPDATE files SET state = 'done', sha256 = ?2, source_sha = NULL, last_error = NULL,
+                     pending_sha = NULL, pending_fields = NULL,
+                     meta_dirty = 1, meta_hash = NULL, meta_fields = NULL
+                 WHERE id = ?1",
+                params![id, sha256],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     pub(crate) async fn mark_modified(&self, id: i64) -> anyhow::Result<()> {
         self.with(move |conn| {
             conn.execute(
@@ -950,8 +980,8 @@ impl State {
             let mut inserted = 0u64;
             for copy in copies {
                 inserted += u64::try_from(tx.execute(
-                    "INSERT OR IGNORE INTO imported (path, zone, master, rendition, size, sha256, checksum)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    "INSERT OR IGNORE INTO imported (path, zone, master, rendition, size, sha256, checksum, source_sha)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
                         copy.path,
                         copy.zone,
@@ -959,7 +989,8 @@ impl State {
                         copy.rendition,
                         i64::try_from(copy.size)?,
                         copy.sha256,
-                        copy.checksum
+                        copy.checksum,
+                        copy.source_sha
                     ],
                 )?)?;
             }
@@ -993,7 +1024,7 @@ impl State {
                 .map_or("", |(parent, _)| parent)
                 .to_owned();
             let mut stmt = conn.prepare(
-                "SELECT path, zone, master, rendition, size, sha256, checksum FROM imported i
+                "SELECT path, zone, master, rendition, size, sha256, checksum, source_sha FROM imported i
                  WHERE NOT EXISTS (SELECT 1 FROM files f WHERE f.path = i.path)
                    AND i.master = ?3 AND i.rendition = ?4
                  ORDER BY i.path = ?1 DESC, i.path",
@@ -1008,10 +1039,11 @@ impl State {
                         row.get::<_, i64>(4)?,
                         row.get::<_, Option<String>>(5)?,
                         row.get::<_, String>(6)?,
+                        row.get::<_, Option<String>>(7)?,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
-            for (candidate, zone, master, rendition, size, sha256, checksum) in rows {
+            for (candidate, zone, master, rendition, size, sha256, checksum, source_sha) in rows {
                 let same_folder =
                     candidate.rsplit_once('/').map_or("", |(parent, _)| parent) == parent;
                 // Only a copy of this photo and rendition is taken over. At
@@ -1027,6 +1059,7 @@ impl State {
                         size: u64::try_from(size)?,
                         sha256,
                         checksum,
+                        source_sha,
                     }));
                 }
             }
@@ -1235,7 +1268,7 @@ impl State {
     pub(crate) async fn list_imported(&self) -> anyhow::Result<Vec<ImportedCopy>> {
         self.with(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT path, zone, master, rendition, size, sha256, checksum FROM imported ORDER BY path",
+                "SELECT path, zone, master, rendition, size, sha256, checksum, source_sha FROM imported ORDER BY path",
             )?;
             let rows = stmt
                 .query_map([], |row| {
@@ -1247,11 +1280,12 @@ impl State {
                         row.get::<_, i64>(4)?,
                         row.get::<_, Option<String>>(5)?,
                         row.get::<_, String>(6)?,
+                        row.get::<_, Option<String>>(7)?,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             rows.into_iter()
-                .map(|(path, zone, master, rendition, size, sha256, checksum)| {
+                .map(|(path, zone, master, rendition, size, sha256, checksum, source_sha)| {
                     Ok(ImportedCopy {
                         path,
                         zone,
@@ -1260,6 +1294,7 @@ impl State {
                         size: u64::try_from(size)?,
                         sha256,
                         checksum,
+                        source_sha,
                     })
                 })
                 .collect()
@@ -1593,23 +1628,29 @@ fn apply_one(
                 // A carried-over copy keeps its recorded hash: it is
                 // done if iCloud still serves the same version, and
                 // replaced only while untouched if it does not.
-                let (state, sha256) = match &file.imported {
+                // Only bytes the previous state proved it downloaded count
+                // as original; a carried-over hash alone does not.
+                let (state, sha256, source_sha) = match &file.imported {
                     Some(copy) => {
                         tx.execute("DELETE FROM imported WHERE path = ?1", [&copy.path])?;
+                        let source = copy
+                            .source_sha
+                            .clone()
+                            .filter(|_| copy.sha256 == copy.source_sha);
                         match &copy.sha256 {
-                            None => (FileState::Adopt, None),
+                            None => (FileState::Adopt, None, None),
                             Some(_) if copy.checksum == file.checksum => {
-                                (FileState::Done, copy.sha256.clone())
+                                (FileState::Done, copy.sha256.clone(), source)
                             }
-                            Some(_) => (FileState::Pending, copy.sha256.clone()),
+                            Some(_) => (FileState::Pending, copy.sha256.clone(), source),
                         }
                     }
-                    None if file.adopt => (FileState::Adopt, None),
-                    None => (FileState::Pending, None),
+                    None if file.adopt => (FileState::Adopt, None, None),
+                    None => (FileState::Pending, None, None),
                 };
                 tx.execute(
                     "INSERT INTO files (zone, asset, rendition, album, slot, path, size, checksum, state, sha256, source_sha)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                     params![
                         zone,
                         asset,
@@ -1620,7 +1661,8 @@ fn apply_one(
                         i64::try_from(file.size)?,
                         file.checksum,
                         state.as_str(),
-                        sha256
+                        sha256,
+                        source_sha
                     ],
                 )?;
             }
@@ -1631,6 +1673,25 @@ fn apply_one(
         params![zone, asset],
     )?;
     Ok(())
+}
+
+fn table_exists(conn: &Connection, table: &str) -> anyhow::Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+            [table],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> anyhow::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info(\"{table}\")"))?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(names.iter().any(|name| name == column))
 }
 
 /// Seconds before a copy that has failed `attempts` times is tried again.
@@ -1838,6 +1899,28 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn schema_three_carried_over_copies_gain_an_unproven_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.sync.db");
+        let conn = Connection::open(&path).unwrap();
+        // The imported table as schema 3 created it.
+        conn.execute_batch(
+            "CREATE TABLE imported (path TEXT PRIMARY KEY, zone TEXT NOT NULL,
+                 master TEXT NOT NULL, rendition TEXT NOT NULL, size INTEGER NOT NULL,
+                 sha256 TEXT, checksum TEXT NOT NULL) STRICT;
+             INSERT INTO imported VALUES ('a.jpg', 'Z', 'M', 'original', 1, 'abc', 'c');
+             PRAGMA user_version = 3;",
+        )
+        .unwrap();
+        drop(conn);
+        let state = State::open(&path).await.unwrap();
+        let copies = state.list_imported().await.unwrap();
+        assert_eq!(copies.len(), 1);
+        assert_eq!(copies[0].sha256.as_deref(), Some("abc"));
+        assert_eq!(copies[0].source_sha, None);
     }
 
     #[tokio::test]

@@ -192,6 +192,8 @@ struct Harness {
     zones: Mutex<Vec<String>>,
     /// What `CheckIndexingState` reports for every zone.
     indexing_finished: Mutex<bool>,
+    /// Report a state kei does not recognize instead, as iCloud's `FAILED`.
+    indexing_unavailable: Mutex<bool>,
     tweak: Mutex<Option<fn(&mut CoreConfig)>>,
     server: MockServer,
     root: tempfile::TempDir,
@@ -213,6 +215,7 @@ impl Harness {
             world: FakeICloud(Arc::new(Mutex::new(world))),
             zones: Mutex::new(vec!["PrimarySync".to_owned()]),
             indexing_finished: Mutex::new(true),
+            indexing_unavailable: Mutex::new(false),
             tweak: Mutex::new(None),
             server,
             root: tempfile::tempdir().unwrap(),
@@ -234,8 +237,13 @@ impl Harness {
             .unwrap()
             .iter()
             .map(|zone| {
-                PhotoLibrary::new_stub_with_zone(Box::new(self.world.clone()), zone)
-                    .with_stub_indexing(*self.indexing_finished.lock().unwrap())
+                let library = PhotoLibrary::new_stub_with_zone(Box::new(self.world.clone()), zone)
+                    .with_stub_indexing(*self.indexing_finished.lock().unwrap());
+                if *self.indexing_unavailable.lock().unwrap() {
+                    library.with_stub_indexing_unavailable()
+                } else {
+                    library
+                }
             })
             .collect()
     }
@@ -554,6 +562,63 @@ async fn listing_carries_on_while_icloud_indexes_then_repeats_once() {
         sorted_files(&h.photos()),
         ["2023/IMG_0001.JPG", "Trip/IMG_0002.JPG"]
     );
+}
+
+#[tokio::test]
+async fn an_index_icloud_reports_as_failed_does_not_hold_the_library() {
+    let h = Harness::new().await;
+    *h.tweak.lock().unwrap() = Some(|config| {
+        config.smart_folders = crate::selection::SmartFolderSelector::Named {
+            included: ["Screenshots".to_owned()].into(),
+            excluded: Default::default(),
+        };
+    });
+    for (asset_name, master, file) in [("A1", "M1", "PLAIN.JPG"), ("A2", "M2", "SHOT.JPG")] {
+        let record = h.master(master, file, &jpeg(file)).await;
+        h.push(record);
+        h.push(asset(asset_name, master));
+    }
+    h.world
+        .0
+        .lock()
+        .unwrap()
+        .smart
+        .insert("SCREENSHOT".into(), vec!["A2".into()]);
+    // iCloud reports FAILED for good while the library reads normally.
+    *h.indexing_unavailable.lock().unwrap() = true;
+
+    let report = h.run().await;
+    assert!(report.complete(), "{report:?}");
+    assert!(!report.zones[0].indexing);
+    assert_eq!(
+        sorted_files(&h.photos()),
+        ["2023/PLAIN.JPG", "Screenshots/SHOT.JPG"]
+    );
+    h.take_positions();
+    let quiet = h.run().await;
+    assert!(quiet.complete(), "{quiet:?}");
+    assert_eq!(h.take_positions(), [Some("p4".to_owned())], "no relist");
+}
+
+#[tokio::test]
+async fn a_listing_taken_while_indexing_is_repeated_once_when_the_state_turns_failed() {
+    let h = Harness::new().await;
+    library_with_album(&h).await;
+    *h.indexing_finished.lock().unwrap() = false;
+    let first = h.run().await;
+    assert!(first.zones[0].indexing);
+    h.take_positions();
+
+    *h.indexing_unavailable.lock().unwrap() = true;
+    let relisted = h.run().await;
+    assert!(relisted.complete(), "{relisted:?}");
+    assert!(!relisted.zones[0].indexing);
+    assert_eq!(h.take_positions()[0], None, "listed again from the start");
+    assert_eq!(relisted.zones[0].drain.downloaded, 0);
+
+    let quiet = h.run().await;
+    assert!(quiet.complete());
+    assert_eq!(h.take_positions(), [Some("p6".to_owned())]);
 }
 
 #[tokio::test]
@@ -1897,6 +1962,98 @@ async fn an_upgrade_keeps_a_previous_primary_layout_and_follows_later_reverts() 
     let quiet = run().await;
     assert_eq!(quiet.zones[0].drain.downloaded, 0);
     assert_eq!(sorted_files(&photos).len(), 2);
+}
+
+#[tokio::test]
+async fn only_bytes_kei_downloaded_count_as_original_after_an_upgrade() {
+    let h = Harness::new().await;
+    let photos = h.photos();
+    std::fs::create_dir_all(photos.join("2023")).unwrap();
+    let mut legacy_rows = Vec::new();
+    for (master, name) in [
+        ("M1", "ONE"),
+        ("M2", "TWO"),
+        ("M3", "THREE"),
+        ("M4", "FOUR"),
+    ] {
+        let bytes = jpeg(name);
+        let record = h.master(master, &format!("{name}.JPG"), &bytes).await;
+        let checksum = checksum_of(&record);
+        h.push(record);
+        h.push(asset(&format!("A-{master}"), master));
+        std::fs::write(photos.join(format!("2023/{name}.JPG")), &bytes).unwrap();
+        if master != "M4" {
+            legacy_rows.push((
+                master,
+                photos.join(format!("2023/{name}.JPG")),
+                bytes.len() as u64,
+                sha256_hex(&bytes),
+                checksum,
+            ));
+        }
+    }
+    let owner = account("upgrade@example.invalid");
+    let legacy = h.root.path().join("account.db");
+    legacy_state(&legacy, &owner, &legacy_rows).await;
+    // M1: the previous state proved it downloaded these bytes. M3: what it
+    // downloaded differs from what is on disk now. M2 has no proof at all.
+    let conn = rusqlite::Connection::open(&legacy).unwrap();
+    for (master, name, source) in [
+        ("M1", "ONE", sha256_hex(&jpeg("ONE"))),
+        (
+            "M3",
+            "THREE",
+            sha256_hex(b"downloaded before a metadata write"),
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO asset_metadata_paths (library, id, version_size, local_path,
+                 provider_checksum, local_checksum, source_checksum)
+             SELECT library, id, version_size, local_path, checksum, local_checksum, ?2
+             FROM assets WHERE id = ?1",
+            rusqlite::params![master, source],
+        )
+        .unwrap();
+        let _ = name;
+    }
+    drop(conn);
+    let target = State::path_for(&legacy);
+    upgrade::prepare(&legacy, &target, &owner, &photos)
+        .await
+        .unwrap()
+        .unwrap();
+    let state = State::open(&target).await.unwrap();
+    let report = run_cycle(
+        &state,
+        &h.libraries(),
+        &h.config(),
+        &reqwest::Client::new(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(report.zones[0].drain.downloaded, 0);
+    assert_eq!(report.zones[0].drain.adopted, 1, "M4 had no record");
+    drop(state);
+
+    let db = rusqlite::Connection::open(&target).unwrap();
+    let source = |path: &str| -> Option<String> {
+        db.query_row(
+            "SELECT source_sha FROM files WHERE path = ?1",
+            [path],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(source("2023/ONE.JPG"), Some(sha256_hex(&jpeg("ONE"))));
+    assert_eq!(source("2023/TWO.JPG"), None);
+    assert_eq!(source("2023/THREE.JPG"), None);
+    assert_eq!(
+        source("2023/FOUR.JPG"),
+        None,
+        "an adopted file was not downloaded by kei"
+    );
 }
 
 #[tokio::test]

@@ -1,10 +1,13 @@
 //! iCloud's indexing state, read once per zone per cycle.
 //!
-//! `changes/zone` is read whatever the state is. Only smart folders that come
-//! from iCloud's search index (Screenshots, Selfies and the like) wait for
-//! indexing to finish. Apple does not say whether a listing taken while it
-//! is still indexing is complete, so a zone observed then is listed once more
-//! from the start on the first cycle that sees indexing finished.
+//! `changes/zone` is read whatever the state is. While iCloud says it is
+//! still indexing (RUNNING), smart folders that come from its search index
+//! (Screenshots, Selfies and the like) wait, and since Apple does not say
+//! whether a listing taken then is complete, the zone is listed once more
+//! from the start when indexing stops running. Some accounts report `FAILED`
+//! or no state for good while the library reads normally; that is treated as
+//! unavailable rather than as indexing, so it neither holds the cycle
+//! incomplete nor waits for a FINISHED that may never come.
 
 use crate::icloud::error::ICloudError;
 use crate::icloud::photos::PhotoLibrary;
@@ -21,8 +24,11 @@ const STARTED: &str = "started";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Indexing {
     Finished,
-    /// iCloud said it is still indexing, or did not say it is finished.
+    /// iCloud said it is still indexing (RUNNING).
     NotFinished,
+    /// iCloud reported a state kei does not recognize, such as `FAILED`, or
+    /// none. Listing carries on as if indexing were finished.
+    Unavailable(&'static str),
     /// The check itself failed. Nothing about the zone's listing changes.
     Unknown,
 }
@@ -31,7 +37,8 @@ impl Indexing {
     pub(super) async fn check(library: &PhotoLibrary) -> Self {
         match library.check_indexing_once().await {
             Ok(true) => Self::Finished,
-            Ok(false) | Err(ICloudError::IndexingUnavailable(_)) => Self::NotFinished,
+            Ok(false) => Self::NotFinished,
+            Err(ICloudError::IndexingUnavailable(reason)) => Self::Unavailable(reason),
             Err(error) => {
                 tracing::debug!(
                     zone = library.zone_name(),
@@ -66,15 +73,24 @@ pub(super) async fn before_observe(
             );
             state.set_kv(&key, OWED).await?;
         }
-        Indexing::Finished if state.get_kv(&key).await?.as_deref() == Some(OWED) => {
-            tracing::info!(
-                zone,
-                "iCloud finished indexing this library; listing it again from the start"
-            );
-            state.relist(zone).await?;
-            state.set_kv(&key, STARTED).await?;
+        Indexing::Finished | Indexing::Unavailable(_) => {
+            if let Indexing::Unavailable(reason) = indexing {
+                tracing::warn!(
+                    zone,
+                    reason,
+                    "iCloud did not report its photo index as ready; listing and downloading continue"
+                );
+            }
+            if state.get_kv(&key).await?.as_deref() == Some(OWED) {
+                tracing::info!(
+                    zone,
+                    "iCloud is no longer indexing this library; listing it again from the start"
+                );
+                state.relist(zone).await?;
+                state.set_kv(&key, STARTED).await?;
+            }
         }
-        Indexing::Finished | Indexing::Unknown => {}
+        Indexing::Unknown => {}
     }
     Ok(())
 }
@@ -87,7 +103,7 @@ pub(super) async fn after_observe(
     caught_up: bool,
 ) -> anyhow::Result<()> {
     let key = key(zone);
-    if indexing == Indexing::Finished
+    if matches!(indexing, Indexing::Finished | Indexing::Unavailable(_))
         && caught_up
         && state.get_kv(&key).await?.as_deref() == Some(STARTED)
     {
