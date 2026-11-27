@@ -541,11 +541,13 @@ async fn download(ctx: &Ctx<'_>, job: Job) -> anyhow::Result<Result<u64, FetchEr
         modified,
     } = job;
     let path = config.directory.join(&row.path);
-    let result = match path.parent() {
-        Some(parent) if let Err(error) = tokio::fs::create_dir_all(parent).await => {
-            Err(FetchError::Failed(error.into()))
-        }
-        _ => {
+    let parent_ready = match path.parent() {
+        Some(parent) => tokio::fs::create_dir_all(parent).await,
+        None => Ok(()),
+    };
+    let result = match parent_ready {
+        Err(error) => Err(FetchError::Failed(error.into())),
+        Ok(()) => {
             core_io::fetch(
                 Fetch {
                     client,
