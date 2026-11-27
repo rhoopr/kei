@@ -1694,9 +1694,7 @@ esac
             Some("test --locked --all-features --lib --no-run --message-format=json")
         );
         for call in invocations {
-            assert!(
-                call.starts_with("sync_core::tests::copies_stress_")
-            );
+            assert!(call.starts_with("sync_core::tests::copies_stress_"));
             assert!(call.contains(" --ignored --exact "));
         }
     }
