@@ -120,7 +120,8 @@ CREATE TABLE IF NOT EXISTS imported (
     checksum TEXT NOT NULL,
     source_sha TEXT
 ) STRICT;
-CREATE INDEX IF NOT EXISTS imported_by_asset ON imported (zone, master, rendition);
+DROP INDEX IF EXISTS imported_by_asset;
+CREATE INDEX IF NOT EXISTS imported_by_identity ON imported (master, rendition);
 CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY,
     started_at INTEGER NOT NULL,
@@ -235,6 +236,8 @@ pub(crate) struct WantedFile {
 pub(crate) struct ImportedCopy {
     pub(crate) path: String,
     pub(crate) zone: String,
+    /// The photo identity the previous engine recorded: its asset record
+    /// name, or for older rows its master record name.
     pub(crate) master: String,
     pub(crate) rendition: String,
     pub(crate) size: u64,
@@ -1003,22 +1006,23 @@ impl State {
     /// A carried-over copy for a new row: the one at `path`, or else one of
     /// the same photo and rendition in the same folder. Paths already owned
     /// by a file row are never offered.
+    /// The previous engine keyed a copy by the photo's asset record name, or
+    /// for older rows its master record name, so `ids` names both.
     pub(crate) async fn imported_copy(
         &self,
         zone: &str,
-        master: &str,
+        ids: [&str; 2],
         rendition: &str,
         path: &str,
     ) -> anyhow::Result<Option<ImportedCopy>> {
-        let (zone, master, rendition, path) = (
+        let (zone, ids, rendition, path) = (
             zone.to_owned(),
-            master.to_owned(),
+            ids.map(ToOwned::to_owned),
             rendition.to_owned(),
             path.to_owned(),
         );
         self.with(move |conn| {
-            let (want_zone, want_master, want_rendition) =
-                (zone.clone(), master.clone(), rendition.clone());
+            let (want_zone, want_rendition) = (zone.clone(), rendition.clone());
             let parent = path
                 .rsplit_once('/')
                 .map_or("", |(parent, _)| parent)
@@ -1026,11 +1030,11 @@ impl State {
             let mut stmt = conn.prepare(
                 "SELECT path, zone, master, rendition, size, sha256, checksum, source_sha FROM imported i
                  WHERE NOT EXISTS (SELECT 1 FROM files f WHERE f.path = i.path)
-                   AND i.master = ?3 AND i.rendition = ?4
+                   AND i.master IN (?3, ?5) AND i.rendition = ?4
                  ORDER BY i.path = ?1 DESC, i.path",
             )?;
             let rows = stmt
-                .query_map(params![path, zone, master, rendition], |row| {
+                .query_map(params![path, zone, ids[0], rendition, ids[1]], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
@@ -1049,7 +1053,7 @@ impl State {
                 // Only a copy of this photo and rendition is taken over. At
                 // the exact path the zone may differ: schemas without a
                 // library column recorded every copy under the primary one.
-                let same_copy = master == want_master && rendition == want_rendition;
+                let same_copy = ids.contains(&master) && rendition == want_rendition;
                 if same_copy && (candidate == path || (same_folder && zone == want_zone)) {
                     return Ok(Some(ImportedCopy {
                         path: candidate,

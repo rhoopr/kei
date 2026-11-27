@@ -199,7 +199,7 @@ async fn plan_asset(
                     state,
                     &config.directory,
                     zone,
-                    photo.id(),
+                    [photo.id(), photo.asset_record_name()],
                     file.rendition,
                     &relative,
                     taken,
@@ -285,15 +285,12 @@ async fn carried_over(
     state: &State,
     directory: &Path,
     zone: &str,
-    master: &str,
+    ids: [&str; 2],
     rendition: &str,
     relative: &str,
     taken: &HashSet<String>,
 ) -> anyhow::Result<Option<ImportedCopy>> {
-    let Some(copy) = state
-        .imported_copy(zone, master, rendition, relative)
-        .await?
-    else {
+    let Some(copy) = state.imported_copy(zone, ids, rendition, relative).await? else {
         return Ok(None);
     };
     if taken.contains(&copy.path) {

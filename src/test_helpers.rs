@@ -16,9 +16,25 @@ use crate::icloud::photos::session::PhotosSession;
 /// A previous-engine state file at `path`: the released v0.24 schema with
 /// its account header bound to `owner`, as `kei migrate-state` leaves it.
 pub(crate) fn legacy_state_db(path: &Path, owner: &crate::state::db::account::AccountOwner) {
+    owned_state_db(
+        path,
+        owner,
+        include_str!("../tests/data/released-v0240-schema.sql"),
+    );
+}
+
+/// An owned, empty database with the schema v0.30.0-beta.3 created.
+pub(crate) fn beta3_state_db(path: &Path, owner: &crate::state::db::account::AccountOwner) {
+    owned_state_db(
+        path,
+        owner,
+        include_str!("../tests/data/released-v0300-beta3-schema.sql"),
+    );
+}
+
+fn owned_state_db(path: &Path, owner: &crate::state::db::account::AccountOwner, schema: &str) {
     let conn = rusqlite::Connection::open(path).unwrap();
-    conn.execute_batch(include_str!("../tests/data/released-v0240-schema.sql"))
-        .unwrap();
+    conn.execute_batch(schema).unwrap();
     conn.execute_batch(
         "CREATE TABLE account_owner (singleton INTEGER PRIMARY KEY CHECK(singleton=1),
              version INTEGER NOT NULL, account_key TEXT NOT NULL, provider_key TEXT NOT NULL);",

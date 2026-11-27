@@ -48,8 +48,9 @@ rendition of one photo in one album folder, or its unfiled copy.
 - `status` is `pending` (owed), `adopt` (a file at the path waits to be
   checked), `done`, `failed` (retried later), `modified` (changed locally and
   left alone) or `carried_over` (recorded by the previous release and not yet
-  taken over by a sync). A carried-over row's `asset_id` is the photo's master
-  record name.
+  taken over by a sync). A carried-over row's `asset_id` is the identity the
+  previous release recorded: the photo's asset record name, or for older rows
+  its master record name.
 - `selected` is false for a copy the current selection no longer wants. Its
   file is kept.
 

@@ -272,7 +272,6 @@ fn read_copies(
         "provider_active_destinations",
         &[
             "library",
-            "master",
             "version_size",
             "path",
             "size_bytes",
@@ -286,15 +285,34 @@ fn read_copies(
         } else {
             "NULL"
         };
+        // `asset_id` is the identity the other tables key copies by: the
+        // photo's asset record name, or a legacy master record name.
+        let identity = if has_columns(conn, "provider_active_destinations", &["asset_id"])? {
+            "asset_id"
+        } else if has_columns(conn, "provider_active_destinations", &["master"])? {
+            "master"
+        } else {
+            "NULL"
+        };
+        let mut destinations = Vec::new();
         collect(
             conn,
             &format!(
-                "SELECT library, master, version_size, path, size_bytes, local_checksum, checksum, {source}
+                "SELECT library, {identity}, version_size, path, size_bytes, local_checksum, checksum, {source}
                  FROM provider_active_destinations WHERE verified_media = 1"
             ),
-            &mut rows,
+            &mut destinations,
             &mut unreadable,
         )?;
+        for mut row in destinations {
+            match destination_path(&row.3) {
+                Some(path) => {
+                    row.3 = path;
+                    rows.push(row);
+                }
+                None => unreadable += 1,
+            }
+        }
     }
 
     let mut report = ImportReport {
@@ -423,6 +441,28 @@ fn hash_file(path: &Path) -> Option<String> {
     let mut hasher = sha2::Sha256::new();
     std::io::copy(&mut file, &mut hasher).ok()?;
     Some(format!("{:x}", hasher.finalize()))
+}
+
+/// A destination path as the previous engine stored it: JSON naming the
+/// path's encoding, such as `{"encoding":"utf8","path":"/photos/a.jpg"}`.
+/// Older rows hold the plain path. A path that is not valid Unicode cannot
+/// be carried over.
+pub(super) fn destination_path(stored: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "encoding", content = "path", rename_all = "snake_case")]
+    enum Stored {
+        Utf8(String),
+        UnixBytes(Vec<u8>),
+        WindowsUnits(Vec<u16>),
+    }
+    if !stored.starts_with('{') {
+        return Some(stored.to_owned());
+    }
+    match serde_json::from_str(stored).ok()? {
+        Stored::Utf8(path) => Some(path),
+        Stored::UnixBytes(bytes) => String::from_utf8(bytes).ok(),
+        Stored::WindowsUnits(units) => String::from_utf16(&units).ok(),
+    }
 }
 
 type Row = (

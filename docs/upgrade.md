@@ -15,7 +15,7 @@ These steps apply to v0.30, which replaces the sync engine. If you are installin
 v0.30 keeps its state in a new file, `<account>.sync.db`, next to the old `<account>.db`. The first command that opens state builds the new file from the old one:
 
 - The old file is opened read-only and its account is checked against the signed-in account. A mismatch refuses, and nothing is written.
-- Each local copy the old state recorded as verified is carried over: its path, size, recorded SHA-256 and iCloud checksum. Copies outside the download directory are dropped. When the old state gave one path to more than one photo, kei hashes the file and keeps only the record that matches it. Rows it cannot read are skipped and counted in the log.
+- Each local copy the old state recorded as verified is carried over: its path, size, recorded SHA-256 and iCloud checksum. The previous release recorded absolute paths, so copies outside the configured download directory are dropped; keep `[download].directory` the same for the upgrade. When the old state gave one path to more than one photo, kei hashes the file and keeps only the record that matches it. Rows it cannot read are skipped and counted in the log.
 - Nothing else is carried over: no provider inbox, catalog, selection generations, journals, legacy trust records or `.kei-history` versions.
 - The new file is checked for integrity and renamed into place. The old file is left where it was.
 
@@ -33,7 +33,7 @@ Some metadata writers need to know that a file still holds the bytes kei downloa
 
 After a cycle in which every library finished its listing without an error, kei deletes the old `<account>.db`, its `-wal`, `-shm` and `-journal` files, and the `.kei-schema-backup-*` bundles that name it, and logs the space freed. A library that iCloud reports as still indexing delays this until the listing owed after indexing has finished.
 
-Until then you can roll back: stop kei, delete `<account>.sync.db` and its `-wal` and `-shm` files, and start the previous binary. After cleanup, roll back by restoring the backup from step 1.
+Until then you can roll back: stop kei, delete `<account>.sync.db` and its `-wal` and `-shm` files, and start the previous binary. Roll back in place: the previous release recorded absolute paths, so it expects the photos where they were. After cleanup, roll back by restoring the backup from step 1 to the same locations.
 
 ## What changes in daily use
 

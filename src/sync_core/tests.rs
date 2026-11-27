@@ -868,6 +868,22 @@ async fn served_resource(h: &Harness, tag: &str, bytes: &[u8]) -> Value {
     h.master(tag, "unused.JPG", bytes).await["fields"]["resOriginalRes"].clone()
 }
 
+/// An unedited Live Photo: master `master` with still and motion.
+async fn live_photo_named(h: &Harness, master: &str, name: &str, filename: &str) {
+    let mut record = h
+        .master(master, filename, &jpeg(&format!("{master} still")))
+        .await;
+    record["fields"]["resOriginalVidComplRes"] = served_resource(
+        h,
+        &format!("{master}-mov"),
+        &mov(&format!("{master} motion")),
+    )
+    .await;
+    record["fields"]["resOriginalVidComplFileType"] = json!({"value": "com.apple.quicktime-movie"});
+    h.push(record);
+    h.push(asset(name, master));
+}
+
 /// A Live Photo in album `AL`: master `M1` with still and motion; the asset
 /// optionally carries an edit of both.
 async fn live_photo(h: &Harness, edit: Option<(&[u8], &[u8])>) {
@@ -2054,6 +2070,169 @@ async fn only_bytes_kei_downloaded_count_as_original_after_an_upgrade() {
         None,
         "an adopted file was not downloaded by kei"
     );
+}
+
+/// Zone, asset, master, rendition, path, size, SHA-256 and iCloud checksum.
+type SavedCopy = (String, String, String, String, String, i64, String, String);
+
+/// Record every copy in `state` the way v0.30.0-beta.3 did: `assets` and
+/// `asset_metadata_paths` keyed by the asset record name, and a verified
+/// `provider_active_destinations` row naming both the asset and its master,
+/// with the path stored as JSON.
+fn record_as_beta3(state: &Path, legacy: &Path, directory: &Path) -> usize {
+    let new = rusqlite::Connection::open(state).unwrap();
+    let mut stmt = new
+        .prepare(
+            "SELECT f.zone, f.asset, a.master, f.rendition, f.path, f.size, f.sha256, f.checksum
+             FROM files f JOIN assets a ON a.zone = f.zone AND a.name = f.asset
+             WHERE f.state = 'done'",
+        )
+        .unwrap();
+    let copies: Vec<SavedCopy> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let old = rusqlite::Connection::open(legacy).unwrap();
+    // The generation and decision rows a destination references hold
+    // nothing the upgrade reads.
+    old.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+    for (zone, asset, master, rendition, path, size, sha256, checksum) in &copies {
+        let absolute = directory.join(path).to_string_lossy().into_owned();
+        old.execute(
+            "INSERT OR IGNORE INTO assets (library, id, version_size, checksum, filename, created_at,
+                 size_bytes, media_type, status, local_path, last_seen_at, local_checksum,
+                 download_checksum)
+             VALUES (?1, ?2, ?3, ?4, 'x', 0, ?5, 'photo', 'downloaded', ?6, 0, ?7, ?7)",
+            rusqlite::params![zone, asset, rendition, checksum, size, absolute, sha256],
+        )
+        .unwrap();
+        old.execute(
+            "INSERT INTO asset_metadata_paths (library, id, version_size, local_path,
+                 provider_checksum, local_checksum, download_checksum, source_checksum)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?6)",
+            rusqlite::params![zone, asset, rendition, absolute, checksum, sha256],
+        )
+        .unwrap();
+        old.execute(
+            "INSERT INTO provider_active_destinations (generation, pass_key, child, library,
+                 asset_id, master, version_size, path, compat_path, checksum, size_bytes,
+                 created_at, metadata_hash, admitted, verified_media, verified_metadata,
+                 local_checksum, source_checksum, current_publication)
+             VALUES ('g1', 'p1', ?2, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 'h', 1, 1, 1, ?9, ?9, 1)",
+            rusqlite::params![
+                zone,
+                asset,
+                master,
+                rendition,
+                json!({"encoding": "utf8", "path": absolute}).to_string(),
+                absolute,
+                checksum,
+                size,
+                sha256
+            ],
+        )
+        .unwrap();
+    }
+    copies.len()
+}
+
+#[tokio::test]
+async fn an_upgrade_from_the_released_beta_takes_over_every_copy_it_recorded() {
+    let h = Harness::new().await;
+    library_with_album(&h).await;
+    live_photo_named(&h, "M3", "A3", "IMG_0003.JPG").await;
+    let m4 = h.master("M4", "IMG_0004.JPG", &jpeg("four")).await;
+    h.push(m4);
+    h.push(edited_asset(&h, "A4", "M4", &jpeg("four edited")).await);
+    let first = h.run().await;
+    assert!(first.complete(), "{first:?}");
+    let photos = h.photos();
+    let before = snapshot(&photos);
+    assert_eq!(before.len(), 6, "{:?}", before.keys());
+
+    // Replace the new state with what the released beta recorded for the
+    // same files.
+    let target = h.root.path().join("state.sync.db");
+    let legacy = h.root.path().join("state.db");
+    let owner = account("upgrade@example.invalid");
+    crate::test_helpers::beta3_state_db(&legacy, &owner);
+    let recorded = record_as_beta3(&target, &legacy, &photos);
+    assert_eq!(recorded, 6);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", target.display()));
+    }
+
+    let import = upgrade::prepare(&legacy, &target, &owner, &photos)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(import.recorded, 3 * recorded as u64);
+    assert_eq!(import.imported, recorded as u64);
+    assert_eq!(import.duplicates, 2 * recorded as u64);
+    assert_eq!(
+        (import.unreadable, import.ambiguous, import.changed_on_disk),
+        (0, 0, 0)
+    );
+
+    let report = h.run().await;
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(report.zones[0].drain.downloaded, 0);
+    assert_eq!(report.zones[0].drain.adopted, 0);
+    assert_eq!(report.completeness.done, recorded as u64);
+    assert_eq!(snapshot(&photos), before, "no file was added or changed");
+    let state = h.state().await;
+    assert!(state.list_imported().await.unwrap().is_empty());
+    assert!(upgrade::finish(&state).await.unwrap().is_some());
+    assert!(!legacy.exists());
+    drop(state);
+    let db = rusqlite::Connection::open(&target).unwrap();
+    // Each table proved the bytes kei downloaded.
+    let unproven: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM files WHERE source_sha IS NULL OR source_sha != sha256",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(unproven, 0);
+}
+
+#[test]
+fn a_destination_path_decodes_from_the_released_beta_encoding() {
+    use super::upgrade::destination_path;
+    assert_eq!(
+        destination_path(r#"{"encoding":"utf8","path":"/photos/a \"b\".jpg"}"#).as_deref(),
+        Some("/photos/a \"b\".jpg")
+    );
+    assert_eq!(
+        destination_path(r#"{"encoding":"unix_bytes","path":[47,97]}"#).as_deref(),
+        Some("/a")
+    );
+    assert_eq!(
+        destination_path(r#"{"encoding":"unix_bytes","path":[255]}"#),
+        None
+    );
+    assert_eq!(
+        destination_path(r#"{"encoding":"windows_units","path":[67,58]}"#).as_deref(),
+        Some("C:")
+    );
+    assert_eq!(
+        destination_path("/photos/plain.jpg").as_deref(),
+        Some("/photos/plain.jpg")
+    );
+    assert_eq!(destination_path("{not json"), None);
 }
 
 #[tokio::test]
