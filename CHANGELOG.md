@@ -37,6 +37,7 @@ Read the [v0.30 upgrade checklist](docs/upgrade.md) before opening an existing b
 - After an upgrade, only copies whose downloaded bytes the previous state proved count as original for orientation filling and sidecar GPS accuracy. This update upgraded the new state database to schema 4.
 - A library whose index iCloud reports as `FAILED` no longer stays incomplete or skips its queried smart folders ([#1126](https://github.com/rhoopr/kei/issues/1126)).
 - A malformed record from iCloud is skipped and counted instead of stopping the library's sync.
+- A name in `[filters].albums` that matches no album stops the sync with `Album "…" not found` before downloading, as beta.3 did, instead of quietly leaving that album out.
 
 ## [0.30.0-beta.3] - 2026-11-23
 

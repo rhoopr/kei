@@ -545,14 +545,49 @@ fn components(
     Some(out)
 }
 
-fn selects(selector: &AlbumSelector, components: &[String]) -> bool {
-    let matches = |name: &String| {
-        if name.contains('/') {
-            components.join("/") == *name
-        } else {
-            components.last() == Some(name)
-        }
+/// Named albums that match no live album, so a typo in `[filters].albums`
+/// cannot silently leave an album out. Empty while some album's name is
+/// still unknown, since a missing name may be that album's.
+pub(crate) async fn missing_named_albums(
+    state: &State,
+    selector: &AlbumSelector,
+) -> anyhow::Result<Vec<String>> {
+    let AlbumSelector::Named { included, .. } = selector else {
+        return Ok(Vec::new());
     };
+    let rows: HashMap<_, _> = state
+        .albums()
+        .await?
+        .into_iter()
+        .map(|row| ((row.zone.clone(), row.name.clone()), row))
+        .collect();
+    let Some(live) = rows
+        .iter()
+        .filter(|(_, row)| !row.deleted && !row.is_folder)
+        .map(|(key, _)| components(&rows, key))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(Vec::new());
+    };
+    Ok(included
+        .iter()
+        .filter(|name| !live.iter().any(|components| names(name, components)))
+        .cloned()
+        .collect())
+}
+
+/// `name` selects the album at `components`: its own name, or its full
+/// path from the top folder when the name has a `/`.
+fn names(name: &str, components: &[String]) -> bool {
+    if name.contains('/') {
+        components.join("/") == name
+    } else {
+        components.last().is_some_and(|last| last == name)
+    }
+}
+
+fn selects(selector: &AlbumSelector, components: &[String]) -> bool {
+    let matches = |name: &String| names(name, components);
     match selector {
         AlbumSelector::None => false,
         AlbumSelector::All { excluded } => !excluded.iter().any(matches),

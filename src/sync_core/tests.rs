@@ -1611,6 +1611,80 @@ async fn the_date_range_limits_which_photos_are_saved() {
     assert_eq!(sorted_files(&h.photos()), ["2023/OLD.JPG", "2025/NEW.JPG"]);
 }
 
+/// A named album that matches nothing once the library is listed is a
+/// mistake in the selection: the sync stops before downloading and says
+/// which name, instead of quietly leaving that album's photos out.
+#[tokio::test]
+async fn a_named_album_that_matches_nothing_stops_the_sync_before_downloading() {
+    let h = Harness::new().await;
+    library_with_album(&h).await;
+    *h.tweak.lock().unwrap() = Some(|config| {
+        config.albums = AlbumSelector::Named {
+            included: ["Trip".to_owned(), "Tirp".to_owned()].into(),
+            excluded: Default::default(),
+        };
+    });
+    let error = run_cycle(
+        &h.state().await,
+        &h.libraries(),
+        &h.config(),
+        &reqwest::Client::new(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains(r#"Album "Tirp" not found"#), "{message}");
+    assert!(!message.contains(r#""Trip""#), "{message}");
+    assert!(
+        sorted_files(&h.photos()).is_empty(),
+        "nothing is downloaded"
+    );
+    let state = h.state().await;
+    assert!(
+        state.listed("PrimarySync").await.unwrap(),
+        "the listing is kept"
+    );
+    assert_eq!(
+        state.last_run().await.unwrap().unwrap().outcome.as_deref(),
+        Some("failed")
+    );
+    drop(state);
+
+    // Fixing the name syncs from the saved listing.
+    *h.tweak.lock().unwrap() = Some(|config| {
+        config.albums = AlbumSelector::Named {
+            included: ["Trip".to_owned()].into(),
+            excluded: Default::default(),
+        };
+    });
+    let pages = h.pages_served();
+    let report = h.run().await;
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(h.pages_served() - pages, 1, "no new listing");
+    assert!(sorted_files(&h.photos()).contains(&"Trip/IMG_0002.JPG".to_owned()));
+}
+
+/// While an album's name is unknown the check waits: the missing name may
+/// be that album's.
+#[tokio::test]
+async fn a_named_album_is_not_reported_missing_while_an_album_name_is_unknown() {
+    let h = Harness::new().await;
+    library_with_album(&h).await;
+    h.push(json!({
+        "recordName": "NAMELESS", "recordType": "CPLAlbum",
+        "fields": {"albumType": {"value": 0}}
+    }));
+    *h.tweak.lock().unwrap() = Some(|config| {
+        config.albums = AlbumSelector::Named {
+            included: ["Elsewhere".to_owned()].into(),
+            excluded: Default::default(),
+        };
+    });
+    let report = h.run().await;
+    assert!(report.zones[0].error.is_none(), "{report:?}");
+}
+
 #[tokio::test]
 async fn stand_ins_for_an_unselected_shared_library_are_counted() {
     let h = Harness::new().await;

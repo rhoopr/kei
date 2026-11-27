@@ -233,6 +233,30 @@ pub(crate) async fn run_cycle(
         all_listed &= state.listed(library.zone_name()).await?;
     }
     if all_listed && !cancel.is_cancelled() {
+        // Every album is known now, so a named album that matches none is a
+        // mistake in the selection, not one still to arrive.
+        let missing = plan::missing_named_albums(state, &config.albums).await?;
+        if !missing.is_empty() {
+            let pending = state.completeness().await?.pending;
+            state
+                .finish_run(run, now(), "failed", 0, 0, pending)
+                .await?;
+            let names = missing
+                .iter()
+                .map(|name| format!("\"{name}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "{} {names} not found in the selected libraries. Check [filters].albums: a name \
+                 matches an album's own name, or its full path such as \"Travel/Paris\". \
+                 Nothing was downloaded.",
+                if missing.len() == 1 {
+                    "Album"
+                } else {
+                    "Albums"
+                }
+            );
+        }
         for (library, zone_report) in libraries.iter().zip(report.zones.iter_mut()) {
             let zone = library.zone_name();
             if !smart_folders_read(state, zone, config).await? {
