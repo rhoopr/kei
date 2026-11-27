@@ -40,6 +40,10 @@ pub(crate) struct ImportReport {
     pub(crate) outside: u64,
     /// Another recorded copy already claimed the path.
     pub(crate) duplicates: u64,
+    /// Rows whose values could not be read, such as a size stored with a
+    /// fraction. They are skipped rather than stopping the upgrade; a file
+    /// at a planned path is still adopted after hashing.
+    pub(crate) unreadable: u64,
 }
 
 /// Build and validate new state from `legacy` when `target` does not exist
@@ -194,6 +198,7 @@ fn read_copies(
     directory: &Path,
 ) -> anyhow::Result<(Vec<ImportedCopy>, ImportReport)> {
     let mut rows = Vec::new();
+    let mut unreadable = 0;
     if has_columns(
         conn,
         "assets",
@@ -220,7 +225,7 @@ fn read_copies(
             "SELECT {library}, id, version_size, local_path, size_bytes, {local}, checksum FROM assets
              WHERE status = 'downloaded' AND local_path IS NOT NULL"
         );
-        collect(conn, &sql, &mut rows)?;
+        collect(conn, &sql, &mut rows, &mut unreadable)?;
         let joined = if library == "library" {
             "a.library"
         } else {
@@ -247,6 +252,7 @@ fn read_copies(
                      WHERE a.status = 'downloaded'"
                 ),
                 &mut rows,
+                &mut unreadable,
             )?;
         }
     }
@@ -269,11 +275,13 @@ fn read_copies(
             "SELECT library, master, version_size, path, size_bytes, local_checksum, checksum
              FROM provider_active_destinations WHERE verified_media = 1",
             &mut rows,
+            &mut unreadable,
         )?;
     }
 
     let mut report = ImportReport {
-        recorded: u64::try_from(rows.len())?,
+        recorded: u64::try_from(rows.len())? + unreadable,
+        unreadable,
         ..ImportReport::default()
     };
     let mut seen = std::collections::HashSet::new();
@@ -292,7 +300,10 @@ fn read_copies(
             report.duplicates += 1;
             continue;
         }
-        let size = u64::try_from(size)?;
+        let Ok(size) = u64::try_from(size) else {
+            report.unreadable += 1;
+            continue;
+        };
         // Kept either way: the planner takes over only a file with the
         // recorded size, and verify reports the rest.
         match std::fs::symlink_metadata(&absolute) {
@@ -314,7 +325,14 @@ fn read_copies(
 
 type Row = (String, String, String, String, i64, Option<String>, String);
 
-fn collect(conn: &Connection, sql: &str, rows: &mut Vec<Row>) -> anyhow::Result<()> {
+/// Append the rows `sql` returns. A row whose values do not decode is
+/// counted in `unreadable` and skipped.
+fn collect(
+    conn: &Connection,
+    sql: &str,
+    rows: &mut Vec<Row>,
+    unreadable: &mut u64,
+) -> anyhow::Result<()> {
     let mut stmt = conn.prepare(sql)?;
     let found = stmt.query_map([], |row| {
         Ok((
@@ -328,7 +346,15 @@ fn collect(conn: &Connection, sql: &str, rows: &mut Vec<Row>) -> anyhow::Result<
         ))
     })?;
     for row in found {
-        rows.push(row?);
+        match row {
+            Ok(row) => rows.push(row),
+            Err(
+                rusqlite::Error::InvalidColumnType(..)
+                | rusqlite::Error::IntegralValueOutOfRange(..)
+                | rusqlite::Error::FromSqlConversionFailure(..),
+            ) => *unreadable += 1,
+            Err(error) => return Err(error.into()),
+        }
     }
     Ok(())
 }

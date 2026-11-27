@@ -67,6 +67,7 @@ pub(crate) async fn open(
                 changed_on_disk = import.changed_on_disk,
                 outside_download_directory = import.outside,
                 duplicates = import.duplicates,
+                unreadable = import.unreadable,
                 "Upgraded sync state; the previous state file is kept until the first full listing completes"
             );
         }

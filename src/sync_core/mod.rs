@@ -34,6 +34,8 @@ pub(crate) use state::State;
 /// Pages read before a zone yields to planning and downloads.
 const MAX_PAGES_PER_CYCLE: usize = 100_000;
 const PLAN_CONFIG_KEY: &str = "plan_config";
+/// Kv key holding the download folder the saved copies were checked against.
+const DIRECTORY_KEY: &str = "download_directory";
 
 /// Settings the sync core reads.
 #[derive(Debug, Clone)]
@@ -159,6 +161,7 @@ pub(crate) async fn run_cycle(
     cancel: &CancellationToken,
 ) -> anyhow::Result<CycleReport> {
     let run = state.start_run(now()).await?;
+    follow_directory_change(state, &config.directory).await?;
     let fingerprint = config.plan_fingerprint();
     if state.get_kv(PLAN_CONFIG_KEY).await?.as_deref() != Some(fingerprint.as_str()) {
         state.mark_all_dirty().await?;
@@ -314,6 +317,50 @@ pub(crate) async fn run_cycle(
         )
         .await?;
     Ok(report)
+}
+
+/// Saved, wanted copies whose file is missing from `directory`, as relative
+/// paths.
+pub(crate) async fn missing_saved_copies(
+    state: &State,
+    directory: &std::path::Path,
+) -> anyhow::Result<Vec<String>> {
+    let mut missing = Vec::new();
+    for file in state.list_files(&[state::FileState::Done]).await? {
+        if !file.wanted {
+            continue;
+        }
+        match tokio::fs::symlink_metadata(directory.join(&file.path)).await {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => missing.push(file.path),
+            Err(error) => anyhow::bail!("Could not check {}: {error}", file.path),
+            Ok(_) => {}
+        }
+    }
+    Ok(missing)
+}
+
+/// Saved copies are recorded relative to the download folder. When the
+/// folder changes, copies that were not moved along are owed again, so the
+/// new folder ends up complete instead of only receiving new photos.
+async fn follow_directory_change(state: &State, directory: &std::path::Path) -> anyhow::Result<()> {
+    let current = directory.to_string_lossy().into_owned();
+    let previous = state.get_kv(DIRECTORY_KEY).await?;
+    if previous.as_deref() == Some(current.as_str()) {
+        return Ok(());
+    }
+    if previous.is_some() {
+        let missing = missing_saved_copies(state, directory).await?;
+        for path in &missing {
+            if let Some(row) = state.file_at(path).await? {
+                state.owe_again(row.id, None).await?;
+            }
+        }
+        tracing::warn!(
+            missing = missing.len(),
+            "The download folder changed; saved copies not found in the new folder are downloaded again"
+        );
+    }
+    state.set_kv(DIRECTORY_KEY, &current).await
 }
 
 fn smart_read_key(zone: &str, folder: &str) -> String {

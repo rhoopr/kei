@@ -46,20 +46,7 @@ pub(crate) async fn run_reconcile(
         return inspect(&state, &directory, &path, args.confirm_damage.as_deref()).await;
     }
 
-    let mut missing = Vec::new();
-    for file in state
-        .list_files(&[crate::sync_core::state::FileState::Done])
-        .await?
-    {
-        if !file.wanted {
-            continue;
-        }
-        match tokio::fs::symlink_metadata(directory.join(&file.path)).await {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => missing.push(file.path),
-            Err(error) => anyhow::bail!("Could not check {}: {error}", file.path),
-            Ok(_) => {}
-        }
-    }
+    let missing = crate::sync_core::missing_saved_copies(&state, &directory).await?;
     // Carried-over copies with no file are never taken over, so the next
     // sync downloads them as new copies; list them with the rest.
     let mut carried = Vec::new();

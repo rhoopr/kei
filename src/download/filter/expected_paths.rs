@@ -37,6 +37,23 @@ pub(in crate::download) struct DerivedPath {
     pub(in crate::download) naming_role: NamingRole,
 }
 
+impl DerivedPath {
+    /// The primary-naming slot this path fills; see `ExpectedFile::slot`.
+    pub(in crate::download) fn primary_slot(&self) -> &'static str {
+        let motion = matches!(
+            self.version_size,
+            VersionSizeKey::LiveOriginal | VersionSizeKey::LiveAdjusted
+        );
+        match (self.naming_role, motion) {
+            (NamingRole::Rendition, _) => "",
+            (NamingRole::Current, false) => "still",
+            (NamingRole::Current, true) => "motion",
+            (NamingRole::OriginalArchive, false) => "still_original",
+            (NamingRole::OriginalArchive, true) => "motion_original",
+        }
+    }
+}
+
 /// Placement role is independent of the stable rendition key.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum NamingRole {

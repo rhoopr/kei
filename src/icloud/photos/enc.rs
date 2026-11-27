@@ -15,6 +15,25 @@ use base64::Engine;
 use plist::Value as PlistValue;
 use serde_json::Value;
 
+/// When the photo was last edited, from its `adjustmentTimestampEnc` plist
+/// date. This is Photos' adjustment time, not the record's modification
+/// time. Unknown encodings and dates outside the plausible range stay unknown.
+pub(crate) fn decode_adjustment_timestamp(fields: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    let entry = fields.get("adjustmentTimestampEnc")?;
+    if entry.get("value")?.as_str()?.len() > 1024 {
+        return None;
+    }
+    let bytes = decoded_bytes(entry)?;
+    let value = PlistValue::from_reader(Cursor::new(&bytes)).ok()?;
+    let date = value.as_date()?;
+    let time = std::time::SystemTime::from(date);
+    if time < std::time::UNIX_EPOCH || time > std::time::SystemTime::now() {
+        return None;
+    }
+    let date = chrono::DateTime::<chrono::Utc>::from(time);
+    (date >= chrono::DateTime::UNIX_EPOCH && date <= chrono::Utc::now()).then_some(date)
+}
+
 /// Read the `value` string from a `fieldEnc` JSON entry.
 ///
 /// Accepts both Apple variants: `type: "STRING"` (plain UTF-8 text in

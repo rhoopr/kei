@@ -13,7 +13,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::icloud::photos::feed::Observation;
 
-pub(crate) const SCHEMA_VERSION: i64 = 2;
+pub(crate) const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS kv (
@@ -75,12 +75,18 @@ CREATE TABLE IF NOT EXISTS smart_members (
     asset TEXT NOT NULL,
     PRIMARY KEY (zone, folder, asset)
 ) STRICT;
+";
+
+/// `files` as of schema 3. A copy in a primary-naming slot keeps its path
+/// while the rendition that fills it changes, so `slot` is part of its key.
+const FILES_TABLE: &str = "
 CREATE TABLE IF NOT EXISTS files (
     id INTEGER PRIMARY KEY,
     zone TEXT NOT NULL,
     asset TEXT NOT NULL,
     rendition TEXT NOT NULL,
     album TEXT NOT NULL,
+    slot TEXT NOT NULL DEFAULT '',
     path TEXT NOT NULL UNIQUE,
     size INTEGER NOT NULL,
     checksum TEXT NOT NULL,
@@ -89,14 +95,18 @@ CREATE TABLE IF NOT EXISTS files (
     wanted INTEGER NOT NULL DEFAULT 1,
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
+    retry_at INTEGER,
     pending_sha TEXT,
     pending_fields TEXT,
     source_sha TEXT,
     meta_dirty INTEGER NOT NULL DEFAULT 1,
     meta_hash TEXT,
     meta_fields TEXT,
-    UNIQUE (zone, asset, rendition, album)
+    UNIQUE (zone, asset, rendition, album, slot)
 ) STRICT;
+";
+
+const SCHEMA_TAIL: &str = "
 CREATE INDEX IF NOT EXISTS files_by_state ON files (state) WHERE wanted = 1;
 CREATE INDEX IF NOT EXISTS files_meta_dirty ON files (zone, id)
     WHERE meta_dirty = 1 AND state = 'done' AND wanted = 1;
@@ -177,6 +187,8 @@ pub(crate) struct FileRow {
     pub(crate) attempts: i64,
     /// Bytes kei was about to publish at this path when it last stopped.
     pub(crate) pending_sha: Option<String>,
+    /// The primary-naming slot this copy fills, or empty.
+    pub(crate) slot: String,
 }
 
 /// A saved copy whose metadata the metadata pass checks.
@@ -204,6 +216,10 @@ pub(crate) struct MetadataRow {
 pub(crate) struct WantedFile {
     pub(crate) rendition: String,
     pub(crate) album: String,
+    /// The primary-naming slot this copy fills, or empty.
+    pub(crate) slot: String,
+    /// The existing row the planner matched; `None` creates a row.
+    pub(crate) row: Option<i64>,
     pub(crate) path: String,
     pub(crate) size: u64,
     pub(crate) checksum: String,
@@ -323,7 +339,27 @@ impl State {
             tx.execute("UPDATE files SET source_sha = sha256", [])?;
             tx.commit()?;
         }
+        if (1..=2).contains(&version) {
+            // Schema 3 adds primary-naming slots to the copy key and a retry
+            // time for failed copies. SQLite cannot change a key in place.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch("ALTER TABLE files RENAME TO files_v2")?;
+            tx.execute_batch(FILES_TABLE)?;
+            tx.execute_batch(
+                "INSERT INTO files (id, zone, asset, rendition, album, path, size, checksum,
+                     sha256, state, wanted, attempts, last_error, pending_sha, pending_fields,
+                     source_sha, meta_dirty, meta_hash, meta_fields)
+                 SELECT id, zone, asset, rendition, album, path, size, checksum,
+                     sha256, state, wanted, attempts, last_error, pending_sha, pending_fields,
+                     source_sha, meta_dirty, meta_hash, meta_fields
+                 FROM files_v2;
+                 DROP TABLE files_v2;",
+            )?;
+            tx.commit()?;
+        }
         conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(FILES_TABLE)?;
+        conn.execute_batch(SCHEMA_TAIL)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -740,20 +776,24 @@ impl State {
                 params![zone, asset],
             )?;
             for file in wanted {
-                let existing: Option<(i64, String, String)> = tx
-                    .query_row(
-                        "SELECT id, checksum, state FROM files
-                         WHERE zone = ?1 AND asset = ?2 AND rendition = ?3 AND album = ?4",
-                        params![zone, asset, file.rendition, file.album],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                    )
-                    .optional()?;
+                let existing: Option<(i64, String, String, String)> = match file.row {
+                    Some(id) => Some(tx.query_row(
+                        "SELECT id, checksum, state, rendition FROM files
+                         WHERE id = ?1 AND zone = ?2 AND asset = ?3",
+                        params![id, zone, asset],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )?),
+                    None => None,
+                };
                 match existing {
-                    Some((id, checksum, state)) => {
+                    Some((id, checksum, state, rendition)) => {
                         let state = FileState::parse(&state)?;
-                        // A new version makes a saved or adoptable copy owed again; a
-                        // locally modified copy stays as it is.
-                        let next = if checksum == file.checksum || state == FileState::Modified {
+                        // A new version, or another rendition taking over a
+                        // primary-naming slot, makes a saved or adoptable
+                        // copy owed again; a locally modified copy stays as
+                        // it is.
+                        let changed = checksum != file.checksum || rendition != file.rendition;
+                        let next = if !changed || state == FileState::Modified {
                             state
                         } else if matches!(state, FileState::Adopt | FileState::Done) {
                             FileState::Pending
@@ -761,10 +801,20 @@ impl State {
                             state
                         };
                         tx.execute(
-                            "UPDATE files SET wanted = 1, size = ?2, checksum = ?3, state = ?4,
-                                 meta_dirty = 1
+                            "UPDATE files SET wanted = 1, rendition = ?2, slot = ?3, size = ?4,
+                                 checksum = ?5, state = ?6, meta_dirty = 1,
+                                 attempts = CASE WHEN ?7 THEN 0 ELSE attempts END,
+                                 retry_at = CASE WHEN ?7 THEN NULL ELSE retry_at END
                              WHERE id = ?1",
-                            params![id, i64::try_from(file.size)?, file.checksum, next.as_str()],
+                            params![
+                                id,
+                                file.rendition,
+                                file.slot,
+                                i64::try_from(file.size)?,
+                                file.checksum,
+                                next.as_str(),
+                                changed
+                            ],
                         )?;
                     }
                     None => {
@@ -786,13 +836,14 @@ impl State {
                             None => (FileState::Pending, None),
                         };
                         tx.execute(
-                            "INSERT INTO files (zone, asset, rendition, album, path, size, checksum, state, sha256, source_sha)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+                            "INSERT INTO files (zone, asset, rendition, album, slot, path, size, checksum, state, sha256, source_sha)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
                             params![
                                 zone,
                                 asset,
                                 file.rendition,
                                 file.album,
+                                file.slot,
                                 file.path,
                                 i64::try_from(file.size)?,
                                 file.checksum,
@@ -836,13 +887,17 @@ impl State {
         limit: usize,
     ) -> anyhow::Result<Vec<FileRow>> {
         let zone = zone.to_owned();
+        let now = chrono::Utc::now().timestamp();
         self.with(move |conn| {
+            // A failed copy waits until its retry time.
             let mut stmt = conn.prepare(&format!(
                 "{FILE_COLUMNS} WHERE zone = ?1 AND wanted = 1 AND id > ?2
-                 AND state IN ('pending', 'adopt', 'failed') ORDER BY id LIMIT ?3"
+                 AND (state IN ('pending', 'adopt')
+                      OR (state = 'failed' AND (retry_at IS NULL OR retry_at <= ?4)))
+                 ORDER BY id LIMIT ?3"
             ))?;
             let rows = stmt
-                .query_map(params![zone, after, i64::try_from(limit)?], file_row)?
+                .query_map(params![zone, after, i64::try_from(limit)?, now], file_row)?
                 .collect::<Result<Vec<_>, _>>()?;
             rows.into_iter().collect()
         })
@@ -893,13 +948,21 @@ impl State {
         .await
     }
 
+    /// Record a failed attempt. The copy is retried on the next cycles at
+    /// first, then less often; see [`retry_delay`].
     pub(crate) async fn mark_failed(&self, id: i64, error: &str) -> anyhow::Result<()> {
         let error = error.to_owned();
+        let now = chrono::Utc::now().timestamp();
         self.with(move |conn| {
+            let attempts: i64 = conn.query_row(
+                "SELECT attempts + 1 FROM files WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )?;
             conn.execute(
-                "UPDATE files SET state = 'failed', attempts = attempts + 1, last_error = ?2
+                "UPDATE files SET state = 'failed', attempts = ?3, last_error = ?2, retry_at = ?4
                  WHERE id = ?1",
-                params![id, error],
+                params![id, error, attempts, now + retry_delay(attempts)],
             )?;
             Ok(())
         })
@@ -1487,7 +1550,7 @@ impl State {
     }
 }
 
-const FILE_COLUMNS: &str = "SELECT id, zone, asset, rendition, album, path, size, checksum, sha256, state, attempts, pending_sha FROM files";
+const FILE_COLUMNS: &str = "SELECT id, zone, asset, rendition, album, path, size, checksum, sha256, state, attempts, pending_sha, slot FROM files";
 
 fn file_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<anyhow::Result<FileRow>> {
     let state: String = row.get(9)?;
@@ -1506,8 +1569,24 @@ fn file_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<anyhow::Result<FileRow>
             state: FileState::parse(&state)?,
             attempts: row.get(10)?,
             pending_sha: row.get(11)?,
+            slot: row.get(12)?,
         })
     })())
+}
+
+/// Seconds before a copy that has failed `attempts` times is tried again.
+/// The first few failures retry every cycle, since most are passing network
+/// trouble. After that the wait doubles from an hour up to a day, so a copy
+/// iCloud keeps refusing costs one attempt a day.
+pub(crate) fn retry_delay(attempts: i64) -> i64 {
+    const RETRIES_EVERY_CYCLE: i64 = 3;
+    const HOUR: i64 = 3600;
+    const DAY: i64 = 24 * HOUR;
+    if attempts <= RETRIES_EVERY_CYCLE {
+        return 0;
+    }
+    let doublings = u32::try_from((attempts - RETRIES_EVERY_CYCLE - 1).min(5)).unwrap_or(5);
+    (HOUR << doublings).min(DAY)
 }
 
 /// Mark the photo a stand-in links to for planning.
@@ -1653,7 +1732,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schema_one_gains_receipt_and_metadata_columns() {
+    async fn schema_one_gains_receipt_metadata_and_slot_columns() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.sync.db");
         let conn = Connection::open(&path).unwrap();
@@ -1687,6 +1766,19 @@ mod tests {
                 .unwrap(),
             ("abc".to_owned(), 1)
         );
+        // Schema 3 rebuilt the table with slots in the key.
+        assert_eq!(row.slot, "");
+        state
+            .with(|conn| {
+                conn.execute(
+                    "INSERT INTO files (zone, asset, rendition, album, slot, path, size, checksum, state)
+                     VALUES ('Z', 'A', 'original', '', 'still_original', 'b.jpg', 1, 'c', 'pending')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1713,9 +1805,11 @@ mod tests {
             .commit_page("Z", vec![asset("A1", "M1")], "t1".into(), true)
             .await
             .unwrap();
-        let wanted = |checksum: &str, path: &str| WantedFile {
+        let wanted = |checksum: &str, path: &str, row: Option<i64>| WantedFile {
             rendition: "original".into(),
             album: String::new(),
+            slot: String::new(),
+            row,
             path: path.into(),
             size: 3,
             checksum: checksum.into(),
@@ -1723,7 +1817,7 @@ mod tests {
             imported: None,
         };
         state
-            .apply_plan("Z", "A1", vec![wanted("c1", "a.jpg")])
+            .apply_plan("Z", "A1", vec![wanted("c1", "a.jpg", None)])
             .await
             .unwrap();
         let row = state.work("Z", 0, 10).await.unwrap().remove(0);
@@ -1732,7 +1826,7 @@ mod tests {
 
         // A new version keeps the original path and the recorded hash.
         state
-            .apply_plan("Z", "A1", vec![wanted("c2", "renamed.jpg")])
+            .apply_plan("Z", "A1", vec![wanted("c2", "renamed.jpg", Some(row.id))])
             .await
             .unwrap();
         let row = state.work("Z", 0, 10).await.unwrap().remove(0);
@@ -1745,6 +1839,54 @@ mod tests {
         state.apply_plan("Z", "A1", Vec::new()).await.unwrap();
         assert!(state.work("Z", 0, 10).await.unwrap().is_empty());
         assert_eq!(state.files_for_asset("Z", "A1").await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn failed_copies_retry_every_cycle_at_first_then_up_to_daily() {
+        assert_eq!(
+            (1..=10).map(retry_delay).collect::<Vec<_>>(),
+            [0, 0, 0, 3600, 7200, 14_400, 28_800, 57_600, 86_400, 86_400]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_copy_waits_for_its_retry_time_and_a_new_version_clears_it() {
+        let state = State::open_in_memory().unwrap();
+        state
+            .commit_page("Z", vec![asset("A1", "M1")], "t1".into(), true)
+            .await
+            .unwrap();
+        let wanted = |checksum: &str, row: Option<i64>| WantedFile {
+            rendition: "original".into(),
+            album: String::new(),
+            slot: String::new(),
+            row,
+            path: "a.jpg".into(),
+            size: 3,
+            checksum: checksum.into(),
+            adopt: false,
+            imported: None,
+        };
+        state
+            .apply_plan("Z", "A1", vec![wanted("c1", None)])
+            .await
+            .unwrap();
+        let id = state.work("Z", 0, 10).await.unwrap()[0].id;
+        for _ in 0..3 {
+            state.mark_failed(id, "refused").await.unwrap();
+            assert_eq!(state.work("Z", 0, 10).await.unwrap().len(), 1);
+        }
+        state.mark_failed(id, "refused").await.unwrap();
+        assert!(state.work("Z", 0, 10).await.unwrap().is_empty());
+        assert_eq!(state.owed("Z").await.unwrap(), 1, "it is still owed");
+
+        // iCloud serves a new version: try it right away.
+        state
+            .apply_plan("Z", "A1", vec![wanted("c2", Some(id))])
+            .await
+            .unwrap();
+        let row = state.work("Z", 0, 10).await.unwrap().remove(0);
+        assert_eq!(row.attempts, 0);
     }
 
     #[tokio::test]

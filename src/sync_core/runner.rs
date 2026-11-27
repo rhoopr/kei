@@ -102,7 +102,7 @@ pub(crate) async fn run(run: Run<'_>) -> anyhow::Result<()> {
             anyhow::ensure!(
                 report.completeness.failed == 0
                     && report.zones.iter().all(|zone| zone.error.is_none()),
-                "Sync finished with {} failed downloads; the next run retries them",
+                "Sync finished with {} failed downloads; they are retried every run at first, then up to once a day",
                 report.completeness.failed
             );
             return Ok(());

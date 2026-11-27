@@ -303,16 +303,24 @@ async fn download_batch(
         jobs.push((row, file.url.clone(), replace));
     }
 
-    let modified = |row: &FileRow| -> i64 {
-        records
-            .get(&row.asset)
-            .and_then(|record| capture_seconds(&record.fields))
-            .unwrap_or(0)
+    let modified = |row: &FileRow, replacing: bool| -> i64 {
+        let fields = records.get(&row.asset).map(|record| &record.fields);
+        // A primary-naming slot that changes hands gets the edit's time, or
+        // the current time for a revert, so library scanners notice it.
+        // Every other copy carries the capture time.
+        if replacing && matches!(row.slot.as_str(), "still" | "motion") {
+            let edited = row.rendition.contains("adjusted");
+            return fields
+                .filter(|_| edited)
+                .and_then(crate::icloud::photos::enc::decode_adjustment_timestamp)
+                .map_or_else(|| chrono::Utc::now().timestamp(), |time| time.timestamp());
+        }
+        fields.and_then(capture_seconds).unwrap_or(0)
     };
     let jobs = jobs
         .into_iter()
         .map(|(row, url, replace)| {
-            let seconds = modified(&row);
+            let seconds = modified(&row, replace.is_some());
             async move {
                 let path = config.directory.join(&row.path);
                 if let Some(parent) = path.parent()
@@ -423,6 +431,7 @@ mod tests {
             state: FileState::Pending,
             attempts: 0,
             pending_sha: None,
+            slot: String::new(),
         }
     }
 

@@ -1,6 +1,8 @@
 //! Turn catalog facts into the local copies kei owes.
 //!
 //! A copy's path is chosen once, when its row is created, and never changes.
+//! With primary naming, the rendition at the plain name follows edits and
+//! reverts while the path stays.
 //! An album's folder is fixed the first time a copy is planned into it, so
 //! renaming the album in iCloud moves nothing. Copies that stop being wanted
 //! keep their files.
@@ -8,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use crate::download::core_io::expected_files;
+use crate::download::core_io::{ExpectedFile, expected_files};
 use crate::download::filter::PathDerivationConfig;
 use crate::download::paths;
 use crate::icloud::photos::feed::{SmartRule, in_derived_smart_folder, smart_rule, stored_asset};
@@ -16,7 +18,7 @@ use crate::icloud::photos::smart_folders::{sensitive_smart_folder_names, smart_f
 use crate::selection::{AlbumSelector, SmartFolderSelector};
 
 use super::CoreConfig;
-use super::state::{AlbumRow, DirtyAsset, ImportedCopy, State, WantedFile};
+use super::state::{AlbumRow, DirtyAsset, FileRow, ImportedCopy, State, WantedFile};
 
 const BATCH: usize = 256;
 /// `files.album` prefix for smart folder copies.
@@ -151,12 +153,8 @@ async fn plan_asset(
         });
     }
 
-    let existing: HashSet<(String, String)> = state
-        .files_for_asset(zone, &asset.name)
-        .await?
-        .into_iter()
-        .map(|row| (row.rendition, row.album))
-        .collect();
+    let existing = state.files_for_asset(zone, &asset.name).await?;
+    let mut claimed = HashSet::new();
     let mut taken = HashSet::new();
     let mut wanted = Vec::new();
     for placement in placements {
@@ -170,9 +168,12 @@ async fn plan_asset(
         for file in files {
             let relative = relative_path(&config.directory, &file.path)?;
             let mut imported = None;
+            let mut row = None;
             let (path, adopt) =
-                if existing.contains(&(file.rendition.to_owned(), placement.key.clone())) {
-                    (relative, false)
+                if let Some(existing) = matching_row(&existing, &claimed, &placement.key, &file) {
+                    claimed.insert(existing.id);
+                    row = Some(existing.id);
+                    (existing.path.clone(), false)
                 } else if let Some(copy) = carried_over(
                     state,
                     &config.directory,
@@ -205,6 +206,8 @@ async fn plan_asset(
             wanted.push(WantedFile {
                 rendition: file.rendition.to_owned(),
                 album: placement.key.clone(),
+                slot: file.slot.to_owned(),
+                row,
                 path,
                 size: file.size,
                 checksum: file.checksum,
@@ -214,6 +217,44 @@ async fn plan_asset(
         }
     }
     Ok(Some(wanted))
+}
+
+/// The existing copy that `file` continues, if any. A path never changes, so
+/// a match keeps its path.
+///
+/// With primary naming the plain name belongs to a slot, not a rendition:
+/// when a photo is edited, the copy at the plain name takes the edit and the
+/// original gets a new `_original` copy; when the edit is reverted, the
+/// plain name takes the original again. A slot is matched first, then a
+/// copy of the same rendition planned before the slot existed.
+fn matching_row<'a>(
+    existing: &'a [FileRow],
+    claimed: &HashSet<i64>,
+    album: &str,
+    file: &ExpectedFile,
+) -> Option<&'a FileRow> {
+    let mut free = existing
+        .iter()
+        .filter(|row| row.album == album && !claimed.contains(&row.id));
+    if file.slot.is_empty() {
+        let candidates: Vec<&FileRow> =
+            free.filter(|row| row.rendition == file.rendition).collect();
+        return candidates
+            .iter()
+            .find(|row| row.slot.is_empty())
+            .or_else(|| candidates.first())
+            .copied();
+    }
+    let candidates: Vec<&FileRow> = free.by_ref().collect();
+    candidates
+        .iter()
+        .find(|row| row.slot == file.slot)
+        .or_else(|| {
+            candidates
+                .iter()
+                .find(|row| row.slot.is_empty() && row.rendition == file.rendition)
+        })
+        .copied()
 }
 
 /// A copy the previous engine recorded for this photo and rendition at the

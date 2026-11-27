@@ -618,6 +618,129 @@ fn health_counts_new_failures_without_progress_not_repeated_ones() {
     );
 }
 
+/// The asset record with an adjusted rendition served as `bytes`, as iCloud
+/// reports a photo edited on a device.
+async fn edited_asset(h: &Harness, name: &str, master: &str, bytes: &[u8]) -> Value {
+    let served = h.master(&format!("{name}-edit"), "unused.JPG", bytes).await;
+    with_fields(
+        asset(name, master),
+        json!({
+            "resJPEGFullRes": served["fields"]["resOriginalRes"].clone(),
+            "resJPEGFullFileType": {"value": "public.jpeg"},
+            "adjustmentType": {"value": "com.apple.photo"}
+        }),
+    )
+}
+
+#[tokio::test]
+async fn primary_naming_hands_the_plain_name_to_the_edit_and_back() {
+    let h = Harness::new().await;
+    *h.tweak.lock().unwrap() = Some(|config| {
+        config.paths.edited_naming = crate::types::EditedNaming::Primary;
+    });
+    let m1 = h.master("M1", "IMG_0001.JPG", &jpeg("original")).await;
+    h.push(m1);
+    h.push(asset("A1", "M1"));
+    h.run().await;
+    assert_eq!(sorted_files(&h.photos()), ["2023/IMG_0001.JPG"]);
+
+    // Edited on a device: the plain name takes the edit and the original
+    // is kept beside it.
+    let edited = edited_asset(&h, "A1", "M1", &jpeg("edit one")).await;
+    h.push(edited);
+    let report = h.run().await;
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(
+        sorted_files(&h.photos()),
+        ["2023/IMG_0001.JPG", "2023/IMG_0001_original.JPG"]
+    );
+    assert_eq!(h.file("2023/IMG_0001.JPG").unwrap(), jpeg("edit one"));
+    assert_eq!(
+        h.file("2023/IMG_0001_original.JPG").unwrap(),
+        jpeg("original")
+    );
+    // Scanners see the plain name change; the original keeps its capture time.
+    let mtime = |relative: &str| {
+        std::fs::metadata(h.photos().join(relative))
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64()
+    };
+    assert!(mtime("2023/IMG_0001.JPG") > CAPTURED_MS / 1000.0 + 86_400.0);
+    assert!((mtime("2023/IMG_0001_original.JPG") - CAPTURED_MS / 1000.0).abs() < 2.0);
+
+    // Edited again: only the plain name changes.
+    let edited = edited_asset(&h, "A1", "M1", &jpeg("edit two")).await;
+    h.push(edited);
+    let report = h.run().await;
+    assert_eq!(report.zones[0].drain.downloaded, 1);
+    assert_eq!(h.file("2023/IMG_0001.JPG").unwrap(), jpeg("edit two"));
+
+    // Reverted: the plain name holds the original again, and the copy
+    // beside it stays.
+    h.push(asset("A1", "M1"));
+    let report = h.run().await;
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(report.zones[0].drain.downloaded, 1);
+    assert_eq!(
+        sorted_files(&h.photos()),
+        ["2023/IMG_0001.JPG", "2023/IMG_0001_original.JPG"]
+    );
+    assert_eq!(h.file("2023/IMG_0001.JPG").unwrap(), jpeg("original"));
+
+    // Edited again after a local change to the plain name: the local file
+    // is kept and reported, and the original beside it is reused.
+    std::fs::write(h.photos().join("2023/IMG_0001.JPG"), jpeg("changed here")).unwrap();
+    let edited = edited_asset(&h, "A1", "M1", &jpeg("edit three")).await;
+    h.push(edited);
+    let report = h.run().await;
+    assert_eq!(report.completeness.modified, 1);
+    assert_eq!(report.zones[0].drain.downloaded, 0);
+    assert_eq!(h.file("2023/IMG_0001.JPG").unwrap(), jpeg("changed here"));
+    assert_eq!(
+        h.file("2023/IMG_0001_original.JPG").unwrap(),
+        jpeg("original")
+    );
+}
+
+#[tokio::test]
+async fn a_new_download_folder_gets_every_copy_not_moved_along() {
+    let h = Harness::new().await;
+    library_with_album(&h).await;
+    h.run().await;
+    // Move one copy along by hand; the other stays behind.
+    let moved = h.root.path().join("moved");
+    std::fs::create_dir_all(moved.join("2023")).unwrap();
+    std::fs::rename(
+        h.photos().join("2023/IMG_0001.JPG"),
+        moved.join("2023/IMG_0001.JPG"),
+    )
+    .unwrap();
+    *h.tweak.lock().unwrap() = Some(|config| {
+        let moved = config.directory.with_file_name("moved");
+        config.directory = moved.clone();
+        config.paths.directory = std::sync::Arc::from(moved.as_path());
+    });
+
+    let report = h.run().await;
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(report.zones[0].drain.downloaded, 1);
+    assert_eq!(
+        sorted_files(&moved),
+        ["2023/IMG_0001.JPG", "Trip/IMG_0002.JPG"]
+    );
+    assert_eq!(
+        sorted_files(&h.photos()),
+        ["Trip/IMG_0002.JPG"],
+        "the old folder is left as it was"
+    );
+    let quiet = h.run().await;
+    assert_eq!(quiet.zones[0].drain.downloaded, 0);
+}
+
 #[tokio::test]
 async fn a_rejected_position_relists_without_downloading_again() {
     let h = Harness::new().await;
@@ -1069,6 +1192,55 @@ async fn contract_upgrade_cleanup_requires_validated_state_reuses_copies_then_re
     assert!(!ours.exists());
     assert!(theirs.join("state.db").exists());
     assert!(upgrade::finish(&state).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn an_upgrade_skips_rows_it_cannot_read_and_keeps_the_rest() {
+    let root = tempfile::tempdir().unwrap();
+    let photos = root.path().join("photos");
+    std::fs::create_dir_all(&photos).unwrap();
+    std::fs::write(photos.join("GOOD.JPG"), jpeg("good")).unwrap();
+    let owner = account("upgrade@example.invalid");
+    let legacy = root.path().join("account.db");
+    legacy_state(
+        &legacy,
+        &owner,
+        &[(
+            "M1",
+            photos.join("GOOD.JPG"),
+            jpeg("good").len() as u64,
+            sha256_hex(&jpeg("good")),
+            "AQID".into(),
+        )],
+    )
+    .await;
+    // Values the old schema's column types allowed but this reader cannot
+    // use: a size with a fraction, and a negative size.
+    let conn = rusqlite::Connection::open(&legacy).unwrap();
+    for (master, size) in [("M2", "3.5"), ("M3", "-1")] {
+        conn.execute(
+            &format!(
+                "INSERT INTO assets (library, id, version_size, checksum, filename, created_at,
+                     size_bytes, media_type, status, local_path, last_seen_at)
+                 VALUES ('PrimarySync', ?1, 'original', 'AQID', 'x.jpg', 0.5, {size}, 'photo',
+                     'downloaded', ?2, 0)"
+            ),
+            rusqlite::params![
+                master,
+                photos.join(format!("{master}.JPG")).to_string_lossy()
+            ],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let import = upgrade::prepare(&legacy, &State::path_for(&legacy), &owner, &photos)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(import.recorded, 3);
+    assert_eq!(import.unreadable, 2);
+    assert_eq!(import.imported, 1);
 }
 
 #[tokio::test]

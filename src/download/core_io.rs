@@ -22,6 +22,12 @@ use crate::retry::RetryConfig;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExpectedFile {
     pub(crate) rendition: &'static str,
+    /// With primary naming, the role this file plays for its photo:
+    /// `still` or `motion` for the current rendition at the plain name, and
+    /// `still_original` or `motion_original` for the original kept beside
+    /// it. Empty for every other file. The rendition filling a slot changes
+    /// when the photo is edited or reverted; the slot's path does not.
+    pub(crate) slot: &'static str,
     pub(crate) path: PathBuf,
     pub(crate) size: u64,
     pub(crate) checksum: String,
@@ -41,6 +47,7 @@ pub(crate) fn expected_files(
         .into_iter()
         .map(|derived| ExpectedFile {
             rendition: derived.version_size.as_str(),
+            slot: derived.primary_slot(),
             path: derived.path,
             size: derived.size,
             checksum: derived.checksum.into(),
