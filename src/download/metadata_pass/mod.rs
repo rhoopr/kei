@@ -373,7 +373,8 @@ pub(crate) async fn write_sidecar(
     ))
     .await
     {
-        Ok(_) => Outcome::Written(()),
+        Ok(true) => Outcome::Written(()),
+        Ok(false) => Outcome::Unchanged,
         Err(error) => {
             crate::support::metadata_error(path, "sidecar_write", &error, None);
             tracing::warn!(path = %path.display(), error = %format!("{error:#}"), "Failed to write XMP sidecar");

@@ -2708,6 +2708,20 @@ mod metadata_pass {
         assert!(xmp.contains("Trip"), "{xmp}");
         let quiet = h.run().await;
         assert_eq!(quiet.zones[0].metadata, Default::default());
+
+        // A refresh visits the copy again. A sidecar that already holds the
+        // packet, even in another element order, is counted unchanged and
+        // keeps its bytes and time, as after an upgrade carries over
+        // sidecars the previous release wrote.
+        let before = snapshot(&h.photos());
+        *h.tweak.lock().unwrap() = Some(|config| {
+            sidecar(config);
+            config.refresh_metadata = true;
+        });
+        let refreshed = h.run().await;
+        assert_eq!(refreshed.zones[0].metadata.written, 0, "{refreshed:?}");
+        assert_eq!(refreshed.zones[0].metadata.unchanged, 1, "{refreshed:?}");
+        assert_eq!(snapshot(&h.photos()), before);
     }
 
     #[tokio::test]

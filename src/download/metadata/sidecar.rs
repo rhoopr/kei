@@ -51,11 +51,14 @@ impl ReconciledSidecarSnapshot {
 /// rather than overwriting the whole packet. Existing bytes must remain
 /// readable, parseable, and unchanged through publication. Otherwise the
 /// write fails without replacing them.
+///
+/// Returns whether a new packet was published; an identical packet already
+/// in place is left untouched.
 pub(crate) async fn write_sidecar(
     media_path: &Path,
     write: &MetadataWrite,
     temp_suffix: &str,
-) -> Result<Option<[u8; 32]>> {
+) -> Result<bool> {
     let media_path = media_path.to_path_buf();
     let write = write.clone();
     let temp_suffix = temp_suffix.to_owned();
@@ -65,18 +68,15 @@ pub(crate) async fn write_sidecar(
     .await
     .context("XMP sidecar preparation task panicked")??;
     let Some(prepared) = prepared else {
-        return Ok(None);
+        return Ok(false);
     };
     let prepared = match prepared {
         PreparedSidecar::Publish(prepared) => prepared,
         PreparedSidecar::Unchanged(snapshot) => {
-            let output = tokio::task::spawn_blocking(move || {
-                snapshot.validate()?;
-                fingerprint_bytes(&snapshot.bytes)
-            })
-            .await
-            .context("Unchanged XMP sidecar validation task panicked")??;
-            return Ok(Some(output.sha256));
+            tokio::task::spawn_blocking(move || snapshot.validate())
+                .await
+                .context("Unchanged XMP sidecar validation task panicked")??;
+            return Ok(false);
         }
     };
 
@@ -116,7 +116,7 @@ pub(crate) async fn write_sidecar(
         });
     }
     tracing::debug!(target: "kei::download::metadata", path = %prepared.sidecar_path.display(), "Wrote XMP sidecar");
-    Ok(Some(prepared.output.sha256))
+    Ok(true)
 }
 
 enum PreparedSidecar {
@@ -184,10 +184,14 @@ fn prepare_sidecar_write(
     if write.is_empty() && !meta.contains_property(KEI_XMP_NS, KEI_MANAGED_FIELDS) {
         return Ok(None);
     }
+    // Rewriting kei's fields can reorder a packet without changing it, so
+    // an existing packet whose properties come out the same stays as it is.
+    let before = existing.as_ref().map(|_| properties(&meta));
     apply_to_owned_sidecar(&mut meta, write)?;
     let bytes = meta.to_string().into_bytes();
+    let same = before.is_some_and(|before| before == properties(&meta));
     let expected = match existing {
-        Some(snapshot) if snapshot.bytes == bytes => {
+        Some(snapshot) if same || snapshot.bytes == bytes => {
             // The caller rechecks the original handle, path and packet bytes
             // before returning its hash. An identical packet needs no staging.
             return Ok(Some(PreparedSidecar::Unchanged(snapshot)));
@@ -256,6 +260,16 @@ fn create_unique_sidecar_temp(
             }
         }
     }
+}
+
+/// Every property in `meta` with its value and flags, in a fixed order.
+fn properties(meta: &XmpMeta) -> Vec<(String, String, xmp_toolkit::XmpValue<String>)> {
+    let mut found: Vec<_> = meta
+        .iter(xmp_toolkit::IterOptions::default())
+        .map(|property| (property.schema_ns, property.name, property.value))
+        .collect();
+    found.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    found
 }
 
 fn parse_existing_sidecar(existing: &str) -> Result<XmpMeta> {
@@ -359,7 +373,7 @@ mod tests {
             title: Some("Owned title".into()),
             ..MetadataWrite::default()
         };
-        write_sidecar(&media, &write, ".meta-tmp").await.unwrap();
+        assert!(write_sidecar(&media, &write, ".meta-tmp").await.unwrap());
         let bytes = fs::read(&sidecar).unwrap();
         assert!(String::from_utf8_lossy(&bytes).contains("User author"));
         // Windows needs a writable handle to set the fixture timestamp.
@@ -375,7 +389,10 @@ mod tests {
         .unwrap();
         let identity = crate::fs_util::file_identity(&file).unwrap();
         let modified = file.metadata().unwrap().modified().unwrap();
-        write_sidecar(&media, &write, ".meta-tmp").await.unwrap();
+        assert!(
+            !write_sidecar(&media, &write, ".meta-tmp").await.unwrap(),
+            "an identical packet is not reported as written"
+        );
         assert_eq!(fs::read(&sidecar).unwrap(), bytes);
         assert_eq!(
             crate::fs_util::file_identity(&fs::File::open(&sidecar).unwrap()).unwrap(),
