@@ -40,6 +40,10 @@ pub(crate) struct ImportReport {
     pub(crate) outside: u64,
     /// Another recorded copy already claimed the path.
     pub(crate) duplicates: u64,
+    /// Records of a path the old state also gave to another photo whose
+    /// recorded bytes the file does not hold. Those photos are downloaded
+    /// again rather than credited with another photo's file.
+    pub(crate) ambiguous: u64,
     /// Rows whose values could not be read, such as a size stored with a
     /// fraction. They are skipped rather than stopping the upgrade; a file
     /// at a planned path is still adopted after hashing.
@@ -284,8 +288,10 @@ fn read_copies(
         unreadable,
         ..ImportReport::default()
     };
-    let mut seen = std::collections::HashSet::new();
-    let mut copies = Vec::new();
+    // Group the records by path, keeping the order they were read in.
+    let mut order = Vec::new();
+    let mut by_path: std::collections::HashMap<String, Vec<ImportedCopy>> =
+        std::collections::HashMap::new();
     for (zone, master, rendition, path, size, sha256, checksum) in rows {
         let absolute = if Path::new(&path).is_absolute() {
             PathBuf::from(&path)
@@ -296,31 +302,99 @@ fn read_copies(
             report.outside += 1;
             continue;
         };
-        if !seen.insert(relative.clone()) {
-            report.duplicates += 1;
-            continue;
-        }
         let Ok(size) = u64::try_from(size) else {
             report.unreadable += 1;
             continue;
         };
-        // Kept either way: the planner takes over only a file with the
-        // recorded size, and verify reports the rest.
-        match std::fs::symlink_metadata(&absolute) {
-            Ok(meta) if meta.is_file() && meta.len() == size => {}
-            _ => report.changed_on_disk += 1,
-        }
-        copies.push(ImportedCopy {
-            path: relative,
+        let copy = ImportedCopy {
+            path: relative.clone(),
             zone,
             master,
             rendition,
             size,
             sha256: sha256.filter(|hash| crate::download::core_io::parse_sha256(hash).is_some()),
             checksum,
-        });
+        };
+        by_path
+            .entry(relative.clone())
+            .or_insert_with(|| {
+                order.push(relative);
+                Vec::new()
+            })
+            .push(copy);
+    }
+
+    let mut copies = Vec::new();
+    for relative in order {
+        let Some(claims) = by_path.remove(&relative) else {
+            continue;
+        };
+        let absolute = directory.join(&relative);
+        let Some(copy) = owner_of(&absolute, claims, &mut report) else {
+            continue;
+        };
+        // Kept either way: the planner takes over only a file with the
+        // recorded size, and verify reports the rest.
+        match std::fs::symlink_metadata(&absolute) {
+            Ok(meta) if meta.is_file() && meta.len() == copy.size => {}
+            _ => report.changed_on_disk += 1,
+        }
+        copies.push(copy);
     }
     Ok((copies, report))
+}
+
+/// The one recorded copy that owns a path. Records of the same photo and
+/// rendition from several tables are duplicates; the first is kept. When
+/// the old state gave the path to more than one photo, the file is hashed
+/// and only a record whose SHA-256 matches keeps it. A stale record must not
+/// mark its photo saved with another photo's file; a dropped photo is
+/// downloaded again instead.
+fn owner_of(
+    absolute: &Path,
+    claims: Vec<ImportedCopy>,
+    report: &mut ImportReport,
+) -> Option<ImportedCopy> {
+    let identity = |copy: &ImportedCopy| {
+        (
+            copy.zone.clone(),
+            copy.master.clone(),
+            copy.rendition.clone(),
+        )
+    };
+    let first = identity(claims.first()?);
+    if claims.iter().all(|copy| identity(copy) == first) {
+        report.duplicates += u64::try_from(claims.len() - 1).unwrap_or(u64::MAX);
+        return claims.into_iter().next();
+    }
+    let actual = hash_file(absolute);
+    let mut owner = None;
+    for copy in claims {
+        if owner.is_none() && actual.is_some() && copy.sha256 == actual {
+            owner = Some(copy);
+        } else if owner
+            .as_ref()
+            .is_some_and(|kept: &ImportedCopy| identity(kept) == identity(&copy))
+        {
+            report.duplicates += 1;
+        } else {
+            report.ambiguous += 1;
+        }
+    }
+    owner
+}
+
+/// SHA-256 of a regular file as lowercase hex, or `None` when it cannot be read.
+fn hash_file(path: &Path) -> Option<String> {
+    use sha2::Digest;
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = sha2::Sha256::new();
+    std::io::copy(&mut file, &mut hasher).ok()?;
+    Some(format!("{:x}", hasher.finalize()))
 }
 
 type Row = (String, String, String, String, i64, Option<String>, String);

@@ -726,6 +726,18 @@ impl State {
     }
 
     /// Paths already claimed by any file row.
+    /// A carried-over copy not yet taken over holds `path`.
+    pub(crate) async fn imported_at(&self, path: &str) -> anyhow::Result<bool> {
+        let path = path.to_owned();
+        self.with(move |conn| {
+            Ok(conn
+                .query_row("SELECT 1 FROM imported WHERE path = ?1", [path], |_| Ok(()))
+                .optional()?
+                .is_some())
+        })
+        .await
+    }
+
     pub(crate) async fn path_owner(&self, path: &str) -> anyhow::Result<Option<i64>> {
         let path = path.to_owned();
         self.with(move |conn| {
@@ -1033,6 +1045,8 @@ impl State {
             path.to_owned(),
         );
         self.with(move |conn| {
+            let (want_zone, want_master, want_rendition) =
+                (zone.clone(), master.clone(), rendition.clone());
             let parent = path
                 .rsplit_once('/')
                 .map_or("", |(parent, _)| parent)
@@ -1040,7 +1054,7 @@ impl State {
             let mut stmt = conn.prepare(
                 "SELECT path, zone, master, rendition, size, sha256, checksum FROM imported i
                  WHERE NOT EXISTS (SELECT 1 FROM files f WHERE f.path = i.path)
-                   AND (i.path = ?1 OR (i.zone = ?2 AND i.master = ?3 AND i.rendition = ?4))
+                   AND i.master = ?3 AND i.rendition = ?4
                  ORDER BY i.path = ?1 DESC, i.path",
             )?;
             let rows = stmt
@@ -1059,7 +1073,11 @@ impl State {
             for (candidate, zone, master, rendition, size, sha256, checksum) in rows {
                 let same_folder =
                     candidate.rsplit_once('/').map_or("", |(parent, _)| parent) == parent;
-                if candidate == path || same_folder {
+                // Only a copy of this photo and rendition is taken over. At
+                // the exact path the zone may differ: schemas without a
+                // library column recorded every copy under the primary one.
+                let same_copy = master == want_master && rendition == want_rendition;
+                if same_copy && (candidate == path || (same_folder && zone == want_zone)) {
                     return Ok(Some(ImportedCopy {
                         path: candidate,
                         zone,

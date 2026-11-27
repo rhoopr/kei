@@ -326,7 +326,12 @@ async fn choose_path(
             paths::insert_asset_identity_ordinal_suffix(relative, asset_id, ordinal)
         }));
     for candidate in candidates {
-        if taken.contains(&candidate) || state.path_owner(&candidate).await?.is_some() {
+        // A path a carried-over copy still holds is that copy's, even when a
+        // file of this size is there: its own photo takes it over.
+        if taken.contains(&candidate)
+            || state.path_owner(&candidate).await?.is_some()
+            || state.imported_at(&candidate).await?
+        {
             continue;
         }
         match tokio::fs::symlink_metadata(directory.join(&candidate)).await {

@@ -690,6 +690,9 @@ async fn primary_naming_hands_the_plain_name_to_the_edit_and_back() {
         ["2023/IMG_0001.JPG", "2023/IMG_0001_original.JPG"]
     );
     assert_eq!(h.file("2023/IMG_0001.JPG").unwrap(), jpeg("original"));
+    let quiet = h.run().await;
+    assert_eq!(quiet.zones[0].drain, drain::DrainStats::default());
+    assert_eq!(sorted_files(&h.photos()).len(), 2);
 
     // Edited again after a local change to the plain name: the local file
     // is kept and reported, and the original beside it is reused.
@@ -739,6 +742,145 @@ async fn a_new_download_folder_gets_every_copy_not_moved_along() {
     );
     let quiet = h.run().await;
     assert_eq!(quiet.zones[0].drain.downloaded, 0);
+}
+
+/// QuickTime bytes: an `ftyp` atom, then `tag`.
+fn mov(tag: &str) -> Vec<u8> {
+    let mut bytes = vec![0, 0, 0, 0x14];
+    bytes.extend_from_slice(b"ftypqt  \0\0\0\0qt  ");
+    bytes.extend_from_slice(tag.as_bytes());
+    bytes
+}
+
+/// A resource field pointing at a fresh server URL for `bytes`.
+async fn served_resource(h: &Harness, tag: &str, bytes: &[u8]) -> Value {
+    h.master(tag, "unused.JPG", bytes).await["fields"]["resOriginalRes"].clone()
+}
+
+/// A Live Photo in album `AL`: master `M1` with still and motion; the asset
+/// optionally carries an edit of both.
+async fn live_photo(h: &Harness, edit: Option<(&[u8], &[u8])>) {
+    let mut master = h.master("M1", "IMG_0001.JPG", &jpeg("still")).await;
+    master["fields"]["resOriginalVidComplRes"] = served_resource(h, "M1-mov", &mov("motion")).await;
+    master["fields"]["resOriginalVidComplFileType"] = json!({"value": "com.apple.quicktime-movie"});
+    h.push(master);
+    let mut record = asset("A1", "M1");
+    if let Some((still, motion)) = edit {
+        record["fields"]["resJPEGFullRes"] = served_resource(h, "A1-still", still).await;
+        record["fields"]["resJPEGFullFileType"] = json!({"value": "public.jpeg"});
+        record["fields"]["resVidComplRes"] = served_resource(h, "A1-mov", motion).await;
+        record["fields"]["resVidComplFileType"] = json!({"value": "com.apple.quicktime-movie"});
+        record["fields"]["adjustmentType"] = json!({"value": "com.apple.photo"});
+    }
+    h.push(record);
+}
+
+fn contents(h: &Harness) -> Vec<(String, String)> {
+    sorted_files(&h.photos())
+        .into_iter()
+        .map(|f| {
+            let bytes = h.file(&f).unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            let tag = text.rsplit(['\u{FFFD}', ' ']).next().unwrap_or_default();
+            (f, tag.to_owned())
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn an_interrupted_handover_of_the_plain_name_is_recorded_as_kei_s_own() {
+    fn primary(config: &mut CoreConfig) {
+        config.paths.edited_naming = crate::types::EditedNaming::Primary;
+    }
+    let h = Harness::new().await;
+    *h.tweak.lock().unwrap() = Some(primary);
+    let m1 = h.master("M1", "IMG_0001.JPG", &jpeg("original")).await;
+    h.push(m1);
+    h.push(asset("A1", "M1"));
+    h.run().await;
+
+    // Plan the edit without downloading it.
+    let edit = jpeg("edit");
+    let edited = edited_asset(&h, "A1", "M1", &edit).await;
+    h.push(edited);
+    *h.tweak.lock().unwrap() = Some(|config| {
+        primary(config);
+        config.transfer = Transfer::None;
+    });
+    h.run().await;
+    // kei wrote its receipt, published the edit, then stopped.
+    let state = h.state().await;
+    let row = state.file_at("2023/IMG_0001.JPG").await.unwrap().unwrap();
+    assert_eq!(row.rendition, "adjusted");
+    state
+        .set_pending(row.id, &sha256_hex(&edit), None)
+        .await
+        .unwrap();
+    drop(state);
+    std::fs::write(h.photos().join("2023/IMG_0001.JPG"), &edit).unwrap();
+
+    *h.tweak.lock().unwrap() = Some(primary);
+    let report = h.run().await;
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(report.completeness.modified, 0);
+    assert_eq!(h.file("2023/IMG_0001.JPG").unwrap(), edit);
+    assert_eq!(
+        h.file("2023/IMG_0001_original.JPG").unwrap(),
+        jpeg("original")
+    );
+    let row = h
+        .state()
+        .await
+        .file_at("2023/IMG_0001.JPG")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.sha256, Some(sha256_hex(&edit)));
+    let quiet = h.run().await;
+    assert_eq!(quiet.zones[0].drain, drain::DrainStats::default());
+}
+
+#[tokio::test]
+async fn primary_naming_moves_a_live_photos_still_and_motion_together_in_an_album() {
+    let h = Harness::new().await;
+    *h.tweak.lock().unwrap() = Some(|config| {
+        config.paths.edited_naming = crate::types::EditedNaming::Primary;
+    });
+    h.push(album("AL", "Trip"));
+    live_photo(&h, None).await;
+    h.push(member("A1", "AL"));
+    h.run().await;
+    let pair = |still: &str, motion: &str| {
+        [
+            ("Trip/IMG_0001.JPG", still),
+            ("Trip/IMG_0001.MOV", motion),
+            ("Trip/IMG_0001_original.JPG", "still"),
+            ("Trip/IMG_0001_original.MOV", "motion"),
+        ]
+        .map(|(path, tag)| (path.to_owned(), tag.to_owned()))
+        .to_vec()
+    };
+    assert_eq!(
+        contents(&h),
+        pair("still", "motion")[..2].to_vec(),
+        "no edit: plain names hold the originals"
+    );
+
+    live_photo(&h, Some((&jpeg("stilledit"), &mov("motionedit")))).await;
+    let report = h.run().await;
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(contents(&h), pair("stilledit", "motionedit"));
+
+    live_photo(&h, None).await;
+    let report = h.run().await;
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(report.zones[0].drain.downloaded, 2);
+    assert_eq!(contents(&h), pair("still", "motion"));
+
+    let quiet = h.run().await;
+    assert!(quiet.complete());
+    assert_eq!(quiet.zones[0].drain, drain::DrainStats::default());
+    assert_eq!(contents(&h), pair("still", "motion"));
 }
 
 #[tokio::test]
@@ -1244,6 +1386,160 @@ async fn an_upgrade_skips_rows_it_cannot_read_and_keeps_the_rest() {
 }
 
 #[tokio::test]
+async fn a_path_the_old_state_gave_two_photos_goes_to_the_one_whose_bytes_it_holds() {
+    let h = Harness::new().await;
+    // Two photos with the same name and size; the file on disk is B's.
+    let (a, b) = (jpeg("aaaa"), jpeg("bbbb"));
+    let m1 = h.master("M1", "IMG_0001.JPG", &a).await;
+    let m2 = h.master("M2", "IMG_0001.JPG", &b).await;
+    let (c1, c2) = (checksum_of(&m1), checksum_of(&m2));
+    h.push(m1);
+    h.push(asset("A1", "M1"));
+    h.push(m2);
+    h.push(asset("A2", "M2"));
+    let photos = h.photos();
+    std::fs::create_dir_all(photos.join("2023")).unwrap();
+    std::fs::write(photos.join("2023/IMG_0001.JPG"), &b).unwrap();
+
+    // A stale record says the file is A's; another says it is B's.
+    let owner = account("upgrade@example.invalid");
+    let legacy = h.root.path().join("account.db");
+    let shared = photos.join("2023/IMG_0001.JPG");
+    legacy_state(
+        &legacy,
+        &owner,
+        &[
+            ("M1", shared.clone(), a.len() as u64, sha256_hex(&a), c1),
+            ("M2", shared, b.len() as u64, sha256_hex(&b), c2),
+        ],
+    )
+    .await;
+    let target = State::path_for(&legacy);
+    let import = upgrade::prepare(&legacy, &target, &owner, &photos)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((import.imported, import.ambiguous), (1, 1));
+
+    let state = State::open(&target).await.unwrap();
+    let run = async || {
+        run_cycle(
+            &state,
+            &h.libraries(),
+            &h.config(),
+            &reqwest::Client::new(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+    };
+    let report = run().await;
+    assert!(report.complete(), "{report:?}");
+    // B keeps its file; A is downloaded beside it instead of being
+    // credited with B's bytes.
+    assert_eq!(report.zones[0].drain.downloaded, 1);
+    assert_eq!(h.file("2023/IMG_0001.JPG").unwrap(), b);
+    let files = sorted_files(&photos);
+    assert_eq!(files.len(), 2, "{files:?}");
+    let other = files.iter().find(|f| *f != "2023/IMG_0001.JPG").unwrap();
+    assert_eq!(h.file(other).unwrap(), a);
+
+    let quiet = run().await;
+    assert!(quiet.complete());
+    assert_eq!(quiet.zones[0].drain.downloaded, 0);
+    assert_eq!(sorted_files(&photos).len(), 2);
+}
+
+#[tokio::test]
+async fn an_upgrade_keeps_a_previous_primary_layout_and_follows_later_reverts() {
+    let h = Harness::new().await;
+    *h.tweak.lock().unwrap() = Some(|config| {
+        config.paths.edited_naming = crate::types::EditedNaming::Primary;
+    });
+    let (original, edit) = (jpeg("original"), jpeg("the edit"));
+    let m1 = h.master("M1", "IMG_0001.JPG", &original).await;
+    let original_checksum = checksum_of(&m1);
+    h.push(m1);
+    let edited = edited_asset(&h, "A1", "M1", &edit).await;
+    let edit_checksum = edited["fields"]["resJPEGFullRes"]["value"]["fileChecksum"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    h.push(edited);
+
+    // The previous engine's layout: the edit at the plain name.
+    let photos = h.photos();
+    std::fs::create_dir_all(photos.join("2023")).unwrap();
+    std::fs::write(photos.join("2023/IMG_0001.JPG"), &edit).unwrap();
+    std::fs::write(photos.join("2023/IMG_0001_original.JPG"), &original).unwrap();
+    let owner = account("upgrade@example.invalid");
+    let legacy = h.root.path().join("account.db");
+    legacy_state(
+        &legacy,
+        &owner,
+        &[(
+            "M1",
+            photos.join("2023/IMG_0001_original.JPG"),
+            original.len() as u64,
+            sha256_hex(&original),
+            original_checksum,
+        )],
+    )
+    .await;
+    let conn = rusqlite::Connection::open(&legacy).unwrap();
+    conn.execute(
+        "INSERT INTO assets (library, id, version_size, checksum, filename, created_at, size_bytes,
+             media_type, status, local_path, last_seen_at, local_checksum)
+         VALUES ('PrimarySync', 'M1', 'adjusted', ?1, 'IMG_0001.JPG', 0, ?2, 'photo', 'downloaded', ?3, 0, ?4)",
+        rusqlite::params![
+            edit_checksum,
+            edit.len() as i64,
+            photos.join("2023/IMG_0001.JPG").to_string_lossy(),
+            sha256_hex(&edit)
+        ],
+    )
+    .unwrap();
+    drop(conn);
+    let target = State::path_for(&legacy);
+    upgrade::prepare(&legacy, &target, &owner, &photos)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let state = State::open(&target).await.unwrap();
+    let run = async || {
+        run_cycle(
+            &state,
+            &h.libraries(),
+            &h.config(),
+            &reqwest::Client::new(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+    };
+    let report = run().await;
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(report.zones[0].drain.downloaded, 0);
+    assert_eq!(report.completeness.done, 2);
+    assert_eq!(
+        sorted_files(&photos),
+        ["2023/IMG_0001.JPG", "2023/IMG_0001_original.JPG"]
+    );
+
+    // A revert after the upgrade puts the original at the plain name.
+    h.push(asset("A1", "M1"));
+    let report = run().await;
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(report.zones[0].drain.downloaded, 1);
+    assert_eq!(h.file("2023/IMG_0001.JPG").unwrap(), original);
+    assert_eq!(h.file("2023/IMG_0001_original.JPG").unwrap(), original);
+    let quiet = run().await;
+    assert_eq!(quiet.zones[0].drain.downloaded, 0);
+    assert_eq!(sorted_files(&photos).len(), 2);
+}
+
+#[tokio::test]
 async fn an_upgrade_refuses_another_accounts_state() {
     let root = tempfile::tempdir().unwrap();
     let legacy = root.path().join("account.db");
@@ -1647,6 +1943,48 @@ mod metadata_pass {
             recorded(&h, "2023/IMG_0001.JPG").await,
             (Some(sha256_hex(&rewritten)), FileState::Done)
         );
+    }
+
+    #[tokio::test]
+    async fn primary_naming_hands_over_a_copy_kei_wrote_metadata_into() {
+        let h = Harness::new().await;
+        *h.tweak.lock().unwrap() = Some(|config| {
+            rating(config);
+            config.paths.edited_naming = crate::types::EditedNaming::Primary;
+        });
+        let m1 = h.master("M1", "IMG_0001.JPG", &small_jpeg()).await;
+        h.push(m1);
+        h.push(favorite("A1", "M1", true));
+        let first = h.run().await;
+        assert_eq!(first.zones[0].metadata.written, 1, "{first:?}");
+
+        // The edit replaces the plain name even though kei rewrote it for
+        // metadata: those bytes are kei's own.
+        let mut edit = small_jpeg();
+        edit[15] = 0x02; // another valid JPEG: a different pixel density
+        let mut edited = edited_asset(&h, "A1", "M1", &edit).await;
+        edited["fields"]["isFavorite"] = json!({"value": 1});
+        h.push(edited);
+        let report = h.run().await;
+        assert!(report.complete(), "{report:?}");
+        assert_eq!(report.completeness.modified, 0);
+        assert_eq!(report.zones[0].drain.downloaded, 2);
+        assert_eq!(report.zones[0].metadata.written, 2, "{report:?}");
+        for path in ["2023/IMG_0001.JPG", "2023/IMG_0001_original.JPG"] {
+            let bytes = h.file(path).unwrap();
+            assert_eq!(
+                recorded(&h, path).await,
+                (Some(sha256_hex(&bytes)), FileState::Done),
+                "{path}"
+            );
+        }
+        let plain = h.file("2023/IMG_0001.JPG").unwrap();
+        assert_ne!(plain, edit, "the edit got its rating too");
+        assert_eq!(plain[15], 0x02, "the plain name holds the edit");
+
+        let quiet = h.run().await;
+        assert_eq!(quiet.zones[0].metadata, Default::default());
+        assert_eq!(quiet.zones[0].drain, drain::DrainStats::default());
     }
 
     fn sidecar(config: &mut CoreConfig) {

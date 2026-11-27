@@ -68,6 +68,7 @@ pub(crate) async fn open(
                 outside_download_directory = import.outside,
                 duplicates = import.duplicates,
                 unreadable = import.unreadable,
+                ambiguous = import.ambiguous,
                 "Upgraded sync state; the previous state file is kept until the first full listing completes"
             );
         }
