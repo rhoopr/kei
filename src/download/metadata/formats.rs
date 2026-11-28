@@ -20,6 +20,23 @@ pub(super) fn is_heif_file(path: &Path) -> bool {
     }
 }
 
+/// Camera raw formats built on TIFF. Their readers expect the vendor layout,
+/// so kei never rewrites them in place.
+const TIFF_RAW_EXTENSIONS: &[&str] = &[
+    "3fr", "arw", "cr2", "dcr", "dng", "erf", "iiq", "kdc", "mef", "mos", "nef", "nrw", "orf",
+    "pef", "raw", "rw2", "rwl", "sr2", "srf", "srw",
+];
+
+fn has_raw_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            TIFF_RAW_EXTENSIONS
+                .iter()
+                .any(|raw| extension.eq_ignore_ascii_case(raw))
+        })
+}
+
 /// Whether the in-place embedded-metadata writer can patch this file.
 ///
 /// The first 12 bytes take precedence over the extension so downloaded part
@@ -28,6 +45,11 @@ pub(super) fn is_heif_file(path: &Path) -> bool {
 /// through XMP Toolkit.
 #[must_use]
 pub(crate) fn is_embed_writable_path(path: &Path) -> bool {
+    // Raw originals such as DNG are TIFF inside, so content alone would send
+    // them to the TIFF writer. They get sidecars only.
+    if has_raw_extension(path) {
+        return false;
+    }
     let mut head = [0u8; 12];
     if let Ok(n) = std::fs::File::open(path).and_then(|mut f| {
         use std::io::Read;
@@ -128,5 +150,23 @@ mod tests {
             assert!(!is_embed_writable_path(&p), "{ext} should NOT be writable");
         }
         assert!(!is_embed_writable_path(Path::new("/a/b")));
+    }
+
+    #[test]
+    fn is_embed_writable_path_keeps_tiff_based_raw_files_sidecar_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let dng = include_bytes!("../../../tests/data/media/pattern.dng");
+        assert!(dng.starts_with(b"II*\0"), "the fixture is TIFF inside");
+        for name in ["pattern.dng", "PATTERN.DNG", "camera.NEF", "camera.cr2"] {
+            let path = dir.path().join(name);
+            fs::write(&path, dng).unwrap();
+            assert!(!is_embed_writable_path(&path), "{name}");
+        }
+        let tiff = dir.path().join("pattern.tif");
+        fs::write(&tiff, dng).unwrap();
+        assert!(
+            is_embed_writable_path(&tiff),
+            "a real TIFF name still embeds"
+        );
     }
 }

@@ -2729,6 +2729,82 @@ mod metadata_pass {
         );
     }
 
+    /// A movie rewrite that damages anything outside the XMP packet is
+    /// refused: the copy keeps the downloaded bytes kei recorded. The refusal
+    /// is lasting, so unchanged cycles count it without rewriting again; a
+    /// change in iCloud retries it, and a clean retry is recorded as kei's own
+    /// bytes.
+    #[tokio::test]
+    async fn contract_movie_embed_rewrite_preserves_media_refuses_then_retries() {
+        // Simulate #947: the toolkit overwrites the track's `hdlr` handler type.
+        fn damage_track_handler() -> crate::download::metadata::ToolkitWriteHook {
+            Box::new(|_destination, temp| {
+                let mut bytes = std::fs::read(temp).unwrap();
+                let at = bytes.windows(4).rposition(|w| w == b"mdta").unwrap();
+                bytes[at..at + 4].copy_from_slice(&[0, 0, 1, 0xe7]);
+                std::fs::write(temp, bytes).unwrap();
+            })
+        }
+        let h = Harness::new().await;
+        *h.tweak.lock().unwrap() = Some(rating);
+        let original = crate::test_helpers::quicktime_user_data_movie(&[]);
+        let mut m1 = h.master("M1", "IMG_0001.MOV", &original).await;
+        m1["fields"]["itemType"] = json!({"value": "com.apple.quicktime-movie"});
+        m1["fields"]["resOriginalFileType"] = json!({"value": "com.apple.quicktime-movie"});
+        h.push(m1);
+        h.push(favorite("A1", "M1", true));
+        let relative = "2023/IMG_0001.MOV";
+        let destination = h.photos().join(relative);
+        crate::download::metadata::after_toolkit_write(&destination, damage_track_handler());
+
+        let refused = h.run().await;
+        assert_eq!(refused.zones[0].drain.downloaded, 1, "{refused:?}");
+        assert_eq!(refused.zones[0].metadata.failed, 1, "{refused:?}");
+        assert_eq!(refused.zones[0].metadata.written, 0, "{refused:?}");
+        assert_eq!(h.file(relative).unwrap(), original);
+        assert_eq!(
+            recorded(&h, relative).await,
+            (Some(sha256_hex(&original)), FileState::Done)
+        );
+
+        // Unchanged: still counted, but the toolkit is not run again.
+        crate::download::metadata::after_toolkit_write(&destination, damage_track_handler());
+        let unchanged = h.run().await;
+        assert_eq!(unchanged.zones[0].metadata.failed, 1, "{unchanged:?}");
+        assert_eq!(unchanged.zones[0].metadata.written, 0, "{unchanged:?}");
+        assert_eq!(unchanged.zones[0].drain.downloaded, 0, "{unchanged:?}");
+        assert!(
+            crate::download::metadata::take_after_toolkit_write(&destination),
+            "no rewrite was attempted"
+        );
+        assert_eq!(h.file(relative).unwrap(), original);
+
+        // The photo changes in iCloud: the new values are tried again.
+        h.push(favorite("A1", "M1", false));
+        let retried = h.run().await;
+        assert_eq!(retried.zones[0].drain.downloaded, 0, "{retried:?}");
+        assert_eq!(retried.zones[0].metadata.written, 1, "{retried:?}");
+        assert_eq!(retried.zones[0].metadata.failed, 0, "{retried:?}");
+        let written = h.file(relative).unwrap();
+        assert_ne!(written, original, "the capture date was embedded");
+        for kept in [&b"unchanged media"[..], b"mdta", b"kept"] {
+            assert!(
+                written.windows(kept.len()).any(|w| w == kept),
+                "{}",
+                String::from_utf8_lossy(kept)
+            );
+        }
+        assert_eq!(
+            recorded(&h, relative).await,
+            (Some(sha256_hex(&written)), FileState::Done)
+        );
+
+        let quiet = h.run().await;
+        assert_eq!(quiet.zones[0].metadata, Default::default());
+        assert_eq!(quiet.zones[0].drain.downloaded, 0);
+        assert_eq!(h.file(relative).unwrap(), written);
+    }
+
     #[tokio::test]
     async fn primary_naming_hands_over_a_copy_kei_wrote_metadata_into() {
         let h = Harness::new().await;

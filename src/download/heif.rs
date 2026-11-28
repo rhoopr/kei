@@ -137,6 +137,18 @@ pub(crate) fn classify_heif_metadata_limit(error: &anyhow::Error) -> bool {
         .is_some_and(|error| matches!(error, HeifError::MetadataLimit { .. }))
 }
 
+/// Whether the writer refused the file's item layout. That answer depends only
+/// on the bytes, so the caller need not retry the same bytes every cycle.
+#[must_use]
+pub(crate) fn classify_heif_layout_refusal(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<HeifError>().is_some_and(|error| {
+        matches!(
+            error,
+            HeifError::InvalidLayout { .. } | HeifError::ValueOverflow { .. }
+        )
+    })
+}
+
 #[derive(Debug)]
 pub(crate) enum HeifExifError {
     Io(std::io::Error),
