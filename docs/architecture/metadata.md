@@ -91,9 +91,26 @@ multiple NFS clients. Recovery does not mark a copy saved by itself.
 
 ## Movie preparation
 
-XMP Toolkit preparation checks movie box boundaries with bounded file reads before
-updating the temporary copy. Nested QuickTime `meta` boxes without a supported
-FullBox prefix are rejected because the toolkit can corrupt their existing child
-boxes. The optional four-byte zero terminator is accepted only at the end of a
-`udta` child list. Rejection preserves the original media and leaves the copy's
-metadata to retry on the next pass.
+`src/download/metadata/movie_layout.rs` checks MP4 and MOV files on both sides of
+the XMP Toolkit write, with bounded reads and box counts.
+
+Before the write, it checks movie box boundaries in the temporary copy. A nested
+`meta` may be an ISO FullBox or a bare QuickTime atom. The optional four-byte zero
+terminator is accepted only at the end of a `udta` child list.
+
+After the write, it compares the temporary copy with the original before
+publishing (`MOVIE_EMBED_REWRITE_PRESERVES_MEDIA`). The toolkit may change only:
+
+- the XMP packet: `moov/udta/XMP_` in QuickTime files, or a top-level XMP `uuid`
+  box in ISO MP4 files;
+- padding (`free`, `skip`, `wide`), including the old `moov` it turns into `free`
+  when the new `moov` no longer fits and is written at the end of the file;
+- the location of `moov` itself;
+- the creation and modification times in `mvhd`, which it fills from XMP dates.
+
+Every other top-level box, such as `ftyp` and `mdat`, must keep its offset, size
+and bytes, so the chunk offset tables still point at the same media. Every other
+`moov` child, including tracks and QuickTime `meta`, and every other `udta` child
+must keep its bytes and order. Any other change, or a malformed rewritten file,
+fails the write. Failure preserves the original media and leaves the copy's
+metadata to retry on the next pass. The comparison reads both files once.

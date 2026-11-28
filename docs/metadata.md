@@ -58,6 +58,48 @@ requires the explicit capture-repair command and its evidence checks.
 | HEIC/HEIF/AVIF embedded metadata | Byte-preserving item-map XMP writer with `xmp`; supported layouts only |
 | RAW and other media | XMP sidecars with `xmp`; no general embedded-write promise |
 
+### Field reference
+
+What each setting writes into the media file (embedded) and into the sidecar.
+Embedded fields need their own setting. A sidecar carries every field below
+that iCloud supplies; album names still need `include_albums`.
+
+| iCloud value | Setting for embedded output | XMP property | Embedded rule |
+| --- | --- | --- | --- |
+| Capture date and time zone offset | `set_exif_datetime` | `exif:DateTimeOriginal`, `xmp:CreateDate`, `xmp:ModifyDate`, `photoshop:DateCreated`, `exifEX:OffsetTimeOriginal` | Only when the file has no capture date, unless capture repair is requested |
+| Favorite | `set_exif_rating` | `xmp:Rating` | Favorite is rating 5; unfavoriting clears only a rating kei wrote |
+| Location | `set_exif_gps` | `exif:GPSLatitude`, `exif:GPSLongitude`, `exif:GPSAltitude` | Only when the file has no GPS |
+| Caption | `set_exif_description` | `dc:description` | Falls back to the title when there is no caption |
+| Title | `embed_xmp` | `dc:title` | |
+| Keywords | `embed_xmp` | `dc:subject` | |
+| Album names | `include_albums` with `embed_xmp` or `xmp_sidecar` | `dc:subject` | Added to keywords |
+| People | `include_people` with `embed_xmp` or `xmp_sidecar` | `iptcExt:PersonInImage` | Currently always empty: iCloud's person names are not in the change feed |
+| Orientation | `set_exif_orientation` | `tiff:Orientation` | JPEG/TIFF originals only, when absent |
+
+Sidecars also carry GPS time, speed and, with matching evidence, horizontal
+accuracy read from the media's own EXIF (see [GPS accuracy
+provenance](#gps-accuracy-provenance)). A sidecar is named after the full media
+filename: `IMG_0001.HEIC.xmp`.
+
+### Format reference
+
+| Format | Embedded writer | Where XMP goes | Other changes the writer makes |
+| --- | --- | --- | --- |
+| JPEG, TIFF | XMP Toolkit | XMP packet | Reconciles matching native EXIF and IPTC fields |
+| JPEG, TIFF without `xmp` | little_exif | No XMP | Native EXIF date, offset, GPS, description, rating and orientation |
+| PNG | XMP Toolkit | XMP text chunk | None checked |
+| HEIC, HEIF, AVIF | kei's item writer | XMP item of the primary image | Native Exif capture time only under capture repair; every other item is checked byte for byte |
+| MOV | XMP Toolkit | `moov/udta/XMP_` | `mvhd` creation and modification times; may move `moov` to the end of the file |
+| MP4 | XMP Toolkit | Top-level XMP `uuid` box | Same as MOV |
+| Anything else | None | Sidecar only | |
+
+Formats are recognised by their first bytes before their extension, so a
+TIFF-structured raw file such as DNG takes the TIFF row. Movie rewrites are
+compared with the original before publication; anything outside the changes
+listed above fails the write and is retried (see [metadata write
+boundaries](architecture/metadata.md#movie-preparation)). QuickTime text items
+such as `©nam` and Apple's `mdta` metadata are left as they are.
+
 `metadata.set_exif_datetime` includes supported HEIF XMP datetime output with
 `xmp`; it is not limited to JPEG/TIFF. The default Cargo feature enables the
 capability, not automatic mutation. Unsupported formats can still have sidecars.

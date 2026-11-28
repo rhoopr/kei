@@ -1,14 +1,48 @@
 //! XMP Toolkit preparation for native format handlers.
 
+use super::movie_layout::{validate_movie_metadata_layout, validate_movie_rewrite_preserves_media};
 use super::prepared::{
     PreparedMetadataFile, TmpGuard, create_unique_embed_temp, keep_source_mtime,
 };
 use super::values::MetadataWrite;
 use super::xmp_fields::{apply_to_xmp, ensure_initialized};
 use anyhow::{Context, Result};
-use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use xmp_toolkit::{OpenFileOptions, XmpFile, XmpMeta};
+
+#[cfg(test)]
+pub(crate) type ToolkitWriteHook = Box<dyn FnOnce(&Path, &Path) + Send>;
+/// Test hooks keyed by destination path. Each runs once, after the toolkit
+/// writes the temporary copy and before the preservation check. Keyed by path
+/// rather than thread so sync-level tests can reach the blocking write task.
+#[cfg(test)]
+static AFTER_TOOLKIT_WRITE: std::sync::Mutex<Vec<(std::path::PathBuf, ToolkitWriteHook)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Run `hook(destination, temp)` after the next toolkit write for `destination`.
+#[cfg(test)]
+pub(crate) fn after_toolkit_write(destination: &Path, hook: ToolkitWriteHook) {
+    AFTER_TOOLKIT_WRITE
+        .lock()
+        .unwrap()
+        .push((destination.to_path_buf(), hook));
+}
+
+#[cfg(test)]
+fn run_after_toolkit_write(destination: &Path, temp: &Path) {
+    let hook = {
+        let mut hooks = AFTER_TOOLKIT_WRITE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        hooks
+            .iter()
+            .position(|(path, _)| path == destination)
+            .map(|index| hooks.remove(index).1)
+    };
+    if let Some(hook) = hook {
+        hook(destination, temp);
+    }
+}
 
 pub(super) fn prepare_metadata_xmp_toolkit(
     path: &Path,
@@ -161,6 +195,9 @@ pub(super) fn prepare_metadata_xmp_toolkit(
             native_companion_values(&tags, &mut after);
         }
     }
+    #[cfg(test)]
+    run_after_toolkit_write(path, &tmp_path);
+    validate_movie_rewrite_preserves_media(path, &tmp_path)?;
     let embedded_fields = write.ownership_after(&before, &after);
     let temp = std::fs::OpenOptions::new()
         .read(true)
@@ -250,105 +287,6 @@ fn native_companion_values(
                 .encode(&tag.value_as_u8_vec(&little_exif::endian::Endian::Little))
         });
     }
-}
-
-/// Rejects malformed movie box bounds. A nested `meta` may be an ISO FullBox or
-/// a bare QuickTime atom.
-fn validate_movie_metadata_layout(path: &Path) -> Result<()> {
-    let mut file = std::fs::File::open(path)?;
-    let end = file.metadata()?.len();
-    let mut header = [0; 8];
-    if end < 8 {
-        return Ok(());
-    }
-    file.read_exact(&mut header)?;
-    if !matches!(
-        &header[4..8],
-        b"ftyp" | b"moov" | b"mdat" | b"wide" | b"free" | b"skip"
-    ) {
-        return Ok(());
-    }
-    let mut budget = 100_000;
-    validate_movie_boxes(&mut file, 0, end, None, 0, &mut budget)
-}
-
-fn validate_movie_boxes(
-    file: &mut std::fs::File,
-    mut offset: u64,
-    end: u64,
-    parent: Option<&[u8; 4]>,
-    depth: usize,
-    budget: &mut usize,
-) -> Result<()> {
-    anyhow::ensure!(
-        depth <= 32,
-        "Movie metadata nesting exceeds preservation check limit"
-    );
-    while offset < end {
-        // QuickTime user-data lists may end with a four-byte zero terminator.
-        if parent == Some(b"udta") && end - offset == 4 {
-            file.seek(SeekFrom::Start(offset))?;
-            let mut terminator = [0; 4];
-            file.read_exact(&mut terminator)?;
-            anyhow::ensure!(terminator == [0; 4], "Invalid movie user-data terminator");
-            return Ok(());
-        }
-        anyhow::ensure!(
-            *budget > 0,
-            "Movie box count exceeds preservation check limit"
-        );
-        *budget -= 1;
-        anyhow::ensure!(end - offset >= 8, "Incomplete movie box header");
-        file.seek(SeekFrom::Start(offset))?;
-        let mut header = [0; 8];
-        file.read_exact(&mut header)?;
-        let kind: &[u8; 4] = header[4..8].try_into()?;
-        let size = u32::from_be_bytes(header[..4].try_into()?);
-        let (size, header_size) = match size {
-            0 => (end - offset, 8),
-            1 => {
-                anyhow::ensure!(end - offset >= 16, "Incomplete extended movie box header");
-                let mut extended = [0; 8];
-                file.read_exact(&mut extended)?;
-                (u64::from_be_bytes(extended), 16)
-            }
-            size => (u64::from(size), 8),
-        };
-        anyhow::ensure!(
-            size >= header_size && size <= end - offset,
-            "Invalid movie box bounds"
-        );
-        let next = offset + size;
-        let mut children = offset + header_size;
-        if kind == b"moov"
-            || (parent.is_some()
-                && matches!(
-                    kind,
-                    b"udta"
-                        | b"meta"
-                        | b"ilst"
-                        | b"trak"
-                        | b"edts"
-                        | b"mdia"
-                        | b"minf"
-                        | b"dinf"
-                        | b"stbl"
-                ))
-        {
-            if kind == b"meta" && parent != Some(b"moov") {
-                anyhow::ensure!(next - children >= 4, "Incomplete movie metadata prefix");
-                file.seek(SeekFrom::Start(children))?;
-                let mut prefix = [0; 4];
-                file.read_exact(&mut prefix)?;
-                if prefix == [0; 4] {
-                    children += 4;
-                }
-            }
-            validate_movie_boxes(file, children, next, Some(kind), depth + 1, budget)?;
-        }
-        offset = next;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -909,5 +847,239 @@ mod tests {
             Some("2".to_string()),
         );
         fs::remove_file(&path).ok();
+    }
+
+    // ── Movie preservation (MOVIE_EMBED_REWRITE_PRESERVES_MEDIA) ───────
+
+    /// QuickTime user data with native text items next to kei's XMP.
+    fn quicktime_text_items_movie() -> Vec<u8> {
+        let item = |kind: &[u8; 4], text: &str| {
+            let mut body = u16::try_from(text.len()).unwrap().to_be_bytes().to_vec();
+            body.extend_from_slice(&[0x15, 0xc7]);
+            body.extend_from_slice(text.as_bytes());
+            let mut bytes = u32::try_from(body.len() + 8)
+                .unwrap()
+                .to_be_bytes()
+                .to_vec();
+            bytes.extend_from_slice(kind);
+            bytes.extend(body);
+            bytes
+        };
+        let mut tail = item(b"\xa9nam", "Native title");
+        tail.extend(item(b"\xa9des", "Native description"));
+        tail.extend(item(b"\xa9day", "2001-01-01"));
+        tail.extend(item(b"\xa9xyz", "+10.0000+020.0000/"));
+        crate::test_helpers::quicktime_user_data_movie(&tail)
+    }
+
+    fn movie_fixtures() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            (
+                "apple-live.mov",
+                include_bytes!("../../../tests/data/media/apple-live.mov").to_vec(),
+            ),
+            (
+                "pattern.mov",
+                include_bytes!("../../../tests/data/media/pattern.mov").to_vec(),
+            ),
+            (
+                "pattern.mp4",
+                include_bytes!("../../../tests/data/media/pattern.mp4").to_vec(),
+            ),
+            (
+                "bare-track-meta.mov",
+                crate::test_helpers::bare_track_meta_movie(),
+            ),
+            ("text-items.mov", quicktime_text_items_movie()),
+        ]
+    }
+
+    fn every_movie_field() -> MetadataWrite {
+        MetadataWrite {
+            rating: Some(4),
+            datetime: Some("2024:05:06 07:08:09".into()),
+            offset_time_original: Some("+02:00".into()),
+            gps: Some(GpsCoords {
+                latitude: 1.5,
+                longitude: 2.5,
+                altitude: Some(3.0),
+            }),
+            title: Some("Title".into()),
+            description: Some("Description".into()),
+            keywords: vec!["one".into(), "two".into()],
+            ..MetadataWrite::default()
+        }
+    }
+
+    /// Independent top-level walk: (kind, offset, bytes) for every box.
+    fn top_level_boxes(bytes: &[u8]) -> Vec<([u8; 4], usize, Vec<u8>)> {
+        let mut boxes = Vec::new();
+        let mut offset = 0;
+        while offset + 8 <= bytes.len() {
+            let size = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap());
+            let size = match size {
+                0 => bytes.len() - offset,
+                1 => usize::try_from(u64::from_be_bytes(
+                    bytes[offset + 8..offset + 16].try_into().unwrap(),
+                ))
+                .unwrap(),
+                size => usize::try_from(size).unwrap(),
+            };
+            let kind = bytes[offset + 4..offset + 8].try_into().unwrap();
+            boxes.push((kind, offset, bytes[offset..offset + size].to_vec()));
+            offset += size;
+        }
+        boxes
+    }
+
+    fn atom_bytes(bytes: &[u8], kind: &[u8; 4]) -> Vec<Vec<u8>> {
+        let mut found = Vec::new();
+        let mut from = 0;
+        while let Some(at) = bytes[from..].windows(4).position(|window| window == kind) {
+            let start = from + at - 4;
+            let size = u32::from_be_bytes(bytes[start..start + 4].try_into().unwrap());
+            found.push(bytes[start..start + usize::try_from(size).unwrap()].to_vec());
+            from = from + at + 4;
+        }
+        found
+    }
+
+    #[test]
+    fn contract_movie_embed_rewrite_preserves_media_across_real_toolkit_rewrites() {
+        for (name, original) in movie_fixtures() {
+            for write in [
+                MetadataWrite {
+                    rating: Some(3),
+                    ..MetadataWrite::default()
+                },
+                every_movie_field(),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join(format!("{name}.kei-tmp"));
+                fs::write(&path, &original).unwrap();
+                apply_metadata_with_default_suffix(&path, &write).unwrap();
+                // A second, larger packet forces the toolkit to grow `moov` again.
+                let mut again = write.clone();
+                again.rating = Some(5);
+                again.description = Some("A longer description ".repeat(200));
+                apply_metadata_with_default_suffix(&path, &again).unwrap();
+                let rewritten = fs::read(&path).unwrap();
+
+                assert_eq!(
+                    read_meta(&path)
+                        .property_i32(xmp_ns::XMP, "Rating")
+                        .unwrap()
+                        .value,
+                    5,
+                    "{name}"
+                );
+                let media = |bytes: &[u8]| {
+                    top_level_boxes(bytes)
+                        .into_iter()
+                        .filter(|(kind, _, _)| kind == b"mdat" || kind == b"ftyp")
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(media(&rewritten), media(&original), "{name}: media moved");
+                // Old `moov` bytes may survive inside `free`; inspect the live one.
+                let live_moov = |bytes: &[u8]| {
+                    let moov = top_level_boxes(bytes)
+                        .into_iter()
+                        .filter(|(kind, _, _)| kind == b"moov")
+                        .collect::<Vec<_>>();
+                    assert_eq!(moov.len(), 1, "{name}: one moov");
+                    moov.into_iter().next().unwrap().2
+                };
+                let (before_moov, after_moov) = (live_moov(&original), live_moov(&rewritten));
+                for kind in [
+                    b"trak", b"\xa9nam", b"\xa9des", b"\xa9day", b"\xa9xyz", b"name",
+                ] {
+                    assert_eq!(
+                        atom_bytes(&after_moov, kind),
+                        atom_bytes(&before_moov, kind),
+                        "{name}: {kind:?}"
+                    );
+                }
+                assert!(embed_temp_entries(dir.path(), ".meta-tmp").is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn contract_movie_embed_rewrite_preserves_media_refuses_damaged_rewrites() {
+        type Damage = fn(&mut Vec<u8>);
+        let damages: [(&str, Damage); 5] = [
+            ("track handler (#947)", |bytes| {
+                // The old `moov` may survive as `free` padding; damage the live one.
+                let at = bytes
+                    .windows(4)
+                    .rposition(|window| window == b"mdta")
+                    .unwrap();
+                bytes[at..at + 4].copy_from_slice(&[0, 0, 1, 0xe7]);
+            }),
+            ("media byte", |bytes| {
+                let at = bytes
+                    .windows(15)
+                    .position(|window| window == b"unchanged media")
+                    .unwrap();
+                bytes[at] ^= 1;
+            }),
+            ("media offset", |bytes| {
+                let at = bytes
+                    .windows(4)
+                    .position(|window| window == b"mdat")
+                    .unwrap()
+                    - 4;
+                bytes.splice(at..at, *b"\0\0\0\x08free");
+            }),
+            ("movie timescale", |bytes| {
+                let mvhd = bytes
+                    .windows(4)
+                    .rposition(|window| window == b"mvhd")
+                    .unwrap();
+                // version/flags (4) + creation/modification times (8).
+                bytes[mvhd + 4 + 12] ^= 1;
+            }),
+            ("native user data", |bytes| {
+                let at = bytes
+                    .windows(4)
+                    .rposition(|window| window == b"kept")
+                    .unwrap();
+                bytes[at..at + 4].copy_from_slice(b"lost");
+            }),
+        ];
+        for (label, damage) in damages {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("live.mov");
+            let original = quicktime_text_items_movie();
+            fs::write(&path, &original).unwrap();
+            super::after_toolkit_write(
+                &path,
+                Box::new(move |_destination, temp| {
+                    let mut bytes = fs::read(temp).unwrap();
+                    damage(&mut bytes);
+                    fs::write(temp, bytes).unwrap();
+                }),
+            );
+            let error = match prepare_metadata_xmp_toolkit(
+                &path,
+                &every_movie_field(),
+                ".meta-tmp",
+                None,
+            ) {
+                Ok(_) => panic!("{label}: damaged rewrite was accepted"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("Refusing embedded metadata rewrite"),
+                "{label}: {error:#}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), original, "{label}");
+            assert!(
+                embed_temp_entries(dir.path(), ".meta-tmp").is_empty(),
+                "{label}"
+            );
+        }
     }
 }

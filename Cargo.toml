@@ -22,7 +22,7 @@ default = ["xmp"]
 xmp = ["dep:xmp_toolkit"]
 # Re-exports parser entry points for cargo-fuzz harnesses (`fuzz/`).
 # Off by default; production builds never see the `kei::__fuzz` module.
-__fuzz_internals = []
+__fuzz_internals = ["dep:mp4-atom"]
 
 [package.metadata.cargo-udeps.ignore]
 # Used only by no-default-features builds (`#[cfg(not(feature = "xmp"))]`).
@@ -104,12 +104,14 @@ xmp_toolkit = { version = "1", optional = true }
 # disable the default `xmp` feature.
 little_exif = "0.6"
 
-# ISO-BMFF (MP4 / HEIF / HEIC) atom parsing. HEIC's XMP packet lives in a
-# `mime`-type item inside the `meta` box; mp4-atom reads existing packets and
-# remains test-only for fixture construction because production HEIC writes
-# preserve raw item-graph bytes.
+# Typed ISO-BMFF (MP4 / HEIF / HEIC) atoms for tests and fuzzing only.
+# Production HEIF reads and writes use kei's own byte-preserving parser in
+# `src/download/heif/`; mp4-atom builds test fixtures, decodes rewritten
+# files as an independent check, and backs the `__fuzz_internals` harnesses.
+# It is optional here so the fuzz feature can enable it, and listed again
+# under [dev-dependencies] for `cargo test`. Release builds do not link it.
 #
-# Pinned because kei depends on specific HEIF fixes included in 0.11.0:
+# Pinned because kei's fixtures and fuzz seeds depend on HEIF fixes in 0.11.0:
 #   - #123  `uri ` infe-item support for iOS 17+ HEICs (kei #274)
 #   - #153  colr cursor advance for `prof` / `rICC` ICC profiles, covering
 #           HDR HEIC parser fixtures (kei #269, #276)
@@ -118,7 +120,7 @@ little_exif = "0.6"
 #   - #161  drops mp4-atom's unmaintained `paste` dep in favor of `pastey`
 #   - #163  returns Err instead of panicking on reserved iloc *_size nibbles
 #           found by fuzzing (upstream #158)
-mp4-atom = "=0.11.0"
+mp4-atom = { version = "=0.11.0", optional = true }
 
 # Error handling
 anyhow = "1"
@@ -180,6 +182,8 @@ http = "1"
 wiremock = "0.6"
 tracing-test = "0.2"
 sha1 = "0.10"
+# Test-only typed ISO-BMFF atoms; see the pinned optional entry above.
+mp4-atom = "=0.11.0"
 # test-util enables `tokio::test(start_paused = true)` so retry/backoff
 # tests in the auth layer don't sleep through real wall-clock delays.
 tokio = { version = "1", features = ["test-util"] }
