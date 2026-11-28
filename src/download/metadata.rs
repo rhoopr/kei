@@ -56,6 +56,7 @@ pub(super) use embedded::apply_metadata_with_expected_fingerprint;
 pub(super) use embedded::prepare_metadata_with_expected_fingerprint;
 pub(crate) use formats::is_embed_writable_path;
 pub(super) use prepared::PreparedMetadataFile;
+pub(crate) use prepared::is_lasting_refusal;
 #[allow(
     unused_imports,
     reason = "preserve the existing facade type path in non-test builds"
@@ -78,7 +79,7 @@ pub(crate) use values::SourceGpsMetadata;
 pub(crate) use values::XmpRational;
 pub(crate) use values::{GpsCoords, MetadataWrite};
 #[cfg(all(test, feature = "xmp"))]
-pub(crate) use xmp_writer::after_toolkit_write;
+pub(crate) use xmp_writer::{ToolkitWriteHook, after_toolkit_write, take_after_toolkit_write};
 
 /// EXIF stores datetimes as `"YYYY:MM:DD HH:MM:SS"`; XMP wants ISO 8601
 /// `"YYYY-MM-DDTHH:MM:SS"`. Best-effort conversion — on malformed input we

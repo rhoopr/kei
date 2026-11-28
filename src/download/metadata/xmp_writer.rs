@@ -1,14 +1,20 @@
 //! XMP Toolkit preparation for native format handlers.
 
-use super::movie_layout::{validate_movie_metadata_layout, validate_movie_rewrite_preserves_media};
+use super::movie_layout::{
+    is_movie_file, validate_movie_metadata_layout, validate_movie_rewrite_preserves_media,
+};
 use super::prepared::{
-    PreparedMetadataFile, TmpGuard, create_unique_embed_temp, keep_source_mtime,
+    PreparedMetadataFile, TmpGuard, copy_fingerprinted, create_unique_embed_temp,
+    keep_source_mtime, lasting_unless_io,
 };
 use super::values::MetadataWrite;
 use super::xmp_fields::{apply_to_xmp, ensure_initialized};
 use anyhow::{Context, Result};
 use std::path::Path;
-use xmp_toolkit::{OpenFileOptions, XmpFile, XmpMeta};
+use xmp_toolkit::{OpenFileOptions, XmpFile, XmpMeta, xmp_ns};
+
+/// XMP properties the toolkit maps onto `mvhd` creation and modification times.
+const MOVIE_HEADER_DATES: [&str; 2] = ["CreateDate", "ModifyDate"];
 
 #[cfg(test)]
 pub(crate) type ToolkitWriteHook = Box<dyn FnOnce(&Path, &Path) + Send>;
@@ -26,6 +32,16 @@ pub(crate) fn after_toolkit_write(destination: &Path, hook: ToolkitWriteHook) {
         .lock()
         .unwrap()
         .push((destination.to_path_buf(), hook));
+}
+
+/// Remove an unused hook for `destination`; true when one was still waiting,
+/// which proves no toolkit write reached that destination.
+#[cfg(test)]
+pub(crate) fn take_after_toolkit_write(destination: &Path) -> bool {
+    let mut hooks = AFTER_TOOLKIT_WRITE.lock().unwrap();
+    let before = hooks.len();
+    hooks.retain(|(path, _)| path != destination);
+    hooks.len() != before
 }
 
 #[cfg(test)]
@@ -52,14 +68,16 @@ pub(super) fn prepare_metadata_xmp_toolkit(
 ) -> Result<PreparedMetadataFile> {
     ensure_initialized();
 
-    let expected = crate::download::file::fingerprint_regular_file_snapshot_blocking(path)
-        .with_context(|| {
-            format!(
-                "Could not fingerprint {} for metadata update",
-                path.display()
-            )
-        })?
-        .fingerprint;
+    let (mut file, tmp_path) = create_unique_embed_temp(path, temp_suffix)?;
+    let cleanup_permissions = file
+        .metadata()
+        .with_context(|| format!("Could not inspect permissions of {}", tmp_path.display()))?
+        .permissions();
+    let guard = TmpGuard::with_cleanup_permissions(&tmp_path, cleanup_permissions);
+    // One read of the source both copies and fingerprints it, so the copy is
+    // exactly the bytes that are checked against the approved fingerprint.
+    let expected = copy_fingerprinted(path, &mut file, &tmp_path)?;
+    drop(file);
     if expected_fingerprint.is_some_and(|approved| approved != expected) {
         return Err(
             crate::download::file::ConditionalPublishTargetChanged::AfterPlanning {
@@ -68,33 +86,11 @@ pub(super) fn prepare_metadata_xmp_toolkit(
             .into(),
         );
     }
-    let (file, tmp_path) = create_unique_embed_temp(path, temp_suffix)?;
-    let cleanup_permissions = file
-        .metadata()
-        .with_context(|| format!("Could not inspect permissions of {}", tmp_path.display()))?
-        .permissions();
-    let guard = TmpGuard::with_cleanup_permissions(&tmp_path, cleanup_permissions);
-    drop(file);
-    std::fs::copy(path, &tmp_path).with_context(|| {
-        format!(
-            "Could not copy {} to {}",
-            path.display(),
-            tmp_path.display()
-        )
-    })?;
-    let copied = crate::download::file::fingerprint_regular_file_snapshot_blocking(&tmp_path)
-        .with_context(|| format!("Could not fingerprint {}", tmp_path.display()))?
-        .fingerprint;
-    if copied != expected {
-        return Err(
-            crate::download::file::ConditionalPublishTargetChanged::AfterPlanning {
-                path: path.to_path_buf(),
-            }
-            .into(),
-        );
-    }
 
-    validate_movie_metadata_layout(&tmp_path)?;
+    let movie = is_movie_file(&tmp_path)?;
+    if movie {
+        validate_movie_metadata_layout(&tmp_path).map_err(lasting_unless_io)?;
+    }
     if write.orientation.is_some() {
         anyhow::ensure!(
             super::probe::original_orientation_missing(&tmp_path)?,
@@ -138,7 +134,21 @@ pub(super) fn prepare_metadata_xmp_toolkit(
             .xmp()
             .unwrap_or_else(|| XmpMeta::new().unwrap_or_default());
         let before = super::xmp_fields::embedded_fields(&meta);
+        // The toolkit maps these two properties onto the movie header's
+        // native creation and modification times, importing them on open and
+        // exporting them on save. Keeping the imported values leaves `mvhd`
+        // untouched; kei's capture date still lands in the other date fields.
+        let movie_dates =
+            movie.then(|| MOVIE_HEADER_DATES.map(|name| meta.property(xmp_ns::XMP, name)));
         apply_to_xmp(&mut meta, write)?;
+        if let Some(dates) = movie_dates {
+            for (name, value) in MOVIE_HEADER_DATES.into_iter().zip(dates) {
+                match value {
+                    Some(value) => meta.set_property(xmp_ns::XMP, name, &value)?,
+                    None => meta.delete_property(xmp_ns::XMP, name)?,
+                }
+            }
+        }
         let after = super::xmp_fields::embedded_fields(&meta);
 
         if !file.can_put_xmp(&meta) {
@@ -197,7 +207,30 @@ pub(super) fn prepare_metadata_xmp_toolkit(
     }
     #[cfg(test)]
     run_after_toolkit_write(path, &tmp_path);
-    validate_movie_rewrite_preserves_media(path, &tmp_path)?;
+    let checked_output = if movie {
+        match validate_movie_rewrite_preserves_media(path, &tmp_path) {
+            Ok(checked) => checked,
+            Err(error) => {
+                // The comparison reads the live destination. If it changed
+                // since the copy, report that rather than blaming the toolkit.
+                let current =
+                    crate::download::file::fingerprint_regular_file_snapshot_blocking(path)
+                        .map(|snapshot| snapshot.fingerprint)
+                        .ok();
+                if current != Some(expected) {
+                    return Err(
+                        crate::download::file::ConditionalPublishTargetChanged::AfterPlanning {
+                            path: path.to_path_buf(),
+                        }
+                        .into(),
+                    );
+                }
+                return Err(lasting_unless_io(error));
+            }
+        }
+    } else {
+        None
+    };
     let embedded_fields = write.ownership_after(&before, &after);
     let temp = std::fs::OpenOptions::new()
         .read(true)
@@ -213,9 +246,15 @@ pub(super) fn prepare_metadata_xmp_toolkit(
     temp.sync_all()
         .with_context(|| format!("Could not fsync {}", tmp_path.display()))?;
     drop(temp);
-    let output = crate::download::file::fingerprint_regular_file_snapshot_blocking(&tmp_path)
-        .with_context(|| format!("Could not fingerprint {}", tmp_path.display()))?
-        .fingerprint;
+    // Nothing writes the temp file's bytes after the movie check hashed them.
+    let output = match checked_output {
+        Some(output) => output,
+        None => {
+            crate::download::file::fingerprint_regular_file_snapshot_blocking(&tmp_path)
+                .with_context(|| format!("Could not fingerprint {}", tmp_path.display()))?
+                .fingerprint
+        }
+    };
     Ok(PreparedMetadataFile {
         required_mtime: None,
         embedded_fields: Box::new(embedded_fields),
@@ -891,7 +930,55 @@ mod tests {
                 crate::test_helpers::bare_track_meta_movie(),
             ),
             ("text-items.mov", quicktime_text_items_movie()),
+            ("dated.mp4", dated_mp4()),
+            ("preview-first.mov", preview_first_movie()),
+            ("creator-tool.mov", creator_tool_movie()),
+            ("copyright.mov", copyright_movie()),
         ]
+    }
+
+    fn atom(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut bytes = u32::try_from(body.len() + 8)
+            .unwrap()
+            .to_be_bytes()
+            .to_vec();
+        bytes.extend_from_slice(kind);
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    /// pattern.mp4 with real `mvhd` creation and modification times.
+    fn dated_mp4() -> Vec<u8> {
+        let mut bytes = include_bytes!("../../../tests/data/media/pattern.mp4").to_vec();
+        let mvhd = bytes.windows(4).position(|w| w == b"mvhd").unwrap() + 4;
+        // 2023-01-02 and 2023-01-03, in seconds since 1904.
+        bytes[mvhd + 4..mvhd + 8].copy_from_slice(&3_755_548_800_u32.to_be_bytes());
+        bytes[mvhd + 8..mvhd + 12].copy_from_slice(&3_755_635_200_u32.to_be_bytes());
+        bytes
+    }
+
+    /// Classic QuickTime: no `ftyp`, a `pnot` preview first.
+    fn preview_first_movie() -> Vec<u8> {
+        let movie = crate::test_helpers::bare_track_meta_movie();
+        let ftyp = usize::try_from(u32::from_be_bytes(movie[..4].try_into().unwrap())).unwrap();
+        [atom(b"pnot", &[0; 12]), movie[ftyp..].to_vec()].concat()
+    }
+
+    /// QuickTime movie whose XMP names a creator tool, which the toolkit
+    /// mirrors into a new `Cr8r` atom.
+    fn creator_tool_movie() -> Vec<u8> {
+        let packet = br#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:CreatorTool="Editor 1.0"/></rdf:RDF></x:xmpmeta>"#;
+        crate::test_helpers::quicktime_user_data_movie(&atom(b"XMP_", packet))
+    }
+
+    /// QuickTime movie with an ISO `cprt` atom, which the toolkit reconciles
+    /// with `dc:rights`.
+    fn copyright_movie() -> Vec<u8> {
+        // version/flags, packed language "eng", then the text.
+        crate::test_helpers::quicktime_user_data_movie(&atom(
+            b"cprt",
+            b"\0\0\0\0\x15\xc7(c) Someone\0",
+        ))
     }
 
     fn every_movie_field() -> MetadataWrite {
@@ -991,7 +1078,7 @@ mod tests {
                 };
                 let (before_moov, after_moov) = (live_moov(&original), live_moov(&rewritten));
                 for kind in [
-                    b"trak", b"\xa9nam", b"\xa9des", b"\xa9day", b"\xa9xyz", b"name",
+                    b"mvhd", b"trak", b"\xa9nam", b"\xa9des", b"\xa9day", b"\xa9xyz", b"name",
                 ] {
                     assert_eq!(
                         atom_bytes(&after_moov, kind),
@@ -1075,11 +1162,59 @@ mod tests {
                     .contains("Refusing embedded metadata rewrite"),
                 "{label}: {error:#}"
             );
+            assert!(
+                super::super::is_lasting_refusal(&error),
+                "{label}: the same bytes would be refused again"
+            );
             assert_eq!(fs::read(&path).unwrap(), original, "{label}");
             assert!(
                 embed_temp_entries(dir.path(), ".meta-tmp").is_empty(),
                 "{label}"
             );
         }
+    }
+
+    #[test]
+    fn contract_movie_embed_rewrite_preserves_media_creator_tool_gains_cr8r() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("creator.mov");
+        fs::write(&path, creator_tool_movie()).unwrap();
+        apply_metadata_with_default_suffix(&path, &every_movie_field()).unwrap();
+        let rewritten = fs::read(&path).unwrap();
+        assert!(
+            rewritten.windows(4).any(|w| w == b"Cr8r"),
+            "the toolkit owns and wrote the creator atom"
+        );
+    }
+
+    #[test]
+    fn movie_check_reports_a_concurrent_edit_as_a_changed_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.mov");
+        fs::write(&path, quicktime_text_items_movie()).unwrap();
+        super::after_toolkit_write(
+            &path,
+            Box::new(|destination, _temp| {
+                // An edit to the destination during the rewrite.
+                let mut bytes = fs::read(destination).unwrap();
+                let at = bytes
+                    .windows(15)
+                    .position(|w| w == b"unchanged media")
+                    .unwrap();
+                bytes[at] ^= 1;
+                fs::write(destination, bytes).unwrap();
+            }),
+        );
+        let error =
+            match prepare_metadata_xmp_toolkit(&path, &every_movie_field(), ".meta-tmp", None) {
+                Ok(_) => panic!("an edited destination was accepted"),
+                Err(error) => error,
+            };
+        assert!(
+            crate::download::file::classify_conditional_publish_error(&error).target_changed,
+            "{error:#}"
+        );
+        assert!(!super::super::is_lasting_refusal(&error));
+        assert!(embed_temp_entries(dir.path(), ".meta-tmp").is_empty());
     }
 }

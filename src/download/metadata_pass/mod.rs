@@ -128,6 +128,9 @@ pub(crate) enum Outcome<T> {
     Changed,
     /// The write failed; retry later.
     Failed,
+    /// The writer refused these bytes for their layout. Retrying the same
+    /// bytes with the same values gives the same answer.
+    Refused,
 }
 
 /// A prepared embedded rewrite, not yet published.
@@ -286,6 +289,8 @@ fn prepare_embed_blocking(path: &Path, request: &EmbedRequest) -> Outcome<Prepar
             );
             if disposition.target_changed {
                 Outcome::Changed
+            } else if super::metadata::is_lasting_refusal(&error) {
+                Outcome::Refused
             } else {
                 Outcome::Failed
             }

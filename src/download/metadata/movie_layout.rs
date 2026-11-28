@@ -3,10 +3,12 @@
 //! The toolkit owns the movie's XMP packet: `moov/udta/XMP_` in QuickTime
 //! files and a top-level XMP `uuid` box in ISO MP4 files. When the new `moov`
 //! does not fit, it writes the new `moov` at the end of the file and turns the
-//! old one into `free`. It can also copy XMP dates into the two `mvhd`
-//! timestamps. Every other box must survive unchanged at its original offset,
-//! so media data and the chunk offset tables that point into it stay valid.
+//! old one into `free`. In QuickTime files it also owns the `Cr8r` and `cprt`
+//! user-data atoms. Every other box must survive unchanged, and top-level boxes
+//! at their original offsets, so media data and the chunk offset tables that
+//! point into it stay valid.
 
+use crate::download::file::ExistingFileFingerprint;
 use anyhow::{Context, Result, bail, ensure};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -19,8 +21,6 @@ const XMP_UUID: [u8; 16] = [
 const BOX_BUDGET: usize = 100_000;
 const MAX_DEPTH: usize = 32;
 const COMPARE_BUFFER_BYTES: usize = 64 * 1024;
-/// Version 1 `mvhd` is 120 bytes; anything larger is compared without masking.
-const MAX_MASKED_MVHD_BYTES: u64 = 256;
 
 #[derive(Clone, Copy, Debug)]
 struct MovieBox {
@@ -65,19 +65,80 @@ fn read_box(file: &mut File, offset: u64, end: u64) -> Result<MovieBox> {
     })
 }
 
-/// Whether the file starts like an ISO-BMFF or QuickTime movie.
+/// Whether the XMP Toolkit's MPEG-4 handler can open the file as a movie.
+///
+/// Mirrors `MPEG4_CheckFormat`: an `ftyp` first box, or classic QuickTime
+/// top-level boxes up to `moov`. Like the toolkit, any box whose type is
+/// printable ASCII or 0xA9 is tolerated before `moov`, which covers `pnot`
+/// previews and stray user-data boxes. Images never match: their first eight
+/// bytes do not form a box that fits in the file with a printable type. A
+/// file whose first box names a movie type but has broken bounds counts as a
+/// movie, so the layout check refuses it instead of skipping it.
 fn is_movie(file: &mut File, len: u64) -> Result<bool> {
-    if len < 8 {
-        return Ok(false);
+    let mut offset = 0;
+    let mut budget = BOX_BUDGET;
+    while offset < len && budget > 0 {
+        budget -= 1;
+        let Ok(movie_box) = read_box(file, offset, len) else {
+            if offset == 0 && len >= 8 {
+                file.seek(SeekFrom::Start(0))?;
+                let mut header = [0; 8];
+                file.read_exact(&mut header)?;
+                let [_, _, _, _, k0, k1, k2, k3] = header;
+                return Ok(matches!(
+                    &[k0, k1, k2, k3],
+                    b"ftyp" | b"moov" | b"mdat" | b"pnot" | b"wide" | b"free" | b"skip"
+                ));
+            }
+            return Ok(false);
+        };
+        if &movie_box.kind == b"moov" || (offset == 0 && &movie_box.kind == b"ftyp") {
+            return Ok(true);
+        }
+        if !movie_box
+            .kind
+            .iter()
+            .all(|&byte| (0x20..=0x7e).contains(&byte) || byte == 0xa9)
+        {
+            return Ok(false);
+        }
+        offset = movie_box.end;
     }
-    file.seek(SeekFrom::Start(0))?;
-    let mut header = [0; 8];
-    file.read_exact(&mut header)?;
-    let [_, _, _, _, k0, k1, k2, k3] = header;
-    Ok(matches!(
-        &[k0, k1, k2, k3],
-        b"ftyp" | b"moov" | b"mdat" | b"wide" | b"free" | b"skip"
-    ))
+    Ok(false)
+}
+
+/// Whether the toolkit opens `path` as a movie; see [`is_movie`].
+pub(super) fn is_movie_file(path: &Path) -> Result<bool> {
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    is_movie(&mut file, len)
+}
+
+/// Bytes to skip before a `meta` box's children: 4 for an ISO FullBox, 0 for
+/// a bare QuickTime atom. Both forms put `hdlr` first, so its position decides;
+/// without one, a nested all-zero prefix is taken as a FullBox header.
+fn meta_prefix_len(file: &mut File, movie_box: MovieBox, parent: Option<&[u8; 4]>) -> Result<u64> {
+    let available = movie_box.end - movie_box.body;
+    if available < 4 {
+        ensure!(parent == Some(b"moov"), "Incomplete movie metadata prefix");
+        return Ok(0);
+    }
+    let mut head = [0; 12];
+    let read = usize::try_from(available.min(12))?;
+    file.seek(SeekFrom::Start(movie_box.body))?;
+    file.read_exact(head.get_mut(..read).unwrap_or_default())?;
+    let [p0, p1, p2, p3, a0, a1, a2, a3, b0, b1, b2, b3] = head;
+    if read >= 8 && &[a0, a1, a2, a3] == b"hdlr" {
+        return Ok(0);
+    }
+    if read >= 12 && &[b0, b1, b2, b3] == b"hdlr" {
+        return Ok(4);
+    }
+    Ok(if parent != Some(b"moov") && [p0, p1, p2, p3] == [0; 4] {
+        4
+    } else {
+        0
+    })
 }
 
 /// Rejects malformed movie box bounds before the toolkit opens the file. A
@@ -131,17 +192,8 @@ fn validate_movie_boxes(
                         | b"stbl"
                 ))
         {
-            if kind == b"meta" && parent != Some(b"moov") {
-                ensure!(
-                    movie_box.end - children >= 4,
-                    "Incomplete movie metadata prefix"
-                );
-                file.seek(SeekFrom::Start(children))?;
-                let mut prefix = [0; 4];
-                file.read_exact(&mut prefix)?;
-                if prefix == [0; 4] {
-                    children += 4;
-                }
+            if kind == b"meta" {
+                children += meta_prefix_len(file, movie_box, parent)?;
             }
             validate_movie_boxes(file, children, movie_box.end, Some(kind), depth + 1, budget)?;
         }
@@ -206,17 +258,21 @@ fn is_xmp_uuid(file: &mut File, movie_box: MovieBox) -> Result<bool> {
 }
 
 /// Refuses a toolkit rewrite that changed anything outside the movie's XMP
-/// packet, padding and `mvhd` timestamps, or that moved a protected box.
+/// packet, padding and toolkit-owned user data, or that moved a protected box.
+///
+/// Returns the rewritten file's fingerprint for movies, computed in the same
+/// pass that compares the media, so callers need not read the file again.
+/// Returns `None` for files the toolkit does not open as movies.
 pub(super) fn validate_movie_rewrite_preserves_media(
     original: &Path,
     rewritten: &Path,
-) -> Result<()> {
+) -> Result<Option<ExistingFileFingerprint>> {
     // CONTRACT: MOVIE_EMBED_REWRITE_PRESERVES_MEDIA
     let mut before = File::open(original)
         .with_context(|| format!("Could not open {} for comparison", original.display()))?;
     let before_len = before.metadata()?.len();
     if !is_movie(&mut before, before_len)? {
-        return Ok(());
+        return Ok(None);
     }
     let mut after = File::open(rewritten)
         .with_context(|| format!("Could not open {} for comparison", rewritten.display()))?;
@@ -232,7 +288,6 @@ pub(super) fn validate_movie_rewrite_preserves_media(
         old.protected.len() == new.protected.len(),
         "Refusing embedded metadata rewrite: the XMP toolkit added or removed a top-level movie box"
     );
-    let mut buffers = CompareBuffers::new();
     for (old_box, new_box) in old.protected.iter().zip(&new.protected) {
         ensure!(
             old_box.kind == new_box.kind
@@ -240,17 +295,11 @@ pub(super) fn validate_movie_rewrite_preserves_media(
                 && old_box.len() == new_box.len(),
             "Refusing embedded metadata rewrite: the XMP toolkit moved or resized a top-level movie box"
         );
-        buffers.require_equal(
-            &mut before,
-            *old_box,
-            &mut after,
-            *new_box,
-            "Refusing embedded metadata rewrite: the XMP toolkit changed a top-level movie box",
-        )?;
     }
     let (Some(old_moov), Some(new_moov)) = (old.moov, new.moov) else {
         bail!("Refusing embedded metadata rewrite: the movie must keep exactly one `moov` box");
     };
+    let mut buffers = CompareBuffers::new();
     let old_moov = children(
         &mut before,
         old_moov.body,
@@ -267,7 +316,6 @@ pub(super) fn validate_movie_rewrite_preserves_media(
     )?;
     let old_moov = split_movie(&mut before, &old_moov, &mut before_budget)?;
     let new_moov = split_movie(&mut after, &new_moov, &mut after_budget)?;
-
     require_same_boxes(
         &mut buffers,
         &mut before,
@@ -284,20 +332,16 @@ pub(super) fn validate_movie_rewrite_preserves_media(
         &new_moov.user_data,
         "Refusing embedded metadata rewrite: the XMP toolkit changed movie user data",
     )?;
-    ensure!(
-        old_moov.header.len() == new_moov.header.len(),
-        "Refusing embedded metadata rewrite: the XMP toolkit added or removed a movie header"
-    );
-    for (old_header, new_header) in old_moov.header.iter().zip(&new_moov.header) {
-        require_same_movie_header(
-            &mut before,
-            *old_header,
+    // Last, because it reads the whole file: the protected top-level boxes
+    // (ftyp, mdat, ...) sit at the same offsets in both files.
+    buffers
+        .hash_comparing(
             &mut after,
-            *new_header,
-            &mut buffers,
-        )?;
-    }
-    Ok(())
+            &mut before,
+            &new.protected,
+            "Refusing embedded metadata rewrite: the XMP toolkit changed a top-level movie box",
+        )
+        .map(Some)
 }
 
 struct TopLevel {
@@ -323,25 +367,29 @@ fn split_top_level(file: &mut File, boxes: &[MovieBox]) -> Result<TopLevel> {
 }
 
 struct MovieChildren {
-    header: Vec<MovieBox>,
-    /// `udta` children other than the XMP packet and padding, in file order.
+    /// `udta` children the toolkit does not own, in file order.
     user_data: Vec<MovieBox>,
-    /// Remaining `moov` children (tracks, QuickTime metadata, ...), in order.
+    /// Every other `moov` child (header, tracks, QuickTime metadata), in order.
     protected: Vec<MovieBox>,
+}
+
+/// `udta` children the toolkit owns: the XMP packet, the `Cr8r` creator atom
+/// it derives from `xmp:CreatorTool` in QuickTime files, and the `cprt`
+/// copyrights it reconciles with `dc:rights`.
+fn is_toolkit_user_data(kind: &[u8; 4]) -> bool {
+    matches!(kind, b"XMP_" | b"Cr8r" | b"cprt") || is_padding(kind)
 }
 
 fn split_movie(file: &mut File, boxes: &[MovieBox], budget: &mut usize) -> Result<MovieChildren> {
     let mut split = MovieChildren {
-        header: Vec::new(),
         user_data: Vec::new(),
         protected: Vec::new(),
     };
     for movie_box in boxes {
         match &movie_box.kind {
-            b"mvhd" => split.header.push(*movie_box),
             b"udta" => {
                 for child in children(file, movie_box.body, movie_box.end, Some(b"udta"), budget)? {
-                    if &child.kind != b"XMP_" && !is_padding(&child.kind) {
+                    if !is_toolkit_user_data(&child.kind) {
                         split.user_data.push(child);
                     }
                 }
@@ -369,53 +417,6 @@ fn require_same_boxes(
         );
         buffers.require_equal(before, *old_box, after, *new_box, reason)?;
     }
-    Ok(())
-}
-
-/// `mvhd` must be unchanged except for its creation and modification times,
-/// which the toolkit reconciles with XMP dates.
-fn require_same_movie_header(
-    before: &mut File,
-    old: MovieBox,
-    after: &mut File,
-    new: MovieBox,
-    buffers: &mut CompareBuffers,
-) -> Result<()> {
-    const REASON: &str =
-        "Refusing embedded metadata rewrite: the XMP toolkit changed the movie header";
-    ensure!(
-        old.len() == new.len() && old.body - old.start == new.body - new.start,
-        REASON
-    );
-    if old.len() > MAX_MASKED_MVHD_BYTES {
-        return buffers.require_equal(before, old, after, new, REASON);
-    }
-    let read = |file: &mut File, movie_box: MovieBox| -> Result<Vec<u8>> {
-        let mut bytes = vec![0; usize::try_from(movie_box.len())?];
-        file.seek(SeekFrom::Start(movie_box.start))?;
-        file.read_exact(&mut bytes)?;
-        Ok(bytes)
-    };
-    let mut old_bytes = read(before, old)?;
-    let mut new_bytes = read(after, new)?;
-    let body = usize::try_from(old.body - old.start)?;
-    let version = old_bytes.get(body).copied();
-    // version (1) + flags (3), then creation and modification times.
-    let times = match version {
-        Some(0) => Some(body + 4..body + 12),
-        Some(1) => Some(body + 4..body + 20),
-        _ => None,
-    };
-    if let Some(times) = times
-        && new_bytes.get(body).copied() == version
-    {
-        for bytes in [&mut old_bytes, &mut new_bytes] {
-            if let Some(range) = bytes.get_mut(times.clone()) {
-                range.fill(0);
-            }
-        }
-    }
-    ensure!(old_bytes == new_bytes, REASON);
     Ok(())
 }
 
@@ -457,6 +458,59 @@ impl CompareBuffers {
             remaining -= count as u64;
         }
         Ok(())
+    }
+
+    /// Hash all of `after` in one sequential read, comparing every byte inside
+    /// a `protected` range with the byte at the same offset in `before`.
+    /// `protected` is in file order and its ranges do not overlap.
+    fn hash_comparing(
+        &mut self,
+        after: &mut File,
+        before: &mut File,
+        protected: &[MovieBox],
+        reason: &'static str,
+    ) -> Result<ExistingFileFingerprint> {
+        use sha2::{Digest, Sha256};
+        let Self { left, right } = self;
+        let mut sha256 = Sha256::new();
+        after.seek(SeekFrom::Start(0))?;
+        let mut position = 0_u64;
+        let mut next = 0;
+        loop {
+            let read = after.read(right)?;
+            if read == 0 {
+                break;
+            }
+            let chunk = right.get(..read).unwrap_or_default();
+            sha256.update(chunk);
+            let end = position + read as u64;
+            while let Some(range) = protected.get(next) {
+                if range.start >= end {
+                    break;
+                }
+                let from = range.start.max(position);
+                let to = range.end.min(end);
+                let offset = usize::try_from(from - position)?;
+                let len = usize::try_from(to - from)?;
+                let (Some(expected), Some(actual)) =
+                    (left.get_mut(..len), chunk.get(offset..offset + len))
+                else {
+                    bail!("Movie comparison buffer is too small");
+                };
+                before.seek(SeekFrom::Start(from))?;
+                before.read_exact(expected)?;
+                ensure!(expected == actual, "{reason}");
+                if range.end > end {
+                    break;
+                }
+                next += 1;
+            }
+            position = end;
+        }
+        Ok(ExistingFileFingerprint {
+            size: position,
+            sha256: sha256.finalize().into(),
+        })
     }
 }
 
@@ -508,7 +562,14 @@ mod tests {
         let (original, rewritten) = (dir.path().join("a.mov"), dir.path().join("b.mov"));
         fs::write(&original, before)?;
         fs::write(&rewritten, after)?;
-        validate_movie_rewrite_preserves_media(&original, &rewritten)
+        if let Some(fingerprint) = validate_movie_rewrite_preserves_media(&original, &rewritten)? {
+            // The comparison pass doubles as the rewritten file's fingerprint.
+            anyhow::ensure!(
+                fingerprint == crate::download::metadata::prepared::fingerprint_bytes(after)?,
+                "fingerprint differs from the rewritten bytes"
+            );
+        }
+        Ok(())
     }
 
     fn refused(before: &[u8], after: &[u8]) -> String {
@@ -538,11 +599,14 @@ mod tests {
         let before = movie(&[ftyp(), old_moov.clone(), mdat()]);
         let mut udta = native_name();
         udta.extend(atom(b"XMP_", b"<x:xmpmeta/>"));
+        // Toolkit-owned creator and copyright atoms may appear or change.
+        udta.extend(atom(b"Cr8r", &[0; 16]));
+        udta.extend(atom(b"cprt", b"\0\0\0\0\x15\xc7(c)\0"));
         let after = movie(&[
             ftyp(),
             atom(b"free", &vec![0; old_moov.len() - 8]),
             mdat(),
-            moov(&mvhd(0, 5, 99, 600), &udta),
+            moov(&mvhd(0, 5, 6, 600), &udta),
         ]);
         check(&before, &after).unwrap();
     }
@@ -555,7 +619,7 @@ mod tests {
         let after = movie(&[
             ftyp(),
             mdat(),
-            moov(&mvhd(1, 7, 8, 600), &native_name()),
+            moov(&mvhd(1, 0, 0, 600), &native_name()),
             atom(b"uuid", &packet),
         ]);
         check(&before, &after).unwrap();
@@ -588,11 +652,55 @@ mod tests {
     }
 
     #[test]
-    fn contract_movie_embed_rewrite_preserves_media_refuses_non_time_header_change() {
+    fn contract_movie_embed_rewrite_preserves_media_refuses_any_header_change() {
+        // Native creation and modification times are capture data too.
         for version in [0, 1] {
             let before = movie(&[ftyp(), mdat(), moov(&mvhd(version, 1, 2, 600), &[])]);
-            let after = movie(&[ftyp(), mdat(), moov(&mvhd(version, 1, 3, 601), &[])]);
-            assert!(refused(&before, &after).contains("movie header"));
+            for after in [
+                mvhd(version, 9, 2, 600),
+                mvhd(version, 1, 9, 600),
+                mvhd(version, 1, 2, 601),
+            ] {
+                let after = movie(&[ftyp(), mdat(), moov(&after, &[])]);
+                assert!(refused(&before, &after).contains("tracks or metadata"));
+            }
+        }
+    }
+
+    #[test]
+    fn contract_movie_embed_rewrite_preserves_media_checks_classic_quicktime_starts() {
+        // The toolkit opens files that start with a preview or any printable
+        // box before `moov`; so does the check.
+        for lead in [atom(b"pnot", &[0; 12]), atom(b"udta", &native_name())] {
+            let before = movie(&[lead.clone(), moov(&mvhd(0, 0, 0, 600), &[]), mdat()]);
+            let after = movie(&[
+                lead,
+                moov(&mvhd(0, 0, 0, 600), &[]),
+                atom(b"mdat", b"media PAYLOAD"),
+            ]);
+            assert!(refused(&before, &after).contains("top-level movie box"));
+        }
+    }
+
+    #[test]
+    fn movie_layout_check_tells_bare_and_full_meta_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let hdlr = atom(b"hdlr", &[0; 24]);
+        let full_with_flags = [vec![0, 0, 0, 1], hdlr.clone()].concat();
+        for body in [
+            hdlr.clone(),
+            [vec![0; 4], hdlr.clone()].concat(),
+            full_with_flags,
+        ] {
+            let track = atom(b"trak", &atom(b"meta", &body));
+            let bytes = movie(&[
+                ftyp(),
+                atom(b"moov", &[mvhd(0, 0, 0, 600), track].concat()),
+                mdat(),
+            ]);
+            let path = dir.path().join("meta.mov");
+            fs::write(&path, bytes).unwrap();
+            super::validate_movie_metadata_layout(&path).unwrap();
         }
     }
 

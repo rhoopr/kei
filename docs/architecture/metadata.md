@@ -17,7 +17,12 @@ A copy is visited when its metadata may be stale: after it is downloaded or adop
 7. Writes or updates the `.xmp` sidecar when enabled.
 8. Records the payload hash and, after an embedded write, the new SHA-256 and owned fields.
 
-A failure leaves only that copy to retry on the next pass.
+A failure leaves only that copy to retry on the next pass. A lasting refusal, where the
+writer rejects the file's own layout (a HEIF item graph it cannot rewrite safely, or
+a movie the toolkit would change outside its XMP), is recorded against the payload
+hash and the kei version. Later passes still count the copy as failed but do not
+redo the rewrite until the file, its values, the settings or kei change. The sidecar
+is still written.
 
 ## Field ownership
 
@@ -92,11 +97,19 @@ multiple NFS clients. Recovery does not mark a copy saved by itself.
 ## Movie preparation
 
 `src/download/metadata/movie_layout.rs` checks MP4 and MOV files on both sides of
-the XMP Toolkit write, with bounded reads and box counts.
+the XMP Toolkit write, with bounded reads and box counts. A file counts as a movie
+when the toolkit would open it as one: an `ftyp` first box, or QuickTime top-level
+boxes up to `moov`, including `pnot` previews and other boxes with printable names.
 
 Before the write, it checks movie box boundaries in the temporary copy. A nested
-`meta` may be an ISO FullBox or a bare QuickTime atom. The optional four-byte zero
-terminator is accepted only at the end of a `udta` child list.
+`meta` may be an ISO FullBox or a bare QuickTime atom; the position of its first
+`hdlr` child tells them apart. The optional four-byte zero terminator is accepted
+only at the end of a `udta` child list.
+
+The toolkit maps `xmp:CreateDate` and `xmp:ModifyDate` onto the `mvhd` creation
+and modification times. kei keeps the values the toolkit read from `mvhd`, so the
+native times are never replaced; kei's capture date goes into the other date
+properties.
 
 After the write, it compares the temporary copy with the original before
 publishing (`MOVIE_EMBED_REWRITE_PRESERVES_MEDIA`). The toolkit may change only:
@@ -106,11 +119,17 @@ publishing (`MOVIE_EMBED_REWRITE_PRESERVES_MEDIA`). The toolkit may change only:
 - padding (`free`, `skip`, `wide`), including the old `moov` it turns into `free`
   when the new `moov` no longer fits and is written at the end of the file;
 - the location of `moov` itself;
-- the creation and modification times in `mvhd`, which it fills from XMP dates.
+- the `udta` atoms it owns in QuickTime files: `Cr8r`, derived from
+  `xmp:CreatorTool`, and `cprt`, reconciled with `dc:rights`.
 
 Every other top-level box, such as `ftyp` and `mdat`, must keep its offset, size
 and bytes, so the chunk offset tables still point at the same media. Every other
-`moov` child, including tracks and QuickTime `meta`, and every other `udta` child
-must keep its bytes and order. Any other change, or a malformed rewritten file,
-fails the write. Failure preserves the original media and leaves the copy's
-metadata to retry on the next pass. The comparison reads both files once.
+`moov` child, including `mvhd`, tracks and QuickTime `meta`, and every other `udta`
+child must keep its bytes and order. Any other change, or a malformed rewritten
+file, is a lasting refusal: the original media is kept and the copy's metadata is
+not rewritten again until the file or its values change. If the original changed
+during the comparison, the copy is reported as changed locally instead.
+
+The comparison reads the rewritten file once and also yields its fingerprint, and
+the source is fingerprinted while it is copied, so a movie rewrite costs no more
+whole-file reads than before the check.

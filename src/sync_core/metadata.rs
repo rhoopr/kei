@@ -151,8 +151,17 @@ async fn visit(
         state.metadata_written(row.id, &payload.hash, None).await?;
         return Ok(Visit::Unchanged);
     }
+    let refused = refusal_marker(&payload.hash);
+    if row.meta_hash.as_deref() == Some(refused.as_str()) {
+        // The writer refused these bytes with these values; the same answer
+        // would come back. Still due and counted, but not redone until the
+        // file, the values, the settings or kei change.
+        tracing::debug!(path = %row.path, "Embedded metadata write was refused for this file; not retrying until it or its metadata changes");
+        return Ok(Visit::Failed);
+    }
 
     let mut written = None;
+    let mut embed_refused = false;
     if writers::embeds_into(settings, &path) {
         let expected = (
             size,
@@ -180,7 +189,7 @@ async fn visit(
                         state.mark_modified(row.id).await?;
                         return Ok(Visit::Modified);
                     }
-                    Outcome::Unchanged | Outcome::Failed => {
+                    Outcome::Unchanged | Outcome::Failed | Outcome::Refused => {
                         return Ok(Visit::Failed);
                     }
                 }
@@ -193,6 +202,8 @@ async fn visit(
             Outcome::Failed => {
                 return Ok(Visit::Failed);
             }
+            // The sidecar does not depend on the media rewrite; still write it.
+            Outcome::Refused => embed_refused = true,
         }
     }
     let mut sidecar = false;
@@ -200,7 +211,7 @@ async fn visit(
         match writers::write_sidecar(settings, &path, row.source_sha.as_deref(), &payload).await {
             Outcome::Written(()) => sidecar = true,
             Outcome::Unchanged => {}
-            Outcome::Changed | Outcome::Failed => {
+            Outcome::Changed | Outcome::Failed | Outcome::Refused => {
                 // Keep any embedded write that already landed.
                 if let Some((installed, fields)) = written {
                     state.set_pending(row.id, &installed, Some(fields)).await?;
@@ -209,6 +220,10 @@ async fn visit(
                 return Ok(Visit::Failed);
             }
         }
+    }
+    if embed_refused {
+        state.metadata_refused(row.id, &refused).await?;
+        return Ok(Visit::Failed);
     }
     let embedded = written.is_some();
     state
@@ -219,6 +234,12 @@ async fn visit(
     } else {
         Visit::Unchanged
     })
+}
+
+/// What `meta_hash` holds after the writer refused `payload_hash` for a
+/// file's layout. Naming the kei version retries the write after an upgrade.
+fn refusal_marker(payload_hash: &str) -> String {
+    format!("refused:{}:{payload_hash}", env!("CARGO_PKG_VERSION"))
 }
 
 fn settings_writes_sidecar(settings: &Settings) -> bool {

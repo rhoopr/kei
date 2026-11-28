@@ -387,6 +387,103 @@ pub(super) fn fingerprint_open_file(
     Ok(crate::download::file::fingerprint_open_file_snapshot_blocking(file, path)?.fingerprint)
 }
 
+/// Copy `source` into `dest` and fingerprint the copied bytes in one read.
+/// Like [`std::fs::copy`], the copy takes the source's permissions.
+#[cfg(feature = "xmp")]
+pub(super) fn copy_fingerprinted(
+    source: &Path,
+    dest: &mut std::fs::File,
+    dest_path: &Path,
+) -> Result<crate::download::file::ExistingFileFingerprint> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Write};
+
+    let regular = |stage: &str| -> Result<std::fs::Metadata> {
+        let metadata = std::fs::symlink_metadata(source)
+            .with_context(|| format!("Could not {stage} metadata source {}", source.display()))?;
+        anyhow::ensure!(
+            metadata.file_type().is_file(),
+            "Metadata source is not a regular file: {}",
+            source.display()
+        );
+        Ok(metadata)
+    };
+    let metadata = regular("inspect")?;
+    let mut input = std::fs::File::open(source)
+        .with_context(|| format!("Could not open {} for metadata update", source.display()))?;
+    let mut sha256 = Sha256::new();
+    let mut size = 0_u64;
+    let mut buffer = vec![0; 64 * 1024];
+    loop {
+        let read = input
+            .read(&mut buffer)
+            .with_context(|| format!("Could not read {}", source.display()))?;
+        if read == 0 {
+            break;
+        }
+        let bytes = buffer.get(..read).unwrap_or_default();
+        sha256.update(bytes);
+        dest.write_all(bytes)
+            .with_context(|| format!("Could not write {}", dest_path.display()))?;
+        size += read as u64;
+    }
+    regular("recheck")?;
+    dest.set_permissions(metadata.permissions())
+        .with_context(|| format!("Could not copy permissions to {}", dest_path.display()))?;
+    Ok(crate::download::file::ExistingFileFingerprint {
+        size,
+        sha256: sha256.finalize().into(),
+    })
+}
+
+/// A rewrite refused because of the file's own layout or what the writer made
+/// of it, not because of I/O. The same bytes and values give the same answer,
+/// so the metadata pass records the refusal rather than redoing the work every
+/// cycle. Displays as the error it wraps.
+#[cfg(feature = "xmp")]
+#[derive(Debug)]
+pub(crate) struct LastingRefusal(anyhow::Error);
+
+#[cfg(feature = "xmp")]
+impl std::fmt::Display for LastingRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
+#[cfg(feature = "xmp")]
+impl std::error::Error for LastingRefusal {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+}
+
+/// Mark `error` as a [`LastingRefusal`] unless an I/O failure caused it.
+#[cfg(feature = "xmp")]
+pub(super) fn lasting_unless_io(error: anyhow::Error) -> anyhow::Error {
+    if error.root_cause().is::<std::io::Error>() {
+        error
+    } else {
+        anyhow::Error::new(LastingRefusal(error))
+    }
+}
+
+/// Whether preparing an embedded rewrite failed with a lasting refusal: a
+/// movie the toolkit would change outside its XMP, or a HEIF item layout the
+/// writer cannot rewrite safely.
+pub(crate) fn is_lasting_refusal(error: &anyhow::Error) -> bool {
+    #[cfg(feature = "xmp")]
+    {
+        error.downcast_ref::<LastingRefusal>().is_some()
+            || crate::download::heif::classify_heif_layout_refusal(error)
+    }
+    #[cfg(not(feature = "xmp"))]
+    {
+        let _ = error;
+        false
+    }
+}
+
 #[cfg(all(test, feature = "xmp"))]
 mod heif_admission_tests {
     use super::{HEIF_PEAK, admit_heif_metadata};

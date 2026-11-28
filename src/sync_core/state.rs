@@ -1508,6 +1508,21 @@ impl State {
         .await
     }
 
+    /// The embedded writer refused this copy's bytes for `marker`'s values.
+    /// The copy stays due, so it is still visited and counted; the marker lets
+    /// the visit skip the rewrite until the file or its metadata changes.
+    pub(crate) async fn metadata_refused(&self, id: i64, marker: &str) -> anyhow::Result<()> {
+        let marker = marker.to_owned();
+        self.with(move |conn| {
+            conn.execute(
+                "UPDATE files SET meta_hash = ?2 WHERE id = ?1",
+                params![id, marker],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     /// JSON of the embedded fields kei owns in this copy.
     pub(crate) async fn meta_fields(&self, id: i64) -> anyhow::Result<Option<String>> {
         self.with(move |conn| {

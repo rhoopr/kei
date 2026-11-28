@@ -25,7 +25,10 @@ When a metadata writer is enabled, a separate pass after downloads updates every
 saved copy whose catalog record or metadata settings changed since kei last wrote
 it, up to `[download] threads` copies at a time. A changed setting makes every
 saved copy due once. The pass never holds back the sync position or download
-completion, and a failed write leaves only that copy to retry next cycle.
+completion, and a failed write leaves only that copy to retry next cycle. When a
+writer refuses the file's own layout, the copy is still reported as failed each
+cycle, but the write is retried only after the file, its iCloud values, the
+settings or kei change.
 
 Only copies that still hold the bytes kei recorded are written. A copy that
 changed locally is left alone and counted as locally modified. Each cycle logs
@@ -66,7 +69,7 @@ that iCloud supplies; album names still need `include_albums`.
 
 | iCloud value | Setting for embedded output | XMP property | Embedded rule |
 | --- | --- | --- | --- |
-| Capture date and time zone offset | `set_exif_datetime` | `exif:DateTimeOriginal`, `xmp:CreateDate`, `xmp:ModifyDate`, `photoshop:DateCreated`, `exifEX:OffsetTimeOriginal` | Only when the file has no capture date, unless capture repair is requested |
+| Capture date and time zone offset | `set_exif_datetime` | `exif:DateTimeOriginal`, `xmp:CreateDate`, `xmp:ModifyDate`, `photoshop:DateCreated`, `exifEX:OffsetTimeOriginal` | Only when the file has no capture date, unless capture repair is requested. In movies, `xmp:CreateDate` and `xmp:ModifyDate` keep the movie header's own times |
 | Favorite | `set_exif_rating` | `xmp:Rating` | Favorite is rating 5; unfavoriting clears only a rating kei wrote |
 | Location | `set_exif_gps` | `exif:GPSLatitude`, `exif:GPSLongitude`, `exif:GPSAltitude` | Only when the file has no GPS |
 | Caption | `set_exif_description` | `dc:description` | Falls back to the title when there is no caption |
@@ -89,16 +92,17 @@ filename: `IMG_0001.HEIC.xmp`.
 | JPEG, TIFF without `xmp` | little_exif | No XMP | Native EXIF date, offset, GPS, description, rating and orientation |
 | PNG | XMP Toolkit | XMP text chunk | None checked |
 | HEIC, HEIF, AVIF | kei's item writer | XMP item of the primary image | Native Exif capture time only under capture repair; every other item is checked byte for byte |
-| MOV | XMP Toolkit | `moov/udta/XMP_` | `mvhd` creation and modification times; may move `moov` to the end of the file |
-| MP4 | XMP Toolkit | Top-level XMP `uuid` box | Same as MOV |
-| Anything else | None | Sidecar only | |
+| MOV | XMP Toolkit | `moov/udta/XMP_` | May move `moov` to the end of the file; `Cr8r` and `cprt` follow `xmp:CreatorTool` and `dc:rights` |
+| MP4 | XMP Toolkit | Top-level XMP `uuid` box | May move `moov` to the end of the file |
+| Camera raw (DNG, CR2, NEF, ARW and other TIFF-based raw), anything else | None | Sidecar only | |
 
-Formats are recognised by their first bytes before their extension, so a
-TIFF-structured raw file such as DNG takes the TIFF row. Movie rewrites are
-compared with the original before publication; anything outside the changes
-listed above fails the write and is retried (see [metadata write
-boundaries](architecture/metadata.md#movie-preparation)). QuickTime text items
-such as `©nam` and Apple's `mdta` metadata are left as they are.
+Formats are recognised by their first bytes before their extension, except
+that raw extensions always mean sidecar only, even though those files are TIFF
+inside. Movie rewrites are compared with the original before publication;
+anything outside the changes listed above refuses the write and keeps the
+original (see [metadata write boundaries](architecture/metadata.md#movie-preparation)).
+QuickTime text items such as `©nam` and Apple's `mdta` metadata are left as they
+are.
 
 `metadata.set_exif_datetime` includes supported HEIF XMP datetime output with
 `xmp`; it is not limited to JPEG/TIFF. The default Cargo feature enables the
