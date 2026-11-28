@@ -29,7 +29,7 @@ kei syncs iCloud Photos media and metadata to local storage. Use this map to fin
 
 **Upgrade.** A previous release's state file is opened read-only and its ownership checked. Verified copies inside the download directory are imported into a scratch file, which is integrity-checked and renamed into place. Planning takes over a carried-over copy of the same photo and rendition at the same path or in the same folder when its size matches; a path the old state gave to several photos goes to the one whose recorded bytes the file holds. After the first cycle in which every zone listed to the end without error, the old file, its SQLite companions and its schema backups are removed.
 
-**Metadata.** Metadata writing is opt-in. After downloads, the pass updates saved copies whose metadata may be stale, but only while they still hold the bytes kei recorded. An embedded write records its output as kei's bytes, with a receipt written first so a restart can tell it from a local edit. It never affects a sync position or download completion. See [metadata write boundaries](architecture/metadata.md).
+**Metadata.** Metadata writing is opt-in. After downloads, the pass updates saved copies whose metadata may be stale, but only while they still hold the bytes kei recorded. An embedded write records its output as kei's bytes, with a receipt written first so a restart can tell it from a local edit. Movie layout validation accepts both FullBox and bare QuickTime `meta` atoms while rejecting malformed bounds; the patched XMP Toolkit is pinned in `Cargo.toml`. It never affects a sync position or download completion. See [metadata write boundaries](architecture/metadata.md).
 
 ## Data-safety invariants
 
